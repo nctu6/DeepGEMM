@@ -104,7 +104,8 @@ static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
 
     const int num_smem_ints = is_varlen ? 3 * aligned_batch_size + 1 : aligned_batch_size;
     const int smem_size = num_smem_ints * static_cast<int>(sizeof(int));
-    DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
+    // NOTES: also used by SM120, so check against the device limit
+    DG_HOST_ASSERT(smem_size <= jit->device.get_num_smem_bytes());
 
     // Compile
     const auto kernel = jit->compile("sm90_paged_mqa_logits_metadata", std::format(R"(

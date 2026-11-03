@@ -34,12 +34,17 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
+    // SM120 currently consumes the same FP32 layouts as SM90
+    const bool use_fp32_sf = arch_major == 9 or arch_major == 12 or disable_ue8m0_cast;
+    // (FP32, 1, 128) on SM120: kernels read SFA at any strides, so no transform (and no extra kernel launch)
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and arch_major == 12)
+        return sf;
     // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and use_fp32_sf)
         return get_mn_major_tma_aligned_tensor(sf);
 
-    // (FP32, 128, 128) on SM90: no need to transform, check SFB requirements
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    // (FP32, 128, 128) on SM90/SM120: no need to transform, check SFB requirements
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and use_fp32_sf)
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
     // (FP32, x, gran_k) on SM100: transform to (INT, 1, gran_k), TMA-aligned and MN-major

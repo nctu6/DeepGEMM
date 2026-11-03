@@ -40,7 +40,9 @@ static void check_major_type_cd(const torch::Tensor& t) {
 }
 
 static bool fp8_fp4_requires_k_major(const torch::Tensor& a, const torch::Tensor& b) {
-    return jit->device.get_arch_major() == 9 or
+    // SM90 WGMMA and SM120 `mma.sync` FP8 kernels both require K-major operands
+    const auto arch_major = jit->device.get_arch_major();
+    return arch_major == 9 or arch_major == 12 or
            (a.scalar_type() == kPackedFP4 and b.scalar_type() == kPackedFP4);
 }
 
@@ -85,7 +87,7 @@ static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& a
 static std::tuple<int, int, int>
 get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& sfb_dtype) {
     const auto arch_major = jit->device.get_arch_major();
-    if (arch_major == 9) {
+    if (arch_major == 9 or arch_major == 12) {
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
     } else if (arch_major == 10) {

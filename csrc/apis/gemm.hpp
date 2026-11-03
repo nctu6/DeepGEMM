@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_fp8_gemm_1d2d.hpp"
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
@@ -124,6 +125,14 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
             const auto major_sfb = get_major_type_ab(sfb);
             sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
         }
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kFloat) {
+        DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and "SM120 FP8 GEMM only supports BF16 output");
+        const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
+        DG_HOST_ASSERT(gran_n == 128 and "SM120 FP8 GEMM only supports 128x128 SFB blocks");
+        const auto major_sfb = get_major_type_ab(sfb);
+        sm120_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
@@ -239,6 +248,12 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kFloat) {
+        const auto major_sfb = get_major_type_ab(sfb);
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        sm120_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
+                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
+                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
@@ -308,6 +323,11 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kFloat) {
+        const auto major_sfb = get_major_type_ab(sfb);
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        sm120_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
+                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,

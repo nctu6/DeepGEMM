@@ -92,8 +92,13 @@ def reset_seed(seed: int = 0):
     torch.cuda.manual_seed(seed)
 
 
+def is_sm90_like_fp8() -> bool:
+    # SM120 FP8 GEMMs use the SM90 contract: 1D2D kernels, FP32 SF, K-major operands
+    return get_arch_major() in (9, 12)
+
+
 def get_ue8m0_usage(kernel_type: KernelType) -> bool:
-    if get_arch_major() == 9:
+    if is_sm90_like_fp8():
         return False
     return kernel_type.is_1d1d()
 
@@ -102,7 +107,7 @@ def get_kernel_types(dtype: torch.dtype) -> tuple:
     if dtype == torch.bfloat16:
         return (KernelType.KernelNoSF, )
 
-    return (KernelType.Kernel1D2D, ) if get_arch_major() == 9 else (KernelType.Kernel1D1D, )
+    return (KernelType.Kernel1D2D, ) if is_sm90_like_fp8() else (KernelType.Kernel1D1D, )
 
 
 def get_major_ab(allow_a_mn_major: bool, allow_b_mn_major: bool) -> Generator:
@@ -161,6 +166,11 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
                         if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
                             override_major = MajorTypeAB.KMajor
                             override_kernel_type = KernelType.Kernel1D1D
+                        if get_arch_major() == 12 and dtype == torch.float8_e4m3fn:
+                            # SM120 FP8 has no 1D1D (per-channel SFB) kernel, FP32 output or accumulation: Dgrad only
+                            override_major = MajorTypeAB.KMajor
+                            yield emit(kernel_type, quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16)  # Dgrad
+                            continue
                         yield emit(kernel_type,          quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16)  # Dgrad
                         yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, True,  torch.float)         # Wgrad
                         yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.bfloat16)      # Wgrad
@@ -204,7 +214,7 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
                     reset_seed()
                     for num_groups, expected_m_per_group in m_group_list:
                         for n, k in n_k_list:
-                            for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
+                            for major_a, major_b in get_major_ab(False, not is_sm90_like_fp8() or dtype != torch.float8_e4m3fn):
                                 if quant_config is not None and quant_config.is_fp4_fp4() and major_b.is_mn_major():
                                     continue
                                 yield kernel_type, quant_config, num_groups, expected_m_per_group, n, k, major_a, major_b, use_psum_layout, ensure_zero_padding

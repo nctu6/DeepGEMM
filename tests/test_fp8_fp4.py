@@ -242,6 +242,10 @@ def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped GEMM:')
 
     arch_major = get_arch_major()
+    if arch_major == 12:
+        # Training-only (weight gradients), not implemented on SM120
+        print(' > Skipped: k-grouped FP8 GEMMs are not supported on SM120\n')
+        return
     test_sf_k_padding = arch_major == 10
     test_options = [(torch.float8_e4m3fn, QuantConfig(),
                      deep_gemm.k_grouped_fp8_gemm_nt_contiguous if arch_major == 9 else

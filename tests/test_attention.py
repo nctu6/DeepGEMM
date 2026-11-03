@@ -53,6 +53,9 @@ def mqa_logits_heads(is_mxfp4: bool):
         heads = (8, 12, 16, 20, 32, 64)
         head_dims = (64, 128) if is_mxfp4 else (32, 64, 128)
         return heads, head_dims
+    # SM120 kernels (`mma.sync` with 128B-swizzled tiles) only support head dim 128
+    if get_arch_major() == 12:
+        return (32, 64), (128, )
     return (32, 64), (32, 64, 128)
 
 
