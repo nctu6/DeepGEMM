@@ -121,8 +121,16 @@ struct SM120ArchSpec {
         const int smem_barriers = kNumMaxStages * 8 * 2 + 16;
         const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
         const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
-        // NOTES: SFA is read from global memory (L1/L2 cached), not staged
-        const int smem_per_stage = smem_a_per_stage + smem_b_per_stage;
+        // NOTES: the FP32 kernel reads SFA from global memory (L1/L2 cached), not staged. The block-scaled 1D1D
+        // kernel TMA-loads the packed UE8M0 words of both operands with each stage: 2 words per row for FP4 (a K block
+        // is 256 elements), 1 for FP8, each tile rounded up to the 128B TMA destination alignment
+        int smem_sf_per_stage = 0;
+        if (desc.kernel_type == KernelType::Kernel1D1D) {
+            const int num_sf_words = desc.a_dtype == kPackedFP4 ? 2 : 1;
+            smem_sf_per_stage = align(num_sf_words * storage_config.load_block_m * 4, 128) +
+                                align(num_sf_words * storage_config.load_block_n * 4, 128);
+        }
+        const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sf_per_stage;
         const int num_stages = std::min((get_smem_capacity() - smem_barriers) / smem_per_stage, kNumMaxStages);
         return {smem_barriers + num_stages * smem_per_stage, num_stages, 0};
     }

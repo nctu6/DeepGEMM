@@ -110,7 +110,8 @@ def main():
     tol = 1e-7
     failed = False
     shapes = [(1, 4096, 7168), (8, 2112, 7168), (64, 7168, 2048), (128, 4096, 4096), (333, 576, 1536),
-              (1000, 3072, 1536), (4096, 4096, 7168)]
+              (1000, 3072, 1536), (4096, 4096, 7168),
+              (64, 1024, 384), (17, 2048, 2176), (200, 1536, 640)]  # K tails: a half FP4 K block, a partial scale word
     for mode in modes:
         for (m, n, k) in shapes:
             diff = run_normal(mode, m, n, k)

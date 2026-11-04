@@ -24,8 +24,10 @@ namespace deep_gemm {
 // SM120 block-scaled GEMM with packed UE8M0 scale factors ("1D1D"), for FP4 (E2M1) and FP8 (E4M3) operands.
 //
 // Same host contract as `sm100_fp8_fp4_gemm_1d1d_impl`: SFA/SFB are int32 tensors holding 4 consecutive-K UE8M0 bytes
-// per word (K granularity `kGranK` of 32 or 128), laid out `[(G,) MN, ceil(K / (kGranK * 4))]` and read here with
-// plain loads at any strides. Unlike SM100 there is no TMEM, so the scales go straight into registers:
+// per word (K granularity `kGranK` of 32 or 128), laid out `[(G,) MN, ceil(K / (kGranK * 4))]`, MN-major and
+// TMA-aligned. Unlike SM100 there is no TMEM: the scales are TMA-loaded into shared memory with each stage (on the
+// same barrier as A/B, so their latency is hidden by the pipeline like the operands') and read into registers by the
+// math warps:
 //  - The tensor core applies the scales (`mma.sync ... block_scale`), so unlike the FP32 "1D2D" kernel there is no
 //    second accumulator and no per-K-block promotion on CUDA cores
 //  - FP4 (`kGranK == 32`): a TMA tile row is 128 bytes = 256 FP4 elements, consumed as 4 `m16n8k64` MMAs, each taking
@@ -46,11 +48,11 @@ template <bool kIsFP4, uint32_t kGranK,
           typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
-                             const uint32_t* sfa, uint32_t sfa_stride_g, uint32_t sfa_stride_m, uint32_t sfa_stride_k,
-                             const uint32_t* sfb, uint32_t sfb_stride_g, uint32_t sfb_stride_n, uint32_t sfb_stride_k,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_b) {
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfb) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
     using MMA = cute::conditional_t<kIsFP4, mma::sm120::FP4BlockScaledMMA, mma::sm120::FP8BlockScaledMMA>;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -90,6 +92,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K;
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K;
     DG_STATIC_ASSERT(SMEM_A_SIZE_PER_STAGE % 1024 == 0 and SMEM_B_SIZE_PER_STAGE % 1024 == 0, "Swizzle-128B needs 1024B alignment");
+    // Scales of one stage, `[kNumSFWords][BLOCK_MN]` words each (TMA destinations are 128B aligned)
+    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = math::constexpr_align(kNumSFWords * BLOCK_M * 4u, 128u);
+    static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = math::constexpr_align(kNumSFWords * BLOCK_N * 4u, 128u);
+    static constexpr uint32_t kNumSFTMABytes = kNumSFWords * (BLOCK_M + BLOCK_N) * 4;
 
     // Configs
     const uint32_t num_k_blocks = math::ceil_div(shape_k, kElemsPerBlock);
@@ -102,6 +108,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     if (warp_idx == kNumMathWarps and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
+        cute::prefetch_tma_descriptor(&tensor_map_sfa);
+        cute::prefetch_tma_descriptor(&tensor_map_sfb);
     }
     __syncwarp();
 
@@ -113,7 +121,15 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     auto smem_b = utils::PatternVisitor([&](const uint32_t& i) {
         return smem_buffer + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE;
     });
-    constexpr uint32_t SMEM_BARRIER_OFFSET = kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    constexpr uint32_t SMEM_SFA_OFFSET = kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    constexpr uint32_t SMEM_SFB_OFFSET = SMEM_SFA_OFFSET + kNumStages * SMEM_SFA_SIZE_PER_STAGE;
+    auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<uint32_t*>(smem_buffer + SMEM_SFA_OFFSET + i * SMEM_SFA_SIZE_PER_STAGE);
+    });
+    auto smem_sfb = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<uint32_t*>(smem_buffer + SMEM_SFB_OFFSET + i * SMEM_SFB_SIZE_PER_STAGE);
+    });
+    constexpr uint32_t SMEM_BARRIER_OFFSET = SMEM_SFB_OFFSET + kNumStages * SMEM_SFB_SIZE_PER_STAGE;
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_BARRIER_OFFSET);
     auto full_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
@@ -168,7 +184,16 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                     tma::copy<kElemsPerBlock, BLOCK_N, kSwizzleBMode, ab_dtype_t>(&tensor_map_b, &full_barrier,
                              reinterpret_cast<ab_dtype_t*>(smem_b[stage_idx]), k_idx,
                              scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
-                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+                    // Scales: inner coordinate is the row/column, outer is the packed word (plus the group offset).
+                    // A 128-element FP8 K block uses a quarter of a 128-granularity word, so that word is re-fetched
+                    const uint32_t sf_block_idx = (kIsFP4 or kGranK == 32) ? k_block_idx : k_block_idx / 4;
+                    tma::copy<BLOCK_M, kNumSFWords, 0, uint32_t>(&tensor_map_sfa, &full_barrier, smem_sfa[stage_idx],
+                             m_block_idx * BLOCK_M,
+                             scheduler.get_global_idx<kWithGroupOffsetA>(num_sf_words, kNumSFWords, sf_block_idx));
+                    tma::copy<BLOCK_N, kNumSFWords, 0, uint32_t>(&tensor_map_sfb, &full_barrier, smem_sfb[stage_idx],
+                             n_block_idx * BLOCK_N,
+                             scheduler.get_global_idx<true>(num_sf_words, kNumSFWords, sf_block_idx, m_block_idx));
+                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + kNumSFTMABytes);
                 }
             }
         }
@@ -187,43 +212,16 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
         const uint32_t b_ld_chunk = (lane_idx >> 3) & 1;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            // Scale-factor sources of this lane (clamped, as out-of-bound rows/columns are never stored)
+            // Scale rows/columns of this lane inside the stage's scale tile
             //  - SFA: lanes `t == 0` and `t == 1` supply rows `g` and `g + 8` of every M tile
             //  - SFB: every lane supplies column `g` of every N tile (only `t == 0` is read by the MMA)
-            const uint32_t group_idx = scheduler.template get_global_idx<true>(1, 1, 0, m_block_idx);
-            const uint32_t* local_sfa = sfa + (kGemmType == GemmType::MGroupedMasked ? group_idx * sfa_stride_g : 0);
-            const uint32_t* local_sfb = sfb + group_idx * sfb_stride_g;
-            uint32_t sfa_row_offsets[kNumMTiles], sfb_col_offsets[kNumNTiles];
+            uint32_t sfa_rows[kNumMTiles], sfb_cols[kNumNTiles];
             #pragma unroll
-            for (uint32_t i = 0; i < kNumMTiles; ++ i) {
-                const uint32_t row = m_block_idx * BLOCK_M + warp_m_idx * WARP_M + i * 16 + group_row + (group_col & 1) * 8;
-                sfa_row_offsets[i] = cute::min(row, shape_m - 1) * sfa_stride_m;
-            }
+            for (uint32_t i = 0; i < kNumMTiles; ++ i)
+                sfa_rows[i] = warp_m_idx * WARP_M + i * 16 + group_row + (group_col & 1) * 8;
             #pragma unroll
-            for (uint32_t j = 0; j < kNumNTiles; ++ j) {
-                const uint32_t col = n_block_idx * BLOCK_N + warp_n_idx * WARP_N + j * 8 + group_row;
-                sfb_col_offsets[j] = cute::min(col, shape_n - 1) * sfb_stride_n;
-            }
-
-            // Load the packed scale words of K block `k_block`
-            uint32_t sfa_words[2][kNumMTiles][kNumSFWords], sfb_words[2][kNumNTiles][kNumSFWords];
-            const auto load_scales = [&](const uint32_t& k_block, const uint32_t& buf) {
-                #pragma unroll
-                for (uint32_t w = 0; w < kNumSFWords; ++ w) {
-                    uint32_t word;
-                    if constexpr (kIsFP4)
-                        word = k_block * 2 + w;
-                    else
-                        word = kGranK == 32 ? k_block : k_block / 4;
-                    word = cute::min(word, num_sf_words - 1);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumMTiles; ++ i)
-                        sfa_words[buf][i][w] = __ldg(local_sfa + sfa_row_offsets[i] + word * sfa_stride_k);
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumNTiles; ++ j)
-                        sfb_words[buf][j][w] = __ldg(local_sfb + sfb_col_offsets[j] + word * sfb_stride_k);
-                }
-            };
+            for (uint32_t j = 0; j < kNumNTiles; ++ j)
+                sfb_cols[j] = warp_n_idx * WARP_N + j * 8 + group_row;
 
             float accum[kNumAccum];
             #pragma unroll
@@ -240,15 +238,22 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
             };
 
             if (scheduler.is_computation_valid(m_block_idx, warp_m_idx * WARP_M)) {
-                load_scales(0, 0);
-                uint32_t buf = 0;
                 #pragma unroll 1
-                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx), buf ^= 1) {
-                    // Prefetch the next K block's scales before waiting for TMA
-                    load_scales(cute::min(k_block_idx + 1, num_k_blocks - 1), buf ^ 1);
-
-                    // Wait TMA arrivals
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    // Wait TMA arrivals (operands and scales)
                     full_barriers[stage_idx]->wait(phase);
+
+                    // The packed scale words of this K block
+                    uint32_t sfa_words[kNumMTiles][kNumSFWords], sfb_words[kNumNTiles][kNumSFWords];
+                    #pragma unroll
+                    for (uint32_t w = 0; w < kNumSFWords; ++ w) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumMTiles; ++ i)
+                            sfa_words[i][w] = smem_sfa[stage_idx][w * BLOCK_M + sfa_rows[i]];
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumNTiles; ++ j)
+                            sfb_words[j][w] = smem_sfb[stage_idx][w * BLOCK_N + sfb_cols[j]];
+                    }
 
                     const uint32_t a_base = mma::sm120::to_smem_addr(smem_a[stage_idx]);
                     const uint32_t b_base = mma::sm120::to_smem_addr(smem_b[stage_idx]);
@@ -279,10 +284,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                         uint32_t scale_a[kNumMTiles], scale_b[kNumNTiles];
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumMTiles; ++ i)
-                            scale_a[i] = get_scale(sfa_words[buf][i]);
+                            scale_a[i] = get_scale(sfa_words[i]);
                         #pragma unroll
                         for (uint32_t j = 0; j < kNumNTiles; ++ j)
-                            scale_b[j] = get_scale(sfb_words[buf][j]);
+                            scale_b[j] = get_scale(sfb_words[j]);
 
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumMTiles; ++ i) {

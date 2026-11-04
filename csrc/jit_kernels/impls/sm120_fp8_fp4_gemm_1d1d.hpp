@@ -25,9 +25,8 @@ public:
         int ld_d;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
-        const void *sfa, *sfb;
-        int sfa_stride_g, sfa_stride_m, sfa_stride_k;
-        int sfb_stride_g, sfb_stride_n, sfb_stride_k;
+        CUtensorMap tensor_map_sfa;
+        CUtensorMap tensor_map_sfb;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -65,12 +64,8 @@ static void __instantiate_kernel() {{
         jit->launch(
             kernel, args.options,
             args.grouped_layout, args.d, static_cast<uint32_t>(args.ld_d),
-            args.sfa, static_cast<uint32_t>(args.sfa_stride_g), static_cast<uint32_t>(args.sfa_stride_m),
-            static_cast<uint32_t>(args.sfa_stride_k),
-            args.sfb, static_cast<uint32_t>(args.sfb_stride_g), static_cast<uint32_t>(args.sfb_stride_n),
-            static_cast<uint32_t>(args.sfb_stride_k),
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.tensor_map_a, args.tensor_map_b
+            args.tensor_map_a, args.tensor_map_b, args.tensor_map_sfa, args.tensor_map_sfb
         );
     }
 };
@@ -82,6 +77,7 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                            const torch::Tensor& d,
                                            void* grouped_layout,
                                            const int& num_groups_a, const int& num_groups_b,
+                                           const int& num_groups_sfa, const int& num_groups_sfb,
                                            const int& gran_k_a, const int& gran_k_b) {
     // `desc.k` counts logical elements, so FP4 (packed two per byte) has `a.size(-1) * 2 == k`
     const bool is_fp4 = a.scalar_type() == kPackedFP4;
@@ -115,8 +111,16 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                               config.storage_config.swizzle_b_mode, 0, false,
                                               /* fp4_unpacked_smem */ false);
 
-    // Scales are read with plain loads at any strides: `[(G,) MN, K / (gran_k * 4)]` int32, MN-major (TMA-aligned)
-    const bool sfa_grouped = sfa.dim() == 3, sfb_grouped = sfb.dim() == 3;
+    // Scales are TMA-loaded with each stage: `[(G,) MN, ceil(K / (gran_k * 4))]` int32, MN-major (TMA-aligned). A K block
+    // needs 2 words for FP4 (256 elements) and 1 for FP8 (128 elements, a quarter of a 128-granularity word)
+    const int num_sf_words_per_block = is_fp4 ? 2 : 1;
+    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, desc.m, desc.k,
+                                                 config.storage_config.load_block_m, gran_k_a, num_groups_sfa, 0, 0, false,
+                                                 num_sf_words_per_block, static_cast<int>(sfa.stride(-1)));
+    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, desc.n, desc.k,
+                                                 config.storage_config.load_block_n, gran_k_b, num_groups_sfb, 0, 0, false,
+                                                 num_sf_words_per_block, static_cast<int>(sfb.stride(-1)));
+
     SM120FP8FP4Gemm1D1DRuntime::compile_and_launch(tag, {
         .gemm_desc = desc,
         .gemm_config = config,
@@ -133,14 +137,8 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
         .ld_d = static_cast<int>(d.stride(-2)),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .sfa = sfa.data_ptr(),
-        .sfb = sfb.data_ptr(),
-        .sfa_stride_g = sfa_grouped ? static_cast<int>(sfa.stride(0)) : 0,
-        .sfa_stride_m = static_cast<int>(sfa.stride(-2)),
-        .sfa_stride_k = static_cast<int>(sfa.stride(-1)),
-        .sfb_stride_g = sfb_grouped ? static_cast<int>(sfb.stride(0)) : 0,
-        .sfb_stride_n = static_cast<int>(sfb.stride(-2)),
-        .sfb_stride_k = static_cast<int>(sfb.stride(-1)),
+        .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
     });
 }
 
@@ -165,7 +163,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
     };
-    sm120_fp8_fp4_gemm_1d1d_launch("sm120_fp8_fp4_gemm_1d1d", desc, a, sfa, b, sfb, d, nullptr, 1, 1, gran_k_a, gran_k_b);
+    sm120_fp8_fp4_gemm_1d1d_launch("sm120_fp8_fp4_gemm_1d1d", desc, a, sfa, b, sfb, d, nullptr, 1, 1, 1, 1, gran_k_a, gran_k_b);
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -193,7 +191,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .expected_num_groups = 1
     };
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d", desc, a, sfa, b, sfb, d,
-                                   m_indices.data_ptr(), 1, num_groups, gran_k_a, gran_k_b);
+                                   m_indices.data_ptr(), 1, num_groups, 1, num_groups, gran_k_a, gran_k_b);
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -219,7 +217,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_fp8_fp4_gemm_masked_1d1d", desc, a, sfa, b, sfb, d,
-                                   masked_m.data_ptr(), num_groups, num_groups, gran_k_a, gran_k_b);
+                                   masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, gran_k_a, gran_k_b);
 }
 
 } // namespace deep_gemm
