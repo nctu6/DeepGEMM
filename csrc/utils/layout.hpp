@@ -68,7 +68,7 @@ static auto get_logical_shape(const torch::Tensor& t) {
 static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
     auto [mn, k] = get_shape<2>(ab);
     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
-        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
+        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and (arch_major == 10 or arch_major == 12));
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
     }
     return std::make_tuple(mn, k);
@@ -77,7 +77,7 @@ static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute
 static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
     auto [num_groups, mn, k] = get_shape<3>(ab);
     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
-        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
+        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and (arch_major == 10 or arch_major == 12));
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
     }
     return std::make_tuple(num_groups, mn, k);
@@ -87,10 +87,11 @@ static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& a
 static std::tuple<int, int, int>
 get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& sfb_dtype) {
     const auto arch_major = jit->device.get_arch_major();
-    if (arch_major == 9 or arch_major == 12) {
+    if (arch_major == 9) {
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
-    } else if (arch_major == 10) {
+    } else if (arch_major == 10 or arch_major == 12) {
+        // SM120 takes FP32 scales for the 1D2D FP8 kernel, and packed UE8M0 for the block-scaled 1D1D kernels
         DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt);
         return sfb_dtype == torch::kFloat ?
             std::make_tuple(1, 128, 128):   // Legacy format

@@ -50,6 +50,51 @@ struct FP8MMA {
     }
 };
 
+/// Block-scaled MMAs: the tensor core applies UE8M0 scales (`2^(byte - 127)`), so no CUDA-core promotion is needed.
+/// Scale-factor lane mapping (verified on hardware, `scripts/sm120_{blockscale,fp4}_probe.cu`), with `g = lane / 4`
+/// and `t = lane % 4`, all selectors 0:
+///  - SFA: lane `t == 0` supplies row `g`, lane `t == 1` supplies row `g + 8` (lanes `t >= 2` are ignored)
+///  - SFB: lane `t == 0` supplies column `g` (the other lanes are ignored)
+/// Fragments are identical to the unscaled `FP8MMA` (A: 4 regs, B: 2 regs, D: 4 floats).
+///
+/// FP8 (E4M3) `m16n8k32`, `scale_vec::1X`: one scale byte per 32 K, passed in the low byte of `sfa`/`sfb`
+struct FP8BlockScaledMMA {
+    static constexpr uint32_t M = 16;
+    static constexpr uint32_t N = 8;
+    static constexpr uint32_t K = 32;
+
+    CUTLASS_DEVICE static void mma(const uint32_t* a, const uint32_t* b, float* d,
+                                   const uint32_t& sfa, const uint32_t& sfb) {
+        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+                     "%10, {0, 0}, %11, {0, 0};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                       "r"(b[0]), "r"(b[1]),
+                       "r"(sfa), "r"(sfb));
+    }
+};
+
+/// FP4 (E2M1, two values per byte, low nibble first) `m16n8k64`, `scale_vec::2X`: the low 16 bits of `sfa`/`sfb` hold
+/// two scale bytes, byte 0 for K 0-31 and byte 1 for K 32-63. The A/B fragments are loaded with the same `ldmatrix`
+/// pattern as FP8 (a 64-element FP4 K step is 32 bytes, like a 32-element FP8 K step)
+struct FP4BlockScaledMMA {
+    static constexpr uint32_t M = 16;
+    static constexpr uint32_t N = 8;
+    static constexpr uint32_t K = 64;
+
+    CUTLASS_DEVICE static void mma(const uint32_t* a, const uint32_t* b, float* d,
+                                   const uint32_t& sfa, const uint32_t& sfb) {
+        asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+                     "%10, {0, 0}, %11, {0, 0};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                       "r"(b[0]), "r"(b[1]),
+                       "r"(sfa), "r"(sfb));
+    }
+};
+
 /// One warp computes `accum[16, N] = A[16, 128] @ B[N, 128]^T` with FP8 operands in TMA 128B-swizzled shared memory
 /// (both K-major with 128-byte rows, i.e. `kHeadDim = 128`)
 ///  - `a_base`/`b_base`: shared memory addresses of the 1024B-aligned tiles, `a_row`: the first of the 16 A rows

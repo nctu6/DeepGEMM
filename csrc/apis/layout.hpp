@@ -47,16 +47,19 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and use_fp32_sf)
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
-    // (FP32, x, gran_k) on SM100: transform to (INT, 1, gran_k), TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and arch_major == 10) {
+    // (FP32, x, gran_k) on SM100 (and gran_k = 32 on SM120, i.e. FP4 / 32-element FP8 block scales): transform to
+    // (INT, 1, gran_k), TMA-aligned and MN-major. SM120 keeps FP32 for gran_k = 128, which the FP32 kernel consumes
+    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and
+        (arch_major == 10 or (arch_major == 12 and gran_k == 32))) {
         DG_HOST_ASSERT(not disable_ue8m0_cast);
         const auto broadcasted = gran_mn == 1 ? sf :
                                  sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));
         return get_mn_major_tma_aligned_packed_ue8m0_tensor(broadcasted, psum_layout);
     }
 
-    // (INT, 1, gran_k) on SM100: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and arch_major == 10)
+    // (INT, 1, gran_k) on SM100 / SM120: already packed UE8M0, check TMA-aligned and MN-major
+    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and
+        (arch_major == 10 or arch_major == 12))
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, true, false, torch::kInt);
 
     DG_HOST_UNREACHABLE("Unknown SF transformation");

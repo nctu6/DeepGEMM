@@ -51,7 +51,8 @@ struct SM120ArchSpec {
     }
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
-        DG_HOST_ASSERT(desc.kernel_type == KernelType::Kernel1D2D);
+        // 1D2D: FP32 scales promoted on CUDA cores; 1D1D: packed UE8M0 scales applied by the block-scaled MMA
+        DG_HOST_ASSERT(desc.kernel_type == KernelType::Kernel1D2D or desc.kernel_type == KernelType::Kernel1D1D);
         DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
 
         // Block M candidates
