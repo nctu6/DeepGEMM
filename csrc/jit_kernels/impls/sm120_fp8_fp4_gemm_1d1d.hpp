@@ -1,6 +1,15 @@
 #pragma once
 
 #include <format>
+#include <functional>
+#include <algorithm>
+#include <limits>
+#include <vector>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <torch/python.h>
 
 #include "../../runtime/runtime.hpp"
@@ -12,7 +21,8 @@
 
 namespace deep_gemm {
 
-// SM120 block-scaled GEMM with packed UE8M0 scales (FP4, or FP8 with 32/128-element scales)
+// SM120 `mma.sync` 1D1D GEMM: block-scaled with packed UE8M0 scales (FP4, or FP8 with 32/128-element scales), or
+// BF16 without scales
 class SM120FP8FP4Gemm1D1DRuntime final {
 public:
     struct Args {
@@ -20,7 +30,7 @@ public:
         GemmConfig gemm_config;
         deep_jit::cuda::LaunchOptions options;
 
-        bool is_fp4;
+        bool is_fp4, is_bf16;
         int gran_k;
         bool use_stream_k;
         void *grouped_layout, *d;
@@ -40,7 +50,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm120_fp8_fp4_gemm_1d1d_impl<
-        {}, {},
+        {}, {}, {},
         {}, {}, {},
         {},
         {}, {}, {},
@@ -53,7 +63,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
-        args.is_fp4 ? "true" : "false", args.gran_k,
+        args.is_fp4 ? "true" : "false", args.is_bf16 ? "true" : "false", args.gran_k,
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
@@ -76,6 +86,194 @@ static void __instantiate_kernel() {{
     }
 };
 
+// A tile layout plus a stream-K choice: what the autotuner selects between
+struct SM120BlockScaledChoice {
+    Layout layout;
+    bool use_stream_k;
+};
+
+static GemmConfig sm120_make_config(const GemmDesc& desc, const Layout& layout) {
+    const auto storage_config = SM120ArchSpec::get_storage_config(desc, layout);
+    return GemmConfig {
+        .layout = layout,
+        .storage_config = storage_config,
+        .pipeline_config = SM120ArchSpec::get_pipeline_config(desc, layout, storage_config),
+        .launch_config = SM120ArchSpec::get_launch_config(desc, layout)
+    };
+}
+
+// Launch one explicit choice
+static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
+                                        const GemmDesc& desc, const SM120BlockScaledChoice& choice,
+                                        const torch::Tensor& a, const torch::Tensor& sfa,
+                                        const torch::Tensor& b, const torch::Tensor& sfb,
+                                        const torch::Tensor& d,
+                                        void* grouped_layout,
+                                        const int& num_groups_a, const int& num_groups_b,
+                                        const int& num_groups_sfa, const int& num_groups_sfb,
+                                        const int& gran_k) {
+    const bool is_fp4 = a.scalar_type() == kPackedFP4;
+    const bool is_bf16 = a.scalar_type() == torch::kBFloat16;
+    const auto config = sm120_make_config(desc, choice.layout);
+    auto stream_k = SM120ArchSpec::StreamKConfig{};
+    if (choice.use_stream_k)
+        stream_k = SM120ArchSpec::get_stream_k_split(desc, choice.layout);
+
+    // Stream-K buffers: FP32 partial slots, and per-tile arrival counters that kernels reset themselves
+    float* workspace = nullptr;
+    int* counters = nullptr;
+    if (stream_k.num_ctas > 0) {
+        workspace = get_stream_k_workspace(static_cast<size_t>(stream_k.num_slots) * desc.m * desc.n);
+        counters = get_stream_k_counters();
+    }
+
+    // Requires no TMA splits: a tile row is exactly one swizzle atom of `block_k` bytes (for packed FP4 the TMA
+    // descriptor converts it into elements itself; BF16 rows hold `block_k / 2` elements)
+    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
+    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    const int tma_block_k = is_bf16 ? config.layout.block_k / 2 : config.layout.block_k;
+    const auto tensor_map_a = make_tma_a_desc(desc.major_a, a, desc.m, desc.k,
+                                              config.storage_config.load_block_m,
+                                              tma_block_k,
+                                              static_cast<int>(a.stride(get_non_contiguous_dim(desc.major_a))), num_groups_a,
+                                              config.storage_config.swizzle_a_mode, 0, false,
+                                              /* fp4_unpacked_smem */ false);
+    const auto tensor_map_b = make_tma_b_desc(desc.major_b, b, desc.n, desc.k,
+                                              config.storage_config.load_block_n,
+                                              tma_block_k,
+                                              static_cast<int>(b.stride(get_non_contiguous_dim(desc.major_b))), num_groups_b,
+                                              config.storage_config.swizzle_b_mode, 0, false,
+                                              /* fp4_unpacked_smem */ false);
+
+    // Scales are TMA-loaded with each stage: `[(G,) MN, ceil(K / (gran_k * 4))]` int32, MN-major (TMA-aligned). An FP4
+    // K block of `block_k` bytes holds `block_k * 2` elements, i.e. `block_k * 2 / 128` words (2 for 128 bytes, 1 for
+    // 64); an FP8 one needs 1 (128 elements, a quarter of a 128-granularity word
+    // 64). BF16 has no scales: the kernel never reads the SF descriptors, which just repeat A's
+    const int num_sf_words_per_block = is_fp4 ? config.layout.block_k * 2 / 128 : 1;
+    const auto tensor_map_sfa = is_bf16 ? tensor_map_a :
+                                make_tma_sf_desc(cute::UMMA::Major::MN, sfa, desc.m, desc.k,
+                                                 config.storage_config.load_block_m, gran_k, num_groups_sfa, 0, 0, false,
+                                                 num_sf_words_per_block, static_cast<int>(sfa.stride(-1)));
+    const auto tensor_map_sfb = is_bf16 ? tensor_map_a :
+                                make_tma_sf_desc(cute::UMMA::Major::MN, sfb, desc.n, desc.k,
+                                                 config.storage_config.load_block_n, gran_k, num_groups_sfb, 0, 0, false,
+                                                 num_sf_words_per_block, static_cast<int>(sfb.stride(-1)));
+
+    SM120FP8FP4Gemm1D1DRuntime::compile_and_launch(tag, {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            // Data-parallel normal GEMMs launch one CTA per tile when there are fewer tiles than SMs: idle persistent CTAs
+            // still pay for dispatch and their prologue, and under PDL they sit between this kernel and the next. The
+            // scheduler strides by the compile-time SM count, so each launched CTA still gets exactly its own tile
+            .grid_dim = dim3(stream_k.num_ctas > 0 ? stream_k.num_ctas :
+                             (desc.gemm_type == GemmType::Normal ?
+                                  std::min(config.launch_config.num_sms, SM120ArchSpec::get_num_tiles(desc, config.layout)) :
+                                  config.launch_config.num_sms), 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
+        .is_fp4 = is_fp4,
+        .is_bf16 = is_bf16,
+        .gran_k = gran_k,
+        .use_stream_k = stream_k.num_ctas > 0,
+        .grouped_layout = grouped_layout,
+        .d = d.data_ptr(),
+        .ld_d = static_cast<int>(d.stride(-2)),
+        .workspace = workspace,
+        .counters = counters,
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
+    });
+}
+
+// Opt-in autotuning (`DG_SM120_AUTOTUNE=1`): on the first call of each shape, time the model's top candidates on the
+// real tensors and cache the fastest (in-process, keyed by the full GEMM descriptor). Off by default: CUDA events
+// resolve only ~2 us here and eager timing cannot see the PDL overlap with neighboring kernels, so it mispicked as
+// often as the fitted model (see `get_1d1d_cost`). It never runs during CUDA-graph capture: capture falls back to a
+// cached choice, or the model's. `DG_SM120_FORCE_LAYOUT` / `DG_SM120_FORCE_STREAM_K` override it
+static SM120BlockScaledChoice sm120_block_scaled_choice(const GemmDesc& desc, const std::function<void(const SM120BlockScaledChoice&)>& run) {
+    // Forced (developer sweeps) or model choice
+    const auto model_layout = get_best_config<SM120ArchSpec>(desc).layout;
+    const SM120BlockScaledChoice model_choice = {model_layout, SM120ArchSpec::get_stream_k_config(desc, model_layout).num_ctas > 0};
+    const bool forced = not deep_jit::get_env<std::string>("DG_SM120_FORCE_LAYOUT").empty() or
+                        deep_jit::get_env<int>("DG_SM120_FORCE_STREAM_K", -1) >= 0;
+    if (forced or deep_jit::get_env<int>("DG_SM120_AUTOTUNE", 0) == 0)
+        return model_choice;
+
+    std::stringstream key_stream;
+    key_stream << desc;
+    const auto key = key_stream.str();
+    static std::mutex mutex;
+    static std::unordered_map<std::string, SM120BlockScaledChoice> cache;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (const auto it = cache.find(key); it != cache.end())
+            return it->second;
+    }
+    if (c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None)
+        return model_choice;
+
+    // Candidates: every legal layout, with and without stream-K, ranked by the model; time the best few
+    std::vector<std::pair<int64_t, SM120BlockScaledChoice>> ranked;
+    for (const auto& layout: SM120ArchSpec::get_layout_candidates(desc)) {
+        const auto cost = SM120ArchSpec::get_layout_info(desc, layout).num_cycles;
+        ranked.push_back({cost, {layout, false}});
+        if (SM120ArchSpec::get_stream_k_split(desc, layout).num_ctas > 0)
+            ranked.push_back({cost, {layout, true}});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    const int num_candidates = std::min<int>(static_cast<int>(ranked.size()), deep_jit::get_env<int>("DG_SM120_AUTOTUNE_TOP", 12));
+
+    // Time each candidate the way it runs when serving: weights cold in L2. A 256 MB scratch (2x the L2) is read
+    // (summed) before every timed launch, which leaves L2 full of clean lines, like the previous layer's weights; a
+    // memset would leave dirty lines whose write-back competes with the GEMM for DRAM and penalizes the
+    // bandwidth-bound decode tiles. Only the GEMM sits between the events, and the median of a few launches is kept,
+    // as the GPU may be shared
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    static torch::Tensor flush_buffer, flush_sum;
+    if (not flush_buffer.defined()) {
+        flush_buffer = torch::ones({64 << 20}, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
+        flush_sum = torch::empty({}, flush_buffer.options());
+    }
+    constexpr int kNumIters = 7;
+    std::vector<cudaEvent_t> events(kNumIters * 2);
+    for (auto& event: events)
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreate(&event));
+    float best_us = std::numeric_limits<float>::infinity();
+    auto best = model_choice;
+    for (int i = 0; i < num_candidates; ++ i) {
+        const auto& choice = ranked[i].second;
+        run(choice);   // compile + warm up
+        for (int j = 0; j < kNumIters; ++ j) {
+            at::sum_out(flush_sum, flush_buffer);
+            DG_CUDA_RUNTIME_CHECK(cudaEventRecord(events[j * 2], stream));
+            run(choice);
+            DG_CUDA_RUNTIME_CHECK(cudaEventRecord(events[j * 2 + 1], stream));
+        }
+        DG_CUDA_RUNTIME_CHECK(cudaEventSynchronize(events.back()));
+        std::vector<float> times(kNumIters);
+        for (int j = 0; j < kNumIters; ++ j)
+            DG_CUDA_RUNTIME_CHECK(cudaEventElapsedTime(&times[j], events[j * 2], events[j * 2 + 1]));
+        std::nth_element(times.begin(), times.begin() + kNumIters / 2, times.end());
+        const float us = times[kNumIters / 2] * 1000;
+        if (us < best_us)
+            best_us = us, best = choice;
+    }
+    for (auto& event: events)
+        DG_CUDA_RUNTIME_CHECK(cudaEventDestroy(event));
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        std::cout << "SM120 autotune " << key << ": " << best.layout.block_m << "x" << best.layout.block_n
+                  << (best.use_stream_k ? " + stream-K" : "") << ", " << best_us << " us (cold L2)" << std::endl;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    cache[key] = best;
+    return best;
+}
+
 static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                            const GemmDesc& desc,
                                            const torch::Tensor& a, const torch::Tensor& sfa,
@@ -87,77 +285,28 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                            const int& gran_k_a, const int& gran_k_b) {
     // `desc.k` counts logical elements, so FP4 (packed two per byte) has `a.size(-1) * 2 == k`
     const bool is_fp4 = a.scalar_type() == kPackedFP4;
-    DG_HOST_ASSERT(is_fp4 == (b.scalar_type() == kPackedFP4));
+    const bool is_bf16 = a.scalar_type() == torch::kBFloat16;
+    DG_HOST_ASSERT(a.scalar_type() == b.scalar_type());
+    DG_HOST_ASSERT(is_bf16 == (desc.kernel_type == KernelType::KernelNoSF));
     DG_HOST_ASSERT(gran_k_a == gran_k_b);
-    DG_HOST_ASSERT(is_fp4 ? gran_k_a == 32 : (gran_k_a == 32 or gran_k_a == 128));
+    // BF16 has no scales and passes a nominal granularity of 32
+    DG_HOST_ASSERT((is_fp4 or is_bf16) ? gran_k_a == 32 : (gran_k_a == 32 or gran_k_a == 128));
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
     // K is whole scale groups (the packed scale tensors are padded, and TMA zero-fills the tail K block), and the
     // epilogue stores 4 BF16 columns (8 bytes) at a time
-    DG_HOST_ASSERT(desc.k % gran_k_a == 0);
+    // (BF16: 16-byte aligned rows)
+    DG_HOST_ASSERT(is_bf16 ? desc.k % 8 == 0 : desc.k % gran_k_a == 0);
     DG_HOST_ASSERT(desc.n % 8 == 0 and d.stride(-2) % 4 == 0);
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(d.data_ptr()) % 8 == 0);
-    DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(is_bf16 or (sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt));
 
-    const auto config = get_best_config<SM120ArchSpec>(desc);
-    const auto stream_k = SM120ArchSpec::get_stream_k_config(desc, config.layout);
-
-    // Stream-K buffers: FP32 partial slots, and per-tile arrival counters that kernels reset themselves
-    std::optional<torch::Tensor> workspace;
-    int* counters = nullptr;
-    if (stream_k.num_ctas > 0) {
-        workspace = torch::empty({stream_k.num_slots, desc.m, desc.n}, d.options().dtype(torch::kFloat));
-        counters = get_stream_k_counters();
-    }
-
-    // Requires no TMA splits: a tile row is exactly one 128-byte swizzle atom
-    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
-    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
-    const auto tensor_map_a = make_tma_a_desc(desc.major_a, a, desc.m, desc.k,
-                                              config.storage_config.load_block_m,
-                                              config.layout.block_k,
-                                              static_cast<int>(a.stride(get_non_contiguous_dim(desc.major_a))), num_groups_a,
-                                              config.storage_config.swizzle_a_mode, 0, false,
-                                              /* fp4_unpacked_smem */ false);
-    const auto tensor_map_b = make_tma_b_desc(desc.major_b, b, desc.n, desc.k,
-                                              config.storage_config.load_block_n,
-                                              config.layout.block_k,
-                                              static_cast<int>(b.stride(get_non_contiguous_dim(desc.major_b))), num_groups_b,
-                                              config.storage_config.swizzle_b_mode, 0, false,
-                                              /* fp4_unpacked_smem */ false);
-
-    // Scales are TMA-loaded with each stage: `[(G,) MN, ceil(K / (gran_k * 4))]` int32, MN-major (TMA-aligned). A K block
-    // needs 2 words for FP4 (256 elements) and 1 for FP8 (128 elements, a quarter of a 128-granularity word)
-    const int num_sf_words_per_block = is_fp4 ? 2 : 1;
-    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, desc.m, desc.k,
-                                                 config.storage_config.load_block_m, gran_k_a, num_groups_sfa, 0, 0, false,
-                                                 num_sf_words_per_block, static_cast<int>(sfa.stride(-1)));
-    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, desc.n, desc.k,
-                                                 config.storage_config.load_block_n, gran_k_b, num_groups_sfb, 0, 0, false,
-                                                 num_sf_words_per_block, static_cast<int>(sfb.stride(-1)));
-
-    SM120FP8FP4Gemm1D1DRuntime::compile_and_launch(tag, {
-        .gemm_desc = desc,
-        .gemm_config = config,
-        .options = {
-            .num_smem_bytes = config.pipeline_config.smem_size,
-            .grid_dim = dim3(stream_k.num_ctas > 0 ? stream_k.num_ctas : config.launch_config.num_sms, 1, 1),
-            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
-            .cluster_dim = dim3(1, 1, 1),
-        },
-        .is_fp4 = is_fp4,
-        .gran_k = gran_k_a,
-        .use_stream_k = stream_k.num_ctas > 0,
-        .grouped_layout = grouped_layout,
-        .d = d.data_ptr(),
-        .ld_d = static_cast<int>(d.stride(-2)),
-        .workspace = workspace.has_value() ? workspace->data_ptr() : nullptr,
-        .counters = counters,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_sfa = tensor_map_sfa,
-        .tensor_map_sfb = tensor_map_sfb,
-    });
+    const auto run = [&](const SM120BlockScaledChoice& choice) {
+        sm120_fp8_fp4_gemm_1d1d_run(tag, desc, choice, a, sfa, b, sfb, d, grouped_layout,
+                                    num_groups_a, num_groups_b, num_groups_sfa, num_groups_sfb, gran_k_a);
+    };
+    // NOTES: tuning runs the GEMM several times into `d`, which is overwritten by the final launch below
+    run(sm120_block_scaled_choice(desc, run));
 }
 
 static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -192,10 +341,13 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                          const int& gran_k_a, const int& gran_k_b,
                                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                          const std::string& compiled_dims,
-                                                         const bool& use_psum_layout) {
-    DG_HOST_ASSERT(not use_psum_layout and "SM120 block-scaled GEMM does not support the PSUM layout");
+                                                         const bool& use_psum_layout,
+                                                         const std::optional<int>& expected_m_for_psum_layout) {
+    // Only the PSUM layout can use an expected M
+    if (expected_m_for_psum_layout)
+        DG_HOST_ASSERT(use_psum_layout);
     const auto desc = GemmDesc {
-        .gemm_type = GemmType::MGroupedContiguous,
+        .gemm_type = use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous,
         .kernel_type = KernelType::Kernel1D1D,
         .m = m, .n = n, .k = k, .num_groups = num_groups,
         .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
@@ -205,8 +357,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
-        .expected_m = m, .expected_n = n, .expected_k = k,
-        .expected_num_groups = 1
+        .expected_m = expected_m_for_psum_layout.value_or(m), .expected_n = n, .expected_k = k,
+        .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
     };
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d", desc, a, sfa, b, sfb, d,
                                    m_indices.data_ptr(), 1, num_groups, 1, num_groups, gran_k_a, gran_k_b);
@@ -236,6 +388,68 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
     };
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_fp8_fp4_gemm_masked_1d1d", desc, a, sfa, b, sfb, d,
                                    masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, gran_k_a, gran_k_b);
+}
+
+// BF16 (no scales) on the same kernel; the scale tensors are unused
+static GemmDesc sm120_bf16_desc(const GemmType& gemm_type, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                const int& num_groups, const int& m, const int& n, const int& k,
+                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                const std::string& compiled_dims,
+                                const int& expected_m, const int& expected_num_groups) {
+    return GemmDesc {
+        .gemm_type = gemm_type,
+        .kernel_type = KernelType::KernelNoSF,
+        .m = m, .n = n, .k = k, .num_groups = num_groups,
+        .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = major_a, .major_b = major_b,
+        .with_accumulation = false,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
+        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = expected_num_groups
+    };
+}
+
+static void sm120_bf16_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& b,
+                                 const std::optional<torch::Tensor>& c,
+                                 const torch::Tensor& d,
+                                 const int& m, const int& n, const int& k,
+                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                 const std::string& compiled_dims) {
+    DG_HOST_ASSERT(not c.has_value() and "SM120 BF16 GEMM does not support accumulation");
+    const auto desc = sm120_bf16_desc(GemmType::Normal, a, b, d, 1, m, n, k, major_a, major_b, compiled_dims, m, 1);
+    sm120_fp8_fp4_gemm_1d1d_launch("sm120_bf16_gemm_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d, nullptr,
+                                   1, 1, 1, 1, 32, 32);
+}
+
+static void sm120_m_grouped_bf16_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& b,
+                                                      const torch::Tensor& d, const torch::Tensor& grouped_layout,
+                                                      const int& num_groups, const int& m, const int& n, const int& k,
+                                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                      const std::string& compiled_dims,
+                                                      const bool& use_psum_layout,
+                                                      const std::optional<int>& expected_m_for_psum_layout) {
+    if (expected_m_for_psum_layout)
+        DG_HOST_ASSERT(use_psum_layout);
+    const auto desc = sm120_bf16_desc(use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous,
+                                      a, b, d, num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                      expected_m_for_psum_layout.value_or(m),
+                                      expected_m_for_psum_layout.has_value() ? num_groups : 1);
+    sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_bf16_gemm_contiguous_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d,
+                                   grouped_layout.data_ptr(), 1, num_groups, 1, num_groups, 32, 32);
+}
+
+static void sm120_m_grouped_bf16_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& b,
+                                                  const torch::Tensor& d, const torch::Tensor& masked_m,
+                                                  const int& num_groups, const int& m, const int& n, const int& k,
+                                                  const int& expected_m,
+                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                  const std::string& compiled_dims) {
+    const auto desc = sm120_bf16_desc(GemmType::MGroupedMasked, a, b, d, num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                      expected_m, num_groups);
+    sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_bf16_gemm_masked_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d,
+                                   masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, 32, 32);
 }
 
 } // namespace deep_gemm

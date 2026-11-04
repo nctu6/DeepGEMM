@@ -31,6 +31,18 @@ CUTLASS_DEVICE uint32_t get_swizzle_128b_offset(const uint32_t& row, const uint3
     return row * 128 + ((chunk ^ (row & 7)) << 4);
 }
 
+/// Same for a tile whose rows are `kRowBytes` = 64 or 128 bytes, TMA-swizzled with the matching mode
+///  - 128B (`Swizzle<3, 4, 3>`): chunk ^= row % 8
+///  - 64B (`Swizzle<2, 4, 3>`, address bits [7, 8] into [4, 5]): chunk ^= (row / 2) % 4
+template <uint32_t kRowBytes>
+CUTLASS_DEVICE uint32_t get_swizzle_offset(const uint32_t& row, const uint32_t& chunk) {
+    DG_STATIC_ASSERT(kRowBytes == 64 or kRowBytes == 128, "Unsupported swizzle");
+    if constexpr (kRowBytes == 128)
+        return row * 128 + ((chunk ^ (row & 7)) << 4);
+    else
+        return row * 64 + ((chunk ^ ((row >> 1) & 3)) << 4);
+}
+
 /// `D = A * B + D` with E4M3 A (16x32, row) and B (32x8, col), FP32 accumulation
 ///  - A fragment: `a[0]`: (row g, k 4t..4t+3), `a[1]`: (row g+8, same k), `a[2]`/`a[3]`: k + 16
 ///  - B fragment: `b[0]`: (k 4t..4t+3, col g), `b[1]`: k + 16
@@ -92,6 +104,22 @@ struct FP4BlockScaledMMA {
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
                        "r"(b[0]), "r"(b[1]),
                        "r"(sfa), "r"(sfb));
+    }
+};
+
+/// BF16 `m16n8k16`, FP32 accumulation, no scales. A step consumes 32 bytes of each operand row, like the FP8 `m16n8k32`,
+/// and the fragments are the same `ldmatrix` patterns (A: 4 regs, B: 2 regs, D: 4 floats)
+struct BF16MMA {
+    static constexpr uint32_t M = 16;
+    static constexpr uint32_t N = 8;
+    static constexpr uint32_t K = 16;
+
+    CUTLASS_DEVICE static void mma(const uint32_t* a, const uint32_t* b, float* d, const uint32_t&, const uint32_t&) {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                       "r"(b[0]), "r"(b[1]));
     }
 };
 

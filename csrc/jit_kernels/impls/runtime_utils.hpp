@@ -116,6 +116,16 @@ static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const in
     }
 }
 
+// L2 promotion of 2D TMA loads (`DG_TMA_L2_PROMOTION` = 0 / 64 / 128 / 256 bytes, developer override; default 256)
+static CUtensorMapL2promotion get_tma_l2_promotion() {
+    switch (deep_jit::get_env<int>("DG_TMA_L2_PROMOTION", 256)) {
+        case 0:   return CU_TENSOR_MAP_L2_PROMOTION_NONE;
+        case 64:  return CU_TENSOR_MAP_L2_PROMOTION_L2_64B;
+        case 128: return CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+        default:  return CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+    }
+}
+
 static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
                                     int gmem_inner_dim, int gmem_outer_dim,
                                     int smem_inner_dim, int smem_outer_dim,
@@ -154,7 +164,7 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
         2, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
-        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+        get_tma_l2_promotion(), CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     return tensor_map;
 }
 

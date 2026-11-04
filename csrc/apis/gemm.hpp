@@ -265,7 +265,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
-                                                     compiled_dims, use_psum_layout);
+                                                     compiled_dims, use_psum_layout, expected_m_for_psum_layout);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
@@ -566,6 +566,11 @@ static void bf16_gemm_nt(const torch::Tensor& a,
         sm90_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
         sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, resolved_epilogue_class);
+    } else if (arch_major == 12) {
+        DG_HOST_ASSERT((not epilogue_alpha.has_value() or epilogue_alpha.value() == 1.0f) and "BF16 GEMM alpha requires SM100");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+        sm120_bf16_gemm_1d1d(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -654,6 +659,11 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
                                              use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
                                              resolve_epilogue_class(epilogue_class, std::nullopt, d));
+    } else if (arch_major == 12) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        sm120_m_grouped_bf16_gemm_contiguous_1d1d(a, b, d, grouped_layout,
+                                                  num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                                  use_psum_layout, expected_m_for_psum_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -705,6 +715,10 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
         sm100_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
                                          num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims,
                                          resolve_epilogue_class(epilogue_class, std::nullopt, d));
+    } else if (arch_major == 12) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        sm120_m_grouped_bf16_gemm_masked_1d1d(a, b, d, masked_m,
+                                              num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

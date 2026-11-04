@@ -105,6 +105,31 @@ static int* get_stream_k_counters() {
     return ptr;
 }
 
+// Per-stream stream-K partial workspace (FP32), reused by every GEMM on the stream
+//  - one buffer instead of a fresh allocation per call: under CUDA graphs every captured GEMM would otherwise own its
+//    own partials, so a replay cycles through all of them in DRAM instead of rewriting one L2-resident buffer
+//    (measured: block-scaled FP4 o_proj M=128 with stream-K, 19 us with per-call buffers)
+//  - GEMMs of one stream run in order (with PDL, a kernel still waits for its predecessor before touching memory),
+//    so they can share it; separate streams get separate buffers
+//  - growing allocates a new buffer and keeps the old one alive, as graphs captured earlier still point to it; the
+//    allocation runs in relaxed capture mode and is never freed, like the counters
+static float* get_stream_k_workspace(const size_t& num_floats) {
+    static std::mutex mutex;
+    static std::unordered_map<cudaStream_t, std::pair<float*, size_t>> buffers;
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& [ptr, capacity] = buffers[stream];
+    if (ptr == nullptr or capacity < num_floats) {
+        // Round up generously so a few shapes settle on one buffer
+        const size_t new_capacity = std::max<size_t>(num_floats, capacity * 2);
+        c10::cuda::CUDAStreamCaptureModeGuard guard(cudaStreamCaptureModeRelaxed);
+        DG_CUDA_RUNTIME_CHECK(cudaMalloc(&ptr, new_capacity * sizeof(float)));
+        capacity = new_capacity;
+    }
+    return ptr;
+}
+
 static void sm120_fp8_gemm_1d2d_launch(const std::string& tag,
                                        const GemmDesc& desc,
                                        const torch::Tensor& a, const torch::Tensor& sfa,
@@ -123,10 +148,10 @@ static void sm120_fp8_gemm_1d2d_launch(const std::string& tag,
     const auto stream_k = SM120ArchSpec::get_stream_k_config(desc, config.layout);
 
     // Stream-K buffers: FP32 partial slots, and per-tile arrival counters that kernels reset themselves
-    std::optional<torch::Tensor> workspace;
+    float* workspace = nullptr;
     int* counters = nullptr;
     if (stream_k.num_ctas > 0) {
-        workspace = torch::empty({stream_k.num_slots, desc.m, desc.n}, d.options().dtype(torch::kFloat));
+        workspace = get_stream_k_workspace(static_cast<size_t>(stream_k.num_slots) * desc.m * desc.n);
         counters = get_stream_k_counters();
     }
 
@@ -153,7 +178,12 @@ static void sm120_fp8_gemm_1d2d_launch(const std::string& tag,
         .gemm_config = config,
         .options = {
             .num_smem_bytes = config.pipeline_config.smem_size,
-            .grid_dim = dim3(stream_k.num_ctas > 0 ? stream_k.num_ctas : config.launch_config.num_sms, 1, 1),
+            // Data-parallel normal GEMMs launch one CTA per tile when there are fewer tiles than SMs (idle persistent
+            // CTAs still pay for dispatch and their prologue, and sit between this kernel and the next under PDL)
+            .grid_dim = dim3(stream_k.num_ctas > 0 ? stream_k.num_ctas :
+                             (desc.gemm_type == GemmType::Normal ?
+                                  std::min(config.launch_config.num_sms, SM120ArchSpec::get_num_tiles(desc, config.layout)) :
+                                  config.launch_config.num_sms), 1, 1),
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(1, 1, 1),
         },
@@ -163,7 +193,7 @@ static void sm120_fp8_gemm_1d2d_launch(const std::string& tag,
         .d = d.data_ptr(),
         .ld_d = static_cast<int>(d.stride(-2)),
         .use_stream_k = stream_k.num_ctas > 0,
-        .workspace = workspace.has_value() ? workspace->data_ptr() : nullptr,
+        .workspace = workspace,
         .counters = counters,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,

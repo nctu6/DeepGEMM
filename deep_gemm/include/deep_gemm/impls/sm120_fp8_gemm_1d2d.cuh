@@ -130,9 +130,6 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
     constexpr uint32_t kNumTMARegisters = 40;
     constexpr uint32_t kNumMathRegisters = kNumMathThreads == 128 ? 248 : 232;
 
-    // Wait for primary kernel completion
-    cudaGridDependencySynchronize();
-
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
@@ -165,6 +162,14 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
         }
     };
 
+    // PDL: the weights (B) do not depend on the previous kernel. Before waiting for it, the producer issues the first
+    // `kNumStages` K blocks of B of its first tile straight into their pipeline stages, so a CTA resident while the
+    // previous kernel finishes starts with a full pipeline of weights (same scheme as `sm120_fp8_fp4_gemm_1d1d_impl`).
+    // Only normal data-parallel GEMMs know their first tile without reading `grouped_layout`
+    static constexpr bool kPreissueWeights = kGemmType == GemmType::Normal and not kUseStreamK;
+    const uint32_t num_preissued_k_blocks = kPreissueWeights and blockIdx.x < scheduler.num_blocks ?
+                                            cute::min(num_k_blocks, kNumStages) : 0;
+
     // Pipeline phases
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
@@ -179,6 +184,25 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
 
         if (warp_idx == kNumMathWarps and cute::elect_one_sync()) {
             constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
+            if constexpr (kPreissueWeights) {
+                if (num_preissued_k_blocks > 0) {
+                    uint32_t first_m_block_idx, first_n_block_idx;
+                    scheduler.get_swizzled_block_idx(blockIdx.x, first_m_block_idx, first_n_block_idx);
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_preissued_k_blocks; ++ k_block_idx) {
+                        // The stages start empty. The transaction is expected without an arrival, so the B bytes landing
+                        // cannot complete the phase: the single arrival comes with A, after the wait
+                        auto& full_barrier = *full_barriers[k_block_idx];
+                        full_barrier.expect_transaction(SMEM_B_SIZE_PER_STAGE);
+                        tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
+                                 smem_b[k_block_idx], k_block_idx * BLOCK_K, first_n_block_idx * BLOCK_N);
+                    }
+                }
+            }
+
+            // Wait for the previous kernel before loading activations (and before reading `grouped_layout`)
+            cudaGridDependencySynchronize();
+
+            bool is_first_task = true;
             while (get_next_task(m_block_idx, n_block_idx)) {
                 for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
                     // Wait consumer release
@@ -188,15 +212,28 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
                     tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3>(&tensor_map_a, &full_barrier,
                              smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx));
-                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
-                             smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
-                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+                    // B of the first stages of the first task was issued before the wait
+                    if (is_first_task and k_block_idx < num_preissued_k_blocks) {
+                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
+                    } else {
+                        tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
+                                 smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
+                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+                    }
                 }
+                is_first_task = false;
             }
+            // PDL: let the next kernel launch once its early weight loads no longer compete with ours for DRAM: here for
+            // short K (every load is issued), at the end of the math warps' mainloop otherwise
+            if (num_k_blocks <= kNumStages)
+                cudaTriggerProgrammaticLaunchCompletion();
         }
     } else {
         // Math warps
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+
+        // Wait for the previous kernel before reading its results (SFA) or writing memory it may still read
+        cudaGridDependencySynchronize();
 
         const uint32_t warp_m_idx = warp_idx / kNumWarpsN;
         const uint32_t warp_n_idx = warp_idx % kNumWarpsN;
@@ -392,6 +429,10 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                     }
                 }
             }
+
+            // PDL (long K, see the producer): the mainloop of this CTA is done
+            if (num_k_blocks > kNumStages)
+                cudaTriggerProgrammaticLaunchCompletion();
 
             // Write back BF16 results directly from registers
             // NOTES: lanes `t` and `t ^ 1` exchange halves so that each stores 4 consecutive columns (8 bytes), and
