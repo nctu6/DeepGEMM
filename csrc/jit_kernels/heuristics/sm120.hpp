@@ -157,13 +157,18 @@ struct SM120ArchSpec {
         int num_slots = 0;  // Max CTAs contributing to one tile, i.e. workspace partial slots
     };
 
+    // Bytes along K of an operand row: packed FP4 holds two elements per byte, and `block_k` counts bytes
+    static int get_k_bytes(const GemmDesc& desc, const int& k) {
+        return desc.a_dtype == kPackedFP4 ? k / 2 : k;
+    }
+
     // Stream-K: spread `num_tiles x num_k_blocks` iterations evenly over CTAs, for normal GEMMs whose
     // tiles do not fill whole waves (decoding and wave-quantized shapes)
     static StreamKConfig get_stream_k_config(const GemmDesc& desc, const Layout& layout) {
         if (desc.gemm_type != GemmType::Normal)
             return {};
         const int64_t num_tiles = get_num_tiles(desc, layout);
-        const int64_t num_k_blocks = ceil_div(desc.k, layout.block_k);
+        const int64_t num_k_blocks = ceil_div(get_k_bytes(desc, desc.k), layout.block_k);
         // Counters are per tile
         if (num_tiles > kNumMaxStreamKTiles)
             return {};
@@ -178,9 +183,21 @@ struct SM120ArchSpec {
         // Compare with data-parallel waves (in K blocks per CTA), requiring a clear win
         const int64_t dp_cost = ceil_div<int64_t>(num_tiles, desc.num_sms) * num_k_blocks;
         const int64_t sk_cost = ceil_div<int64_t>(num_iters, num_ctas) + kStreamKFixupCost;
-        // NOTES: opt-in only: under CUDA graphs with cold weights (the serving condition) data-parallel tiles
-        // were faster or equal on all measured DeepSeek shapes (`scripts/sm120_sweep_graph.py --sk 0,1`)
-        if (deep_jit::get_env<int>("DG_SM120_FORCE_STREAM_K", 0) != 1 or sk_cost * 10 > dp_cost * 9)
+        // NOTES: the FP32-scale kernel is opt-in only: under CUDA graphs with cold weights (the serving condition)
+        // data-parallel tiles were faster or equal on all measured DeepSeek shapes (`scripts/sm120_sweep_graph.py
+        // --sk 0,1`). The block-scaled kernel streams half the bytes per K element, so its decode shapes are bound by
+        // the per-CTA K loop instead, and splitting K wins: it follows the cost model unless forced either way
+        const bool is_block_scaled = desc.kernel_type == KernelType::Kernel1D1D;
+        // Opt-in only for both kernels (`DG_SM120_FORCE_STREAM_K=1`; `=2`, tests only, skips the cost-model gate).
+        // The block-scaled kernel streams half the bytes per K element, so its per-CTA K loop is cheaper relative to
+        // the fixed reduction cost than the model (fitted on the FP32 kernel) assumes: forcing it on measured a clear
+        // win on some shapes (N=512) and a clear loss on others (N=2112) at the same M, so a dedicated fit is needed
+        // before enabling it by default -- see the "Open" row in the status log
+        (void)is_block_scaled;
+        const int force = deep_jit::get_env<int>("DG_SM120_FORCE_STREAM_K", 0);
+        if (force == 0)
+            return {};
+        if (force != 2 and sk_cost * 10 > dp_cost * 9)
             return {};
 
         // A tile spans at most `ceil(num_k_blocks / min_range) + 1` CTAs
@@ -204,8 +221,9 @@ struct SM120ArchSpec {
         const double m = desc.get_expected_m(), n = desc.get_expected_n(), k = desc.get_expected_k();
         const double num_groups_a = desc.gemm_type == GemmType::MGroupedMasked ? desc.get_expected_num_groups() : 1;
         const double num_groups_b = desc.gemm_type == GemmType::Normal ? 1 : desc.num_groups;
-        const double num_k_blocks = ceil_div(desc.get_expected_k(), layout.block_k);
-        const double dram = (num_groups_b * n * k + num_groups_a * (m * k + 2 * m * n)) / kDRAMBytesPerUnit;
+        const double k_bytes = get_k_bytes(desc, desc.get_expected_k());
+        const double num_k_blocks = ceil_div(static_cast<int>(k_bytes), layout.block_k);
+        const double dram = (num_groups_b * n * k_bytes + num_groups_a * (m * k_bytes + 2 * m * n)) / kDRAMBytesPerUnit;
         const double l2 = static_cast<double>(num_tiles) * num_k_blocks * (layout.block_m + layout.block_n) * layout.block_k / kL2BytesPerUnit;
         const double cta = num_k_blocks * get_relative_wave_cost(layout) / 1000.0 * kCTACostScale + kWaveOverhead;
         double cost = 0;

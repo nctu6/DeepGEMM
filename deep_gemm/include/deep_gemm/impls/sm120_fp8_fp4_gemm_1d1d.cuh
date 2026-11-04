@@ -36,7 +36,10 @@ namespace deep_gemm {
 //    byte `j` of the word, with `kGranK == 128` all MMAs of a K block share one byte
 //  - A lane supplies the SFA scale of row `g` (lane `t == 0`) or `g + 8` (lane `t == 1`) and the SFB scale of column `g`
 //    (lane `t == 0`), where `g = lane / 4`, `t = lane % 4`
-// The TMA pipeline, scheduler, warp tiling and epilogue are shared with `sm120_fp8_gemm_1d2d_impl`
+// The TMA pipeline, scheduler, warp tiling, stream-K and epilogue are shared with `sm120_fp8_gemm_1d2d_impl`: with
+// `kUseStreamK` (normal GEMMs whose tiles fill the GPU poorly, e.g. decoding with a long K), the
+// `num_tiles x num_k_blocks` iteration space is split evenly over the CTAs, and a tile covered by several CTAs is
+// reduced in split order through an FP32 `workspace` by the last one to finish (tracked by self-resetting `counters`)
 template <bool kIsFP4, uint32_t kGranK,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumGroups,
@@ -45,9 +48,11 @@ template <bool kIsFP4, uint32_t kGranK,
           uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumSMs, GemmType kGemmType,
+          bool kUseStreamK,
           typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+                             float* workspace, int* counters,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -63,6 +68,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedContiguous or
                      kGemmType == GemmType::MGroupedMasked, "Unsupported GEMM type");
+    DG_STATIC_ASSERT(not kUseStreamK or kGemmType == GemmType::Normal, "Stream-K is only for normal GEMMs");
     DG_STATIC_ASSERT(kGranK == 32 or (not kIsFP4 and kGranK == 128), "FP4 needs 32-element scales; FP8 accepts 32 or 128");
     static constexpr uint32_t kElemsPerBlock = kIsFP4 ? BLOCK_K * 2 : BLOCK_K;
     static constexpr uint32_t kNumKSteps = BLOCK_K / 32;   // 32 bytes of A/B per MMA, for both FP8 and FP4
@@ -133,6 +139,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_BARRIER_OFFSET);
     auto full_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
+    auto smem_is_last_split = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 2);
     if (warp_idx == kNumMathWarps + 1 and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
@@ -154,6 +161,33 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
 
+    // Task iteration: a task is a tile, or with stream-K, a K range of a tile
+    uint32_t tile_idx = 0, k_block_begin = 0, k_block_end = num_k_blocks;
+    uint64_t sk_iter = 0, sk_iter_end = 0, sk_num_iters = 0;
+    if constexpr (kUseStreamK) {
+        sk_num_iters = static_cast<uint64_t>(scheduler.num_blocks) * num_k_blocks;
+        sk_iter = sk_num_iters * blockIdx.x / gridDim.x;
+        sk_iter_end = sk_num_iters * (blockIdx.x + 1) / gridDim.x;
+    }
+    // The CTA whose range contains iteration `x`
+    const auto get_sk_owner = [&](const uint64_t& x) -> uint32_t {
+        return static_cast<uint32_t>(((x + 1) * gridDim.x + sk_num_iters - 1) / sk_num_iters - 1);
+    };
+    auto get_next_task = [&](uint32_t& m_block_idx, uint32_t& n_block_idx) -> bool {
+        if constexpr (not kUseStreamK) {
+            return scheduler.get_next_block(m_block_idx, n_block_idx);
+        } else {
+            if (sk_iter >= sk_iter_end)
+                return false;
+            tile_idx = static_cast<uint32_t>(sk_iter / num_k_blocks);
+            k_block_begin = static_cast<uint32_t>(sk_iter % num_k_blocks);
+            k_block_end = static_cast<uint32_t>(cute::min<uint64_t>(num_k_blocks, k_block_begin + (sk_iter_end - sk_iter)));
+            sk_iter += k_block_end - k_block_begin;
+            scheduler.get_swizzled_block_idx(tile_idx, m_block_idx, n_block_idx);
+            return true;
+        }
+    };
+
     // Pipeline phases
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
@@ -168,8 +202,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
 
         if (warp_idx == kNumMathWarps and cute::elect_one_sync()) {
             constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
-            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+            while (get_next_task(m_block_idx, n_block_idx)) {
+                for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
                     // Wait consumer release
                     empty_barriers[stage_idx]->wait(phase ^ 1);
 
@@ -211,7 +245,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
         const uint32_t b_ld_row = warp_n_idx * WARP_N + (lane_idx >> 4) * 8 + (lane_idx & 7);
         const uint32_t b_ld_chunk = (lane_idx >> 3) & 1;
 
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (get_next_task(m_block_idx, n_block_idx)) {
             // Scale rows/columns of this lane inside the stage's scale tile
             //  - SFA: lanes `t == 0` and `t == 1` supply rows `g` and `g + 8` of every M tile
             //  - SFB: every lane supplies column `g` of every N tile (only `t == 0` is read by the MMA)
@@ -239,7 +273,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
 
             if (scheduler.is_computation_valid(m_block_idx, warp_m_idx * WARP_M)) {
                 #pragma unroll 1
-                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
                     // Wait TMA arrivals (operands and scales)
                     full_barriers[stage_idx]->wait(phase);
 
@@ -302,9 +336,79 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                 }
             } else {
                 #pragma unroll 1
-                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
                     full_barriers[stage_idx]->wait(phase);
                     empty_barrier_arrive();
+                }
+            }
+
+            // Stream-K: publish this CTA's FP32 partial of a shared tile, and let the last contributor reduce
+            if constexpr (kUseStreamK) {
+                const uint32_t first_owner = get_sk_owner(static_cast<uint64_t>(tile_idx) * num_k_blocks);
+                const uint32_t num_contributors = get_sk_owner(static_cast<uint64_t>(tile_idx + 1) * num_k_blocks - 1) - first_owner + 1;
+                const uint32_t k_split_idx = blockIdx.x - first_owner;
+                // A tile computed by a single CTA is stored directly
+                if (num_contributors > 1) {
+                    const uint64_t split_stride = static_cast<uint64_t>(shape_m) * shape_n;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumMTiles; ++ i) {
+                        #pragma unroll
+                        for (uint32_t half = 0; half < 2; ++ half) {
+                            const uint32_t row = m_block_idx * BLOCK_M + warp_m_idx * WARP_M + i * 16 + group_row + half * 8;
+                            if (row >= shape_m)
+                                continue;
+                            auto partial_row = workspace + k_split_idx * split_stride + static_cast<uint64_t>(row) * shape_n;
+                            #pragma unroll
+                            for (uint32_t j = 0; j < kNumNTiles; ++ j) {
+                                const uint32_t col = n_block_idx * BLOCK_N + warp_n_idx * WARP_N + j * 8 + group_col * 2;
+                                if (col >= shape_n)
+                                    continue;
+                                const uint32_t idx = (i * kNumNTiles + j) * 4 + half * 2;
+                                __stcg(reinterpret_cast<float2*>(partial_row + col), make_float2(accum[idx], accum[idx + 1]));
+                            }
+                        }
+                    }
+                    __threadfence();
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
+                    if (threadIdx.x == 0) {
+                        const bool is_last = atomicAdd(counters + tile_idx, 1) == static_cast<int>(num_contributors) - 1;
+                        // Reset for the next launch (all splits of this tile have arrived)
+                        if (is_last)
+                            counters[tile_idx] = 0;
+                        *smem_is_last_split = is_last;
+                    }
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
+                    if (not *smem_is_last_split)
+                        continue;
+                    __threadfence();
+
+                    // Deterministic reduction in split order. The splits are summed in order, but unrolled so that the
+                    // loads of consecutive splits overlap instead of each waiting out an L2 round trip
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumAccum; ++ i)
+                        accum[i] = 0;
+                    #pragma unroll 4
+                    for (uint32_t split = 0; split < num_contributors; ++ split) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumMTiles; ++ i) {
+                            #pragma unroll
+                            for (uint32_t half = 0; half < 2; ++ half) {
+                                const uint32_t row = m_block_idx * BLOCK_M + warp_m_idx * WARP_M + i * 16 + group_row + half * 8;
+                                if (row >= shape_m)
+                                    continue;
+                                auto partial_row = workspace + split * split_stride + static_cast<uint64_t>(row) * shape_n;
+                                #pragma unroll
+                                for (uint32_t j = 0; j < kNumNTiles; ++ j) {
+                                    const uint32_t col = n_block_idx * BLOCK_N + warp_n_idx * WARP_N + j * 8 + group_col * 2;
+                                    if (col >= shape_n)
+                                        continue;
+                                    const uint32_t idx = (i * kNumNTiles + j) * 4 + half * 2;
+                                    const auto value = __ldcg(reinterpret_cast<const float2*>(partial_row + col));
+                                    accum[idx] += value.x, accum[idx + 1] += value.y;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

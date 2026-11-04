@@ -8,6 +8,7 @@
 #include "../heuristics/sm120.hpp"
 
 #include "runtime_utils.hpp"
+#include "sm120_fp8_gemm_1d2d.hpp"
 
 namespace deep_gemm {
 
@@ -21,8 +22,10 @@ public:
 
         bool is_fp4;
         int gran_k;
+        bool use_stream_k;
         void *grouped_layout, *d;
         int ld_d;
+        void *workspace, *counters;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_sfa;
@@ -45,6 +48,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
+        {},
         {}
     >);
 }};
@@ -59,11 +63,13 @@ static void __instantiate_kernel() {{
         args.gemm_config.pipeline_config.num_stages,
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
+        args.use_stream_k ? "true" : "false",
         to_string(args.gemm_desc.cd_dtype)));
 
         jit->launch(
             kernel, args.options,
             args.grouped_layout, args.d, static_cast<uint32_t>(args.ld_d),
+            args.workspace, args.counters,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b, args.tensor_map_sfa, args.tensor_map_sfb
         );
@@ -94,6 +100,15 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
     DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt);
 
     const auto config = get_best_config<SM120ArchSpec>(desc);
+    const auto stream_k = SM120ArchSpec::get_stream_k_config(desc, config.layout);
+
+    // Stream-K buffers: FP32 partial slots, and per-tile arrival counters that kernels reset themselves
+    std::optional<torch::Tensor> workspace;
+    int* counters = nullptr;
+    if (stream_k.num_ctas > 0) {
+        workspace = torch::empty({stream_k.num_slots, desc.m, desc.n}, d.options().dtype(torch::kFloat));
+        counters = get_stream_k_counters();
+    }
 
     // Requires no TMA splits: a tile row is exactly one 128-byte swizzle atom
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
@@ -126,15 +141,18 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
         .gemm_config = config,
         .options = {
             .num_smem_bytes = config.pipeline_config.smem_size,
-            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .grid_dim = dim3(stream_k.num_ctas > 0 ? stream_k.num_ctas : config.launch_config.num_sms, 1, 1),
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(1, 1, 1),
         },
         .is_fp4 = is_fp4,
         .gran_k = gran_k_a,
+        .use_stream_k = stream_k.num_ctas > 0,
         .grouped_layout = grouped_layout,
         .d = d.data_ptr(),
         .ld_d = static_cast<int>(d.stride(-2)),
+        .workspace = workspace.has_value() ? workspace->data_ptr() : nullptr,
+        .counters = counters,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
