@@ -52,6 +52,14 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
         sm90_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else if (arch_major == 10) {
         sm100_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
+    } else if (arch_major == 12) {
+        // `d = c + sum_s a[s] @ b[s].T`, with c == d: a BF16 GEMM per batch slice, every slice accumulating into the
+        // FP32 D (which already holds c). a[s]/b[s] are [m,k]/[n,k], K-major and contiguous. The BF16-D case routes
+        // through a zeroed FP32 workspace above, so this branch always sees FP32 D with c == d
+        DG_HOST_ASSERT(c.has_value() and c->data_ptr() == d.data_ptr());
+        for (int i = 0; i < s; ++ i)
+            sm120_bf16_gemm_1d1d(a[i], b[i], std::make_optional(d), d, m, n, k,
+                                 cute::UMMA::Major::K, cute::UMMA::Major::K, "mnk", 1.0f);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -240,11 +248,24 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k,
                       gran_k_a, gran_k_b, major_a, major_b, compiled_dims,
                       resolve_epilogue_class(merged_epilogue_class, c, d_tensor));
-    } else {
+    } else if (arch_major == 12) {
+        // SM120: one FP32-scale GEMM per batch, on 2D views of each batch (any row strides; the kernel reads SFA at any
+        // strides). A single batched launch would need 3D TMA descriptors in `sm120_fp8_gemm_1d2d`
+        DG_HOST_ASSERT(merged_epilogue_class == nullptr and "Custom epilogues require SM100");
+        DG_HOST_ASSERT(not c.has_value() and "SM120 FP8 bmm does not support accumulation");
+        DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128 and transformed_sfa.scalar_type() == torch::kFloat);
+        for (int i = 0; i < batch_size; ++ i) {
+            const auto sfb_i = transformed_sfb[i];
+            sm120_fp8_gemm_1d2d(a[i], transformed_sfa[i], b[i], sfb_i, std::nullopt, d_tensor[i], m, n, k,
+                                major_a, major_b, get_major_type_ab(sfb_i), compiled_dims);
+        }
+    } else if (arch_major == 9) {
         DG_HOST_ASSERT(merged_epilogue_class == nullptr and "Custom epilogues require SM100");
         const auto major_sfb = get_major_type_ab(sfb);
         DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         sm90_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
 
