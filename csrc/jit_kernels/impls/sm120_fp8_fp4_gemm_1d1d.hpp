@@ -35,6 +35,7 @@ public:
         bool use_stream_k;
         void *grouped_layout, *d;
         int ld_d;
+        float alpha;
         void *workspace, *counters;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -58,7 +59,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {},
+        {}, {},
         {}
     >);
 }};
@@ -73,12 +74,12 @@ static void __instantiate_kernel() {{
         args.gemm_config.pipeline_config.num_stages,
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        args.use_stream_k ? "true" : "false",
+        args.use_stream_k ? "true" : "false", args.gemm_desc.with_accumulation ? "true" : "false",
         to_string(args.gemm_desc.cd_dtype)));
 
         jit->launch(
             kernel, args.options,
-            args.grouped_layout, args.d, static_cast<uint32_t>(args.ld_d),
+            args.grouped_layout, args.d, static_cast<uint32_t>(args.ld_d), args.alpha,
             args.workspace, args.counters,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b, args.tensor_map_sfa, args.tensor_map_sfb
@@ -111,7 +112,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
                                         void* grouped_layout,
                                         const int& num_groups_a, const int& num_groups_b,
                                         const int& num_groups_sfa, const int& num_groups_sfb,
-                                        const int& gran_k) {
+                                        const int& gran_k, const float& alpha) {
     const bool is_fp4 = a.scalar_type() == kPackedFP4;
     const bool is_bf16 = a.scalar_type() == torch::kBFloat16;
     const auto config = sm120_make_config(desc, choice.layout);
@@ -146,10 +147,10 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
                                               /* fp4_unpacked_smem */ false);
 
     // Scales are TMA-loaded with each stage: `[(G,) MN, ceil(K / (gran_k * 4))]` int32, MN-major (TMA-aligned). An FP4
-    // K block of `block_k` bytes holds `block_k * 2` elements, i.e. `block_k * 2 / 128` words (2 for 128 bytes, 1 for
-    // 64); an FP8 one needs 1 (128 elements, a quarter of a 128-granularity word
+    // K block of `block_k` bytes holds `block_k * 2` elements, i.e. `block_k * 2 / (gran_k * 4)` words (MXFP4: 2 for 128
+    // bytes, 1 for 64; NVFP4: 4 and 2); an FP8 one needs 1 (128 elements, a quarter of a 128-granularity word
     // 64). BF16 has no scales: the kernel never reads the SF descriptors, which just repeat A's
-    const int num_sf_words_per_block = is_fp4 ? config.layout.block_k * 2 / 128 : 1;
+    const int num_sf_words_per_block = is_fp4 ? config.layout.block_k * 2 / (gran_k * 4) : 1;
     const auto tensor_map_sfa = is_bf16 ? tensor_map_a :
                                 make_tma_sf_desc(cute::UMMA::Major::MN, sfa, desc.m, desc.k,
                                                  config.storage_config.load_block_m, gran_k, num_groups_sfa, 0, 0, false,
@@ -181,6 +182,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
         .grouped_layout = grouped_layout,
         .d = d.data_ptr(),
         .ld_d = static_cast<int>(d.stride(-2)),
+        .alpha = alpha,
         .workspace = workspace,
         .counters = counters,
         .tensor_map_a = tensor_map_a,
@@ -282,19 +284,24 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                            void* grouped_layout,
                                            const int& num_groups_a, const int& num_groups_b,
                                            const int& num_groups_sfa, const int& num_groups_sfb,
-                                           const int& gran_k_a, const int& gran_k_b) {
+                                           const int& gran_k_a, const int& gran_k_b,
+                                           const float& alpha) {
     // `desc.k` counts logical elements, so FP4 (packed two per byte) has `a.size(-1) * 2 == k`
     const bool is_fp4 = a.scalar_type() == kPackedFP4;
     const bool is_bf16 = a.scalar_type() == torch::kBFloat16;
     DG_HOST_ASSERT(a.scalar_type() == b.scalar_type());
     DG_HOST_ASSERT(is_bf16 == (desc.kernel_type == KernelType::KernelNoSF));
     DG_HOST_ASSERT(gran_k_a == gran_k_b);
-    // BF16 has no scales and passes a nominal granularity of 32
-    DG_HOST_ASSERT((is_fp4 or is_bf16) ? gran_k_a == 32 : (gran_k_a == 32 or gran_k_a == 128));
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    // FP4: 32-element UE8M0 (MXFP4) or 16-element UE4M3 (NVFP4) scales. BF16 has no scales and passes a nominal 32
+    if (is_fp4)
+        DG_HOST_ASSERT(gran_k_a == 32 or gran_k_a == 16);
+    else
+        DG_HOST_ASSERT(is_bf16 ? gran_k_a == 32 : (gran_k_a == 32 or gran_k_a == 128));
+    DG_HOST_ASSERT(is_bf16 or desc.sf_gran_k == gran_k_a);
+    DG_HOST_ASSERT(d.scalar_type() == desc.cd_dtype and (d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat));
     DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
     // K is whole scale groups (the packed scale tensors are padded, and TMA zero-fills the tail K block), and the
-    // epilogue stores 4 BF16 columns (8 bytes) at a time
+    // epilogue stores 8 bytes at a time (4 BF16 or 2 FP32 columns)
     // (BF16: 16-byte aligned rows)
     DG_HOST_ASSERT(is_bf16 ? desc.k % 8 == 0 : desc.k % gran_k_a == 0);
     DG_HOST_ASSERT(desc.n % 8 == 0 and d.stride(-2) % 4 == 0);
@@ -303,7 +310,7 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
 
     const auto run = [&](const SM120BlockScaledChoice& choice) {
         sm120_fp8_fp4_gemm_1d1d_run(tag, desc, choice, a, sfa, b, sfb, d, grouped_layout,
-                                    num_groups_a, num_groups_b, num_groups_sfa, num_groups_sfb, gran_k_a);
+                                    num_groups_a, num_groups_b, num_groups_sfa, num_groups_sfb, gran_k_a, alpha);
     };
     // NOTES: tuning runs the GEMM several times into `d`, which is overwritten by the final launch below
     run(sm120_block_scaled_choice(desc, run));
@@ -316,8 +323,8 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                     const int& m, const int& n, const int& k,
                                     const int& gran_k_a, const int& gran_k_b,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                    const std::string& compiled_dims) {
-    DG_HOST_ASSERT(not c.has_value() and "SM120 block-scaled GEMM does not support accumulation");
+                                    const std::string& compiled_dims, const float& alpha) {
+    // With `c`, D already holds C (see `early_return`), and the kernel adds to it
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
         .kernel_type = KernelType::Kernel1D1D,
@@ -325,12 +332,13 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
-        .with_accumulation = false,
+        .with_accumulation = c.has_value(),
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
-        .compiled_dims = compiled_dims
+        .compiled_dims = compiled_dims,
+        .sf_gran_k = gran_k_a
     };
-    sm120_fp8_fp4_gemm_1d1d_launch("sm120_fp8_fp4_gemm_1d1d", desc, a, sfa, b, sfb, d, nullptr, 1, 1, 1, 1, gran_k_a, gran_k_b);
+    sm120_fp8_fp4_gemm_1d1d_launch("sm120_fp8_fp4_gemm_1d1d", desc, a, sfa, b, sfb, d, nullptr, 1, 1, 1, 1, gran_k_a, gran_k_b, alpha);
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -357,11 +365,12 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
+        .sf_gran_k = gran_k_a,
         .expected_m = expected_m_for_psum_layout.value_or(m), .expected_n = n, .expected_k = k,
         .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
     };
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d", desc, a, sfa, b, sfb, d,
-                                   m_indices.data_ptr(), 1, num_groups, 1, num_groups, gran_k_a, gran_k_b);
+                                   m_indices.data_ptr(), 1, num_groups, 1, num_groups, gran_k_a, gran_k_b, 1.0f);
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -384,10 +393,11 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
+        .sf_gran_k = gran_k_a,
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_fp8_fp4_gemm_masked_1d1d", desc, a, sfa, b, sfb, d,
-                                   masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, gran_k_a, gran_k_b);
+                                   masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, gran_k_a, gran_k_b, 1.0f);
 }
 
 // BF16 (no scales) on the same kernel; the scale tensors are unused
@@ -395,7 +405,8 @@ static GemmDesc sm120_bf16_desc(const GemmType& gemm_type, const torch::Tensor& 
                                 const int& num_groups, const int& m, const int& n, const int& k,
                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                 const std::string& compiled_dims,
-                                const int& expected_m, const int& expected_num_groups) {
+                                const int& expected_m, const int& expected_num_groups,
+                                const bool& with_accumulation) {
     return GemmDesc {
         .gemm_type = gemm_type,
         .kernel_type = KernelType::KernelNoSF,
@@ -403,7 +414,7 @@ static GemmDesc sm120_bf16_desc(const GemmType& gemm_type, const torch::Tensor& 
         .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
-        .with_accumulation = false,
+        .with_accumulation = with_accumulation,
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
@@ -416,11 +427,12 @@ static void sm120_bf16_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& b,
                                  const torch::Tensor& d,
                                  const int& m, const int& n, const int& k,
                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                 const std::string& compiled_dims) {
-    DG_HOST_ASSERT(not c.has_value() and "SM120 BF16 GEMM does not support accumulation");
-    const auto desc = sm120_bf16_desc(GemmType::Normal, a, b, d, 1, m, n, k, major_a, major_b, compiled_dims, m, 1);
+                                 const std::string& compiled_dims, const float& alpha) {
+    // With `c`, D already holds C (see `early_return`), and the kernel adds to it
+    const auto desc = sm120_bf16_desc(GemmType::Normal, a, b, d, 1, m, n, k, major_a, major_b, compiled_dims, m, 1,
+                                      c.has_value());
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_bf16_gemm_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d, nullptr,
-                                   1, 1, 1, 1, 32, 32);
+                                   1, 1, 1, 1, 32, 32, alpha);
 }
 
 static void sm120_m_grouped_bf16_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& b,
@@ -435,9 +447,9 @@ static void sm120_m_grouped_bf16_gemm_contiguous_1d1d(const torch::Tensor& a, co
     const auto desc = sm120_bf16_desc(use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous,
                                       a, b, d, num_groups, m, n, k, major_a, major_b, compiled_dims,
                                       expected_m_for_psum_layout.value_or(m),
-                                      expected_m_for_psum_layout.has_value() ? num_groups : 1);
+                                      expected_m_for_psum_layout.has_value() ? num_groups : 1, false);
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_bf16_gemm_contiguous_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d,
-                                   grouped_layout.data_ptr(), 1, num_groups, 1, num_groups, 32, 32);
+                                   grouped_layout.data_ptr(), 1, num_groups, 1, num_groups, 32, 32, 1.0f);
 }
 
 static void sm120_m_grouped_bf16_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& b,
@@ -447,9 +459,9 @@ static void sm120_m_grouped_bf16_gemm_masked_1d1d(const torch::Tensor& a, const 
                                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                   const std::string& compiled_dims) {
     const auto desc = sm120_bf16_desc(GemmType::MGroupedMasked, a, b, d, num_groups, m, n, k, major_a, major_b, compiled_dims,
-                                      expected_m, num_groups);
+                                      expected_m, num_groups, false);
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_m_grouped_bf16_gemm_masked_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d,
-                                   masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, 32, 32);
+                                   masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, 32, 32, 1.0f);
 }
 
 } // namespace deep_gemm

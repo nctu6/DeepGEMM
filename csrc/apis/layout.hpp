@@ -31,6 +31,19 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
         DG_HOST_UNREACHABLE("Invalid recipe");
     }
 
+    // NVFP4 on SM120: (FP32 or E4M3, 1, 16) values -> packed UE4M3 words, or already-packed int32 words
+    if (arch_major == 12 and gran_k == 16) {
+        DG_HOST_ASSERT(gran_mn == 1 and "NVFP4 scales are per row");
+        if (sf.scalar_type() == torch::kInt)
+            return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, true, false, torch::kInt);
+        DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat or sf.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
+        if (num_groups.has_value())
+            DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
+        DG_HOST_ASSERT(sf.size(-2) == mn and sf.size(-1) == ceil_div(k, 16));
+        return get_mn_major_tma_aligned_packed_ue4m3_tensor(sf);
+    }
+
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
@@ -133,6 +146,7 @@ static void register_apis(pybind11::module_& m) {
 
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);
+    m.def("get_mn_major_tma_aligned_packed_ue4m3_tensor", &get_mn_major_tma_aligned_packed_ue4m3_tensor, py::arg("sf"));
     m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", &get_mn_major_tma_aligned_packed_ue8m0_tensor,
       py::arg("sf"), py::arg("psum_layout") = std::nullopt);
     m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", &get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor,

@@ -125,6 +125,29 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return packed[:, :n // 2].contiguous(), sf
 
 
+def per_token_cast_to_nvfp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4: packed E2M1 data and FP32 scales holding E4M3 values, one per 16 elements along the last dimension.
+
+    No per-tensor global scale is applied, so the inputs' block maxima must fit the E4M3 scale range (6 * 448 down to
+    6 * 2^-9). The scales go to the GEMMs as is with `recipe=(1, 1, 16)`, or pre-packed with
+    `get_mn_major_tma_aligned_packed_ue4m3_tensor`.
+    """
+    m, n = x.shape
+    assert n % 2 == 0
+    padded_n = align(n, 16)
+    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, -1, 16)
+    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
+    # The scale actually applied is the E4M3-rounded one, so quantize against it
+    sf = (x_amax / 6.0).to(torch.float8_e4m3fn).float().clamp_min(2 ** -9)
+    x_scaled = x_view * (1.0 / sf.unsqueeze(2))
+    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)
+    codes2 = codes.view(m, padded_n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    return packed[:, :n // 2].contiguous(), sf
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2

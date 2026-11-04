@@ -2,6 +2,7 @@
 
 Modes (all BF16 output, K-major NT):
   fp4      FP4 (E2M1) A/B, 32-element UE8M0 scales          -> mxf4 `m16n8k64`
+  nvfp4    FP4 (E2M1) A/B, 16-element UE4M3 scales          -> mxf4nvf4 `scale_vec::4X` `m16n8k64`
   fp8g32   FP8 (E4M3) A/B, 32-element UE8M0 scales          -> mxf8f6f4 `m16n8k32`
   fp8g128  FP8 (E4M3) A/B, 128-element UE8M0 scales (packed) -> mxf8f6f4 `m16n8k32`
   bf16     BF16 A/B, no scales (same kernel)                 -> `m16n8k16` (cuBLASLt is bypassed via deterministic mode)
@@ -16,7 +17,7 @@ import torch
 
 import deep_gemm
 from deep_gemm.utils.math import (cast_back_from_fp4, cast_back_from_fp8, per_token_cast_to_fp4,
-                                  per_token_cast_to_fp8)
+                                  per_token_cast_to_fp8, per_token_cast_to_nvfp4)
 
 
 def calc_diff(x, y):
@@ -29,6 +30,9 @@ def quantize(x, mode):
     """Returns (data, fp32 power-of-two scales, dequantized reference)"""
     if mode == 'bf16':
         return x, None, x.float()
+    if mode == 'nvfp4':
+        q, sf = per_token_cast_to_nvfp4(x)
+        return q, sf, cast_back_from_fp4(q, sf, gran_k=16)
     if mode == 'fp4':
         q, sf = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32)
         return q, sf, cast_back_from_fp4(q, sf, gran_k=32)
@@ -38,12 +42,15 @@ def quantize(x, mode):
 
 
 def to_gemm_sf(sf, mode):
-    """FP32 (1, 128) scales stay on the FP32 kernel, so 128-element UE8M0 scales are handed over pre-packed"""
+    """FP32 (1, 128) scales stay on the FP32 kernel, so 128-element UE8M0 scales are handed over pre-packed. NVFP4 scales
+    are pre-packed here too, to test that path (the PSUM test hands SFA over as FP32 values)"""
+    if mode == 'nvfp4':
+        return deep_gemm.get_mn_major_tma_aligned_packed_ue4m3_tensor(sf)
     return deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf) if mode == 'fp8g128' else sf
 
 
 def gran_k_of(mode):
-    return 128 if mode == 'fp8g128' else 32
+    return {'fp8g128': 128, 'nvfp4': 16}.get(mode, 32)
 
 
 def gemm_nt(mode, qa, sfa, qb, sfb, d):
@@ -51,6 +58,26 @@ def gemm_nt(mode, qa, sfa, qb, sfb, d):
         deep_gemm.bf16_gemm_nt(qa, qb, d)
     else:
         deep_gemm.fp8_fp4_gemm_nt((qa, sfa), (qb, sfb), d, recipe=(1, 1, gran_k_of(mode)))
+
+
+def run_epilogue(mode, m, n, k, out_dtype, alpha, accumulate, in_place, seed=0):
+    """D = alpha * A @ B^T (+ C): `alpha` scales the product, C is added unscaled (as on SM100)"""
+    torch.manual_seed(seed)
+    a = torch.randn(m, k, device='cuda', dtype=torch.bfloat16)
+    b = torch.randn(n, k, device='cuda', dtype=torch.bfloat16)
+    qa, sfa, ref_a = quantize(a, mode)
+    qb, sfb, ref_b = quantize(b, mode)
+    sfa, sfb = to_gemm_sf(sfa, mode), to_gemm_sf(sfb, mode)
+    c = torch.randn(m, n, device='cuda', dtype=out_dtype) if accumulate else None
+    ref = alpha * (ref_a @ ref_b.t()) + (c.float() if accumulate else 0)
+    d = c.clone() if in_place else torch.empty(m, n, device='cuda', dtype=out_dtype)
+    c_arg = d if in_place else c
+    if mode == 'bf16':
+        deep_gemm.bf16_gemm_nt(qa, qb, d, c=c_arg, alpha=alpha)
+    else:
+        deep_gemm.fp8_fp4_gemm_nt((qa, sfa), (qb, sfb), d, c=c_arg, recipe=(1, 1, gran_k_of(mode)), alpha=alpha)
+    torch.cuda.synchronize()
+    return calc_diff(d, ref.to(out_dtype))
 
 
 def gemm_contiguous(mode, qa, sfa, qb, sfb, d, layout, use_psum_layout=False):
@@ -187,7 +214,7 @@ def main():
     parser.add_argument('--grouped', action='store_true')
     parser.add_argument('--repeat', type=int, default=0, help='also check bitwise determinism over this many launches')
     args = parser.parse_args()
-    modes = ['fp4', 'fp8g32', 'fp8g128', 'bf16'] if args.mode == 'all' else [args.mode]
+    modes = ['fp4', 'nvfp4', 'fp8g32', 'fp8g128', 'bf16'] if args.mode == 'all' else [args.mode]
     # BF16 GEMMs otherwise go to cuBLASLt
     deep_gemm.use_deterministic_algorithms(True)
     # Operands and scales are exact in the reference, so only FP32 summation order and bf16 output rounding differ
@@ -219,6 +246,17 @@ def main():
                 ok = diff < tol
                 failed |= not ok
                 print(f'[{mode:7s}] masked      g={g} max_m={mm} n={n} k={k}  diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
+    # Epilogue: alpha, accumulation (distinct C, and C aliasing D), FP32 output. A non-power-of-two alpha changes the
+    # rounding order vs. the reference, so the tolerance is looser
+    for mode in modes:
+        for (m, n, k) in [(1, 2112, 7168), (200, 1536, 640), (512, 4096, 2048)]:
+            for out_dtype in (torch.bfloat16, torch.float):
+                for alpha, accumulate, in_place in [(0.37, False, False), (1.0, True, False), (-1.5, True, True)]:
+                    diff = run_epilogue(mode, m, n, k, out_dtype, alpha, accumulate, in_place)
+                    ok = diff < 1e-6
+                    failed |= not ok
+                    print(f'[{mode:7s}] epilogue    m={m:5d} n={n:5d} k={k:5d} {str(out_dtype)[6:]:8s} alpha={alpha:5.2f} '
+                          f'acc={int(accumulate)} in_place={int(in_place)}  diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
     if args.repeat:
         for mode in modes:
             for (m, n, k) in [(128, 7168, 2048), (64, 4608, 7168), (1, 2112, 7168), (4096, 4096, 7168), (256, 3072, 1536)]:

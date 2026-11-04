@@ -25,6 +25,10 @@ struct GemmDesc {
     // SM100 m-grouped psum layout padding contract
     bool ensure_zero_padding = true;
 
+    // K granularity of the block scales (SM120 1D1D kernel: 32 for MX formats, 16 for NVFP4, 128 for FP8 g128);
+    // 0 where the kernel does not use it
+    int sf_gran_k = 0;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
@@ -77,6 +81,7 @@ struct GemmDesc {
            << ", tc_util=" << desc.tc_util
            << ", compiled_dims=" << desc.compiled_dims
            << ", ensure_zero_padding=" << static_cast<int>(desc.ensure_zero_padding)
+           << ", sf_gran_k=" << desc.sf_gran_k
            << ", expected_m=" << desc.expected_m
            << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k

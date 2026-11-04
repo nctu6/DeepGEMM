@@ -135,11 +135,10 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         const auto major_sfb = get_major_type_ab(sfb);
         sm120_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
     } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
-        DG_HOST_ASSERT(not alpha.has_value() and "FP8/FP4 GEMM alpha requires SM100");
+        // D = alpha * A @ B^T (+ C), BF16 or FP32
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and "SM120 block-scaled GEMM only supports BF16 output");
         sm120_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                major_a, major_b, compiled_dims);
+                                major_a, major_b, compiled_dims, alpha.value_or(1.0f));
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
@@ -567,10 +566,9 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     } else if (arch_major == 10) {
         sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, resolved_epilogue_class);
     } else if (arch_major == 12) {
-        DG_HOST_ASSERT((not epilogue_alpha.has_value() or epilogue_alpha.value() == 1.0f) and "BF16 GEMM alpha requires SM100");
+        // D = alpha * A @ B^T (+ C), BF16 or FP32
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-        sm120_bf16_gemm_1d1d(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
+        sm120_bf16_gemm_1d1d(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, epilogue_alpha.value_or(1.0f));
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

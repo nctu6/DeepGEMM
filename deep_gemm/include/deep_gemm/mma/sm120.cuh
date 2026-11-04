@@ -107,6 +107,43 @@ struct FP4BlockScaledMMA {
     }
 };
 
+/// NVFP4: E2M1 operands with UE4M3 scales over 16-element K groups (`scale_vec::4X`). A lane's 32-bit scale operand holds
+/// the 4 UE4M3 bytes of its row/column for the MMA's 64 K: byte `i` scales K `16i .. 16i + 15`. The fragments and the
+/// scale lane map are those of the MXFP4 (`scale_vec::2X`) MMA
+struct NVFP4BlockScaledMMA {
+    static constexpr uint32_t M = 16;
+    static constexpr uint32_t N = 8;
+    static constexpr uint32_t K = 64;
+
+    CUTLASS_DEVICE static void mma(const uint32_t* a, const uint32_t* b, float* d,
+                                   const uint32_t& sfa, const uint32_t& sfb) {
+        asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+                     "%10, {0, 0}, %11, {0, 0};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                       "r"(b[0]), "r"(b[1]),
+                       "r"(sfa), "r"(sfb));
+    }
+};
+
+/// TF32 `m16n8k8`, FP32 accumulation, no scales. A step consumes 8 TF32 values of each operand row (ptxas rounds the
+/// FP32 register inputs to TF32). A: 4 regs (rows `g`, `g + 8` x columns `t`, `t + 4`), B: 2 regs (column `g`, rows `t`,
+/// `t + 4`), D: 4 floats, `g = lane / 4`, `t = lane % 4`
+struct TF32MMA {
+    static constexpr uint32_t M = 16;
+    static constexpr uint32_t N = 8;
+    static constexpr uint32_t K = 8;
+
+    CUTLASS_DEVICE static void mma(const uint32_t* a, const uint32_t* b, float* d) {
+        asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                       "r"(b[0]), "r"(b[1]));
+    }
+};
+
 /// BF16 `m16n8k16`, FP32 accumulation, no scales. A step consumes 32 bytes of each operand row, like the FP8 `m16n8k32`,
 /// and the fragments are the same `ldmatrix` patterns (A: 4 regs, B: 2 regs, D: 4 floats)
 struct BF16MMA {
@@ -123,15 +160,17 @@ struct BF16MMA {
     }
 };
 
-/// One warp computes `accum[16, N] = A[16, 128] @ B[N, 128]^T` with FP8 operands in TMA 128B-swizzled shared memory
-/// (both K-major with 128-byte rows, i.e. `kHeadDim = 128`)
+/// One warp computes `accum[16, N] = A[16, kHeadDim] @ B[N, kHeadDim]^T` with FP8 operands in TMA-swizzled shared memory
+/// (both K-major; rows are `kHeadDim` bytes, swizzled with the matching mode: 128B for 128, 64B for 64)
 ///  - `a_base`/`b_base`: shared memory addresses of the 1024B-aligned tiles, `a_row`: the first of the 16 A rows
 ///  - `accum` follows the SM90 WGMMA `m64nN` per-warp layout: `accum[j * 4 + {0, 1, 2, 3}]` holds
 ///    `(row g, col 8j + 2t + {0, 1})` and `(row g + 8, col 8j + 2t + {0, 1})`, with `g = lane / 4`, `t = lane % 4`
-template <uint32_t N>
-CUTLASS_DEVICE void warp_mma_16xNx128_ss(const uint32_t& a_base, const uint32_t& a_row,
-                                          const uint32_t& b_base, float* accum) {
+/// An `ldmatrix.x4` reads a 16x16 FP8 tile (two 16B chunks of K per row); `kHeadDim / 32` of them cover the head dim
+template <uint32_t N, uint32_t kHeadDim = 128>
+CUTLASS_DEVICE void warp_mma_16xNxHd_ss(const uint32_t& a_base, const uint32_t& a_row,
+                                         const uint32_t& b_base, float* accum) {
     DG_STATIC_ASSERT(N % 16 == 0, "Invalid N");
+    DG_STATIC_ASSERT(kHeadDim == 128 or kHeadDim == 64, "Unsupported head dim");
     const uint32_t lane_idx = threadIdx.x % 32;
     const uint32_t a_ld_row = a_row + ((lane_idx >> 3) & 1) * 8 + (lane_idx & 7);
     const uint32_t a_ld_chunk = lane_idx >> 4;
@@ -143,15 +182,15 @@ CUTLASS_DEVICE void warp_mma_16xNx128_ss(const uint32_t& a_base, const uint32_t&
         accum[i] = 0;
 
     #pragma unroll
-    for (uint32_t k = 0; k < 128 / FP8MMA::K; ++ k) {
+    for (uint32_t k = 0; k < kHeadDim / FP8MMA::K; ++ k) {
         uint32_t a_frag[4];
         ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-                    a_base + get_swizzle_128b_offset(a_ld_row, k * 2 + a_ld_chunk));
+                    a_base + get_swizzle_offset<kHeadDim>(a_ld_row, k * 2 + a_ld_chunk));
         #pragma unroll
         for (uint32_t j = 0; j < N / 16; ++ j) {
             uint32_t b_frag[2][2];
             ldmatrix_x4(b_frag[0][0], b_frag[0][1], b_frag[1][0], b_frag[1][1],
-                        b_base + get_swizzle_128b_offset(b_ld_row + j * 16, k * 2 + b_ld_chunk));
+                        b_base + get_swizzle_offset<kHeadDim>(b_ld_row + j * 16, k * 2 + b_ld_chunk));
             FP8MMA::mma(a_frag, b_frag[0], accum + (j * 2 + 0) * 4);
             FP8MMA::mma(a_frag, b_frag[1], accum + (j * 2 + 1) * 4);
         }

@@ -130,6 +130,32 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(const to
     return (sf.dim() == 2) ? out.squeeze(0) : out;
 }
 
+// NVFP4 scales: `[(G,) MN, ceil(K / 16)]` FP32 or E4M3 values -> UE4M3 bytes packed 4 consecutive-K per int32 word,
+// `[(G,) MN, ceil(K / 64)]`, TMA-aligned and MN-major (the layout of the packed UE8M0 scales). FP32 values are rounded to
+// E4M3, so they should be exactly representable (NVFP4 scales are E4M3 by definition). Runs as torch ops: weights are
+// packed once at load, and activation quantizers should emit this layout directly
+static torch::Tensor get_mn_major_tma_aligned_packed_ue4m3_tensor(const torch::Tensor& sf) {
+    DG_HOST_ASSERT(sf.dim() == 2 or sf.dim() == 3);
+    DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat or sf.scalar_type() == torch::kFloat8_e4m3fn);
+    const auto sf_reshaped = (sf.dim() == 2) ? sf.unsqueeze(0) : sf;
+    const auto ue4m3_tensor = sf_reshaped.to(torch::kFloat8_e4m3fn).view(torch::kUInt8);
+
+    const auto [num_sf_batches, mn, k] = get_shape<3>(sf_reshaped);
+    const auto aligned_mn = get_tma_aligned_size(mn, 4);
+    const auto aligned_k  = align(k, 4);
+    const auto options = torch::TensorOptions().device(sf.device()).dtype(torch::kUInt8);
+    auto padded = torch::zeros({num_sf_batches, aligned_mn, aligned_k}, options);
+    // ReSharper disable once CppExpressionWithoutSideEffects
+    padded.slice(1, 0, mn).slice(2, 0, k).copy_(ue4m3_tensor);
+    padded = padded.view(-1).view(torch::kInt32).view({num_sf_batches, aligned_mn, aligned_k / 4});
+
+    auto out = torch::empty_strided({num_sf_batches, aligned_mn, aligned_k / 4},
+                                    {aligned_mn * (aligned_k / 4), 1, aligned_mn},
+                                    at::TensorOptions().device(sf.device()).dtype(torch::kInt32));
+    out = out.copy_(padded).slice(1, 0, mn);
+    return (sf.dim() == 2) ? out.squeeze(0) : out;
+}
+
 static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::Tensor& sf,
                                                                   const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
     const auto [dim, num_sf_batches, mn, sf_k, tma_aligned_mn, batched_sf] = preprocess_sf(sf);
