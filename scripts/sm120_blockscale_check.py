@@ -4,6 +4,7 @@ Modes (all BF16 output, K-major NT):
   fp4      FP4 (E2M1) A/B, 32-element UE8M0 scales          -> mxf4 `m16n8k64`
   fp8g32   FP8 (E4M3) A/B, 32-element UE8M0 scales          -> mxf8f6f4 `m16n8k32`
   fp8g128  FP8 (E4M3) A/B, 128-element UE8M0 scales (packed) -> mxf8f6f4 `m16n8k32`
+  bf16     BF16 A/B, no scales (same kernel)                 -> `m16n8k16` (cuBLASLt is bypassed via deterministic mode)
 
 Run on the test machine with GPU 7 (see `sm120_remote.sh`):
   sm120_remote.sh dg scripts/sm120_blockscale_check.py [--mode fp4|fp8g32|fp8g128|all] [--grouped]
@@ -26,6 +27,8 @@ def calc_diff(x, y):
 
 def quantize(x, mode):
     """Returns (data, fp32 power-of-two scales, dequantized reference)"""
+    if mode == 'bf16':
+        return x, None, x.float()
     if mode == 'fp4':
         q, sf = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32)
         return q, sf, cast_back_from_fp4(q, sf, gran_k=32)
@@ -39,23 +42,69 @@ def to_gemm_sf(sf, mode):
     return deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf) if mode == 'fp8g128' else sf
 
 
+def gran_k_of(mode):
+    return 128 if mode == 'fp8g128' else 32
+
+
+def gemm_nt(mode, qa, sfa, qb, sfb, d):
+    if mode == 'bf16':
+        deep_gemm.bf16_gemm_nt(qa, qb, d)
+    else:
+        deep_gemm.fp8_fp4_gemm_nt((qa, sfa), (qb, sfb), d, recipe=(1, 1, gran_k_of(mode)))
+
+
+def gemm_contiguous(mode, qa, sfa, qb, sfb, d, layout, use_psum_layout=False):
+    if mode == 'bf16':
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(qa, qb, d, layout, use_psum_layout=use_psum_layout)
+    else:
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous((qa, sfa), (qb, sfb), d, layout, recipe=(1, 1, gran_k_of(mode)),
+                                                       use_psum_layout=use_psum_layout)
+
+
+def gemm_masked(mode, qa, sfa, qb, sfb, d, masked_m, expected_m):
+    if mode == 'bf16':
+        deep_gemm.m_grouped_bf16_gemm_nt_masked(qa, qb, d, masked_m, expected_m)
+    else:
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked((qa, sfa), (qb, sfb), d, masked_m, expected_m,
+                                                   recipe=(1, 1, gran_k_of(mode)))
+
+
+def run_repeat(mode, m, n, k, repeats, seed=0):
+    """Bitwise determinism over many launches: a shared-memory race (a stage overwritten while still being read) shows up
+    as an occasional wrong tile, so the result must be identical on every run"""
+    torch.manual_seed(seed)
+    a = torch.randn(m, k, device='cuda', dtype=torch.bfloat16)
+    b = torch.randn(n, k, device='cuda', dtype=torch.bfloat16)
+    qa, sfa, _ = quantize(a, mode)
+    qb, sfb, _ = quantize(b, mode)
+    sfa, sfb = to_gemm_sf(sfa, mode), to_gemm_sf(sfb, mode)
+    first = torch.empty(m, n, device='cuda', dtype=torch.bfloat16)
+    gemm_nt(mode, qa, sfa, qb, sfb, first)
+    d = torch.empty_like(first)
+    mismatches = 0
+    for _ in range(repeats):
+        d.fill_(float('nan'))
+        gemm_nt(mode, qa, sfa, qb, sfb, d)
+        mismatches += int(not torch.equal(d, first))
+    torch.cuda.synchronize()
+    return mismatches
+
+
 def run_normal(mode, m, n, k, seed=0):
     torch.manual_seed(seed)
-    gran_k = 128 if mode == 'fp8g128' else 32
     a = torch.randn(m, k, device='cuda', dtype=torch.bfloat16)
     b = torch.randn(n, k, device='cuda', dtype=torch.bfloat16)
     qa, sfa, ref_a = quantize(a, mode)
     qb, sfb, ref_b = quantize(b, mode)
     ref = (ref_a @ ref_b.t()).to(torch.bfloat16)
     d = torch.empty(m, n, device='cuda', dtype=torch.bfloat16)
-    deep_gemm.fp8_fp4_gemm_nt((qa, to_gemm_sf(sfa, mode)), (qb, to_gemm_sf(sfb, mode)), d, recipe=(1, 1, gran_k))
+    gemm_nt(mode, qa, to_gemm_sf(sfa, mode), qb, to_gemm_sf(sfb, mode), d)
     torch.cuda.synchronize()
     return calc_diff(d, ref)
 
 
 def run_contiguous(mode, num_groups, m_per_group, n, k, seed=0):
     torch.manual_seed(seed)
-    gran_k = 128 if mode == 'fp8g128' else 32
     align = deep_gemm.get_mk_alignment_for_contiguous_layout()
     m_total = num_groups * ((m_per_group + align - 1) // align * align)
     a = torch.randn(m_total, k, device='cuda', dtype=torch.bfloat16)
@@ -66,7 +115,7 @@ def run_contiguous(mode, num_groups, m_per_group, n, k, seed=0):
         q, sf, ref_b = quantize(b, mode)
         qbs.append(q); sfbs.append(sf); ref_bs.append(ref_b)
     qb, ref_b = torch.stack(qbs), torch.stack(ref_bs)
-    sfb = to_gemm_sf(torch.stack(sfbs), mode)
+    sfb = None if mode == 'bf16' else to_gemm_sf(torch.stack(sfbs), mode)
     sfa = to_gemm_sf(sfa, mode)
     m_indices = torch.arange(num_groups, device='cuda', dtype=torch.int32).repeat_interleave(m_total // num_groups)
     ref = torch.empty(m_total, n, device='cuda', dtype=torch.bfloat16)
@@ -74,22 +123,55 @@ def run_contiguous(mode, num_groups, m_per_group, n, k, seed=0):
         sl = slice(g * (m_total // num_groups), (g + 1) * (m_total // num_groups))
         ref[sl] = (ref_a[sl] @ ref_b[g].t()).to(torch.bfloat16)
     d = torch.empty(m_total, n, device='cuda', dtype=torch.bfloat16)
-    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous((qa, sfa), (qb, sfb), d, m_indices, recipe=(1, 1, gran_k))
+    gemm_contiguous(mode, qa, sfa, qb, sfb, d, m_indices)
     torch.cuda.synchronize()
     return calc_diff(d, ref)
 
 
+def run_contiguous_psum(mode, num_groups, m_per_group, n, k, seed=0):
+    """PSUM layout: `grouped_layout[g]` is the cumulative logical end of group g, and each group starts at the previous
+    end aligned up to the contiguous-layout alignment; rows in the gaps are not compared"""
+    torch.manual_seed(seed)
+    align = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    actual_ms = [max(1, int(m_per_group * f)) for f in torch.linspace(0.6, 1.4, num_groups).tolist()]
+    starts, ends, start = [], [], 0
+    for am in actual_ms:
+        starts.append(start); ends.append(start + am)
+        start = (start + am + align - 1) // align * align
+    m_total = start
+    a = torch.zeros(m_total, k, device='cuda', dtype=torch.bfloat16)
+    for st, en in zip(starts, ends):
+        a[st:en] = torch.randn(en - st, k, device='cuda', dtype=torch.bfloat16)
+    qa, sfa, ref_a = quantize(a, mode)
+    qbs, sfbs, ref_bs = zip(*[quantize(torch.randn(n, k, device='cuda', dtype=torch.bfloat16), mode) for _ in range(num_groups)])
+    qb = torch.stack(qbs)
+    sfb = None if mode == 'bf16' else to_gemm_sf(torch.stack(sfbs), mode)
+    psum = torch.tensor(ends, device='cuda', dtype=torch.int32)
+    if mode == 'fp8g128':
+        sfa = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sfa, psum_layout=psum)
+    d = torch.zeros(m_total, n, device='cuda', dtype=torch.bfloat16)
+    gemm_contiguous(mode, qa, sfa, qb, sfb, d, psum, use_psum_layout=True)
+    torch.cuda.synchronize()
+    worst = 0.0
+    for g, (st, en) in enumerate(zip(starts, ends)):
+        ref = (ref_a[st:en] @ ref_bs[g].t()).to(torch.bfloat16)
+        worst = max(worst, calc_diff(d[st:en], ref))
+    return worst
+
+
 def run_masked(mode, num_groups, max_m, n, k, seed=0):
     torch.manual_seed(seed)
-    gran_k = 128 if mode == 'fp8g128' else 32
     masked_m = torch.randint(1, max_m + 1, (num_groups,), device='cuda', dtype=torch.int32)
     a = torch.randn(num_groups, max_m, k, device='cuda', dtype=torch.bfloat16)
     qas, sfas, ref_as = zip(*[quantize(a[g], mode) for g in range(num_groups)])
     qbs, sfbs, ref_bs = zip(*[quantize(torch.randn(n, k, device='cuda', dtype=torch.bfloat16), mode) for _ in range(num_groups)])
     qa, qb = torch.stack(qas), torch.stack(qbs)
-    sfa, sfb = to_gemm_sf(torch.stack(sfas), mode), to_gemm_sf(torch.stack(sfbs), mode)
+    if mode == 'bf16':
+        sfa = sfb = None
+    else:
+        sfa, sfb = to_gemm_sf(torch.stack(sfas), mode), to_gemm_sf(torch.stack(sfbs), mode)
     d = torch.zeros(num_groups, max_m, n, device='cuda', dtype=torch.bfloat16)
-    deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked((qa, sfa), (qb, sfb), d, masked_m, max_m // 2 + 1, recipe=(1, 1, gran_k))
+    gemm_masked(mode, qa, sfa, qb, sfb, d, masked_m, max_m // 2 + 1)
     torch.cuda.synchronize()
     worst = 0.0
     for g in range(num_groups):
@@ -103,8 +185,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', default='all')
     parser.add_argument('--grouped', action='store_true')
+    parser.add_argument('--repeat', type=int, default=0, help='also check bitwise determinism over this many launches')
     args = parser.parse_args()
-    modes = ['fp4', 'fp8g32', 'fp8g128'] if args.mode == 'all' else [args.mode]
+    modes = ['fp4', 'fp8g32', 'fp8g128', 'bf16'] if args.mode == 'all' else [args.mode]
+    # BF16 GEMMs otherwise go to cuBLASLt
+    deep_gemm.use_deterministic_algorithms(True)
     # Operands and scales are exact in the reference, so only FP32 summation order and bf16 output rounding differ
     # (<= ~1e-8). A single wrong scale or flipped byte shows up at >= 1e-6 (see the negative control in the report)
     tol = 1e-7
@@ -124,11 +209,22 @@ def main():
                 ok = diff < tol
                 failed |= not ok
                 print(f'[{mode:7s}] contiguous  g={g} m/g={mpg} n={n} k={k}  diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
+            for (g, mpg, n, k) in [(4, 128, 2048, 2048), (8, 100, 1536, 7168)]:
+                diff = run_contiguous_psum(mode, g, mpg, n, k)
+                ok = diff < tol
+                failed |= not ok
+                print(f'[{mode:7s}] psum        g={g} m/g~{mpg} n={n} k={k}  diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
             for (g, mm, n, k) in [(4, 128, 2048, 2048), (8, 64, 1536, 7168)]:
                 diff = run_masked(mode, g, mm, n, k)
                 ok = diff < tol
                 failed |= not ok
                 print(f'[{mode:7s}] masked      g={g} max_m={mm} n={n} k={k}  diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
+    if args.repeat:
+        for mode in modes:
+            for (m, n, k) in [(128, 7168, 2048), (64, 4608, 7168), (1, 2112, 7168), (4096, 4096, 7168), (256, 3072, 1536)]:
+                bad = run_repeat(mode, m, n, k, args.repeat)
+                failed |= bad > 0
+                print(f'[{mode:7s}] determinism m={m:5d} n={n:5d} k={k:5d}  {bad}/{args.repeat} runs differ  {"ok" if bad == 0 else "FAIL"}', flush=True)
     print('FAILED' if failed else 'ALL OK')
     sys.exit(1 if failed else 0)
 
