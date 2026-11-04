@@ -21,10 +21,12 @@
 
 namespace deep_gemm {
 
-// SM120 block-scaled GEMM with packed UE8M0 scale factors ("1D1D"), for FP4 (E2M1) and FP8 (E4M3) operands.
+// SM120 block-scaled GEMM with packed scale factors ("1D1D"): FP4 (E2M1) with UE8M0 (MXFP4, 32-element groups) or UE4M3
+// (NVFP4, 16-element groups) scales, FP8 (E4M3) with UE8M0 scales, and BF16 without scales.
 //
-// Same host contract as `sm100_fp8_fp4_gemm_1d1d_impl`: SFA/SFB are int32 tensors holding 4 consecutive-K UE8M0 bytes
-// per word (K granularity `kGranK` of 32 or 128), laid out `[(G,) MN, ceil(K / (kGranK * 4))]`, MN-major and
+// Same host contract as `sm100_fp8_fp4_gemm_1d1d_impl`: SFA/SFB are int32 tensors holding 4 consecutive-K scale bytes
+// per word (K granularity `kGranK` of 32 or 128 for UE8M0, 16 for UE4M3), laid out `[(G,) MN, ceil(K / (kGranK * 4))]`,
+// MN-major and
 // TMA-aligned. Unlike SM100 there is no TMEM: the scales are TMA-loaded into shared memory with each stage (on the
 // same barrier as A/B, so their latency is hidden by the pipeline like the operands') and read into registers by the
 // math warps:
@@ -32,6 +34,8 @@ namespace deep_gemm {
 //    second accumulator and no per-K-block promotion on CUDA cores
 //  - FP4 (`kGranK == 32`): a TMA tile row is 128 bytes = 256 FP4 elements, consumed as 4 `m16n8k64` MMAs, each taking
 //    the 2 scale bytes of its 64 K
+//  - NVFP4 (`kGranK == 16`): the same MMAs with `scale_vec::4X`, each taking one whole word (the 4 UE4M3 bytes of its
+//    64 K)
 //  - FP8: a tile row is 128 bytes = 128 elements, consumed as 4 `m16n8k32` MMAs. With `kGranK == 32` MMA `j` takes
 //    byte `j` of the word, with `kGranK == 128` all MMAs of a K block share one byte
 //  - A lane supplies the SFA scale of row `g` (lane `t == 0`) or `g + 8` (lane `t == 1`) and the SFB scale of column `g`
@@ -51,10 +55,10 @@ template <bool kIsFP4, bool kIsBF16, uint32_t kGranK,
           uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumSMs, GemmType kGemmType,
-          bool kUseStreamK,
+          bool kUseStreamK, bool kWithAccumulation,
           typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, float alpha,
                              float* workspace, int* counters,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
@@ -62,8 +66,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfb) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
+    static constexpr bool kIsNVFP4 = kIsFP4 and kGranK == 16;
     using MMA = cute::conditional_t<kIsBF16, mma::sm120::BF16MMA,
-                cute::conditional_t<kIsFP4, mma::sm120::FP4BlockScaledMMA, mma::sm120::FP8BlockScaledMMA>>;
+                cute::conditional_t<kIsNVFP4, mma::sm120::NVFP4BlockScaledMMA,
+                cute::conditional_t<kIsFP4, mma::sm120::FP4BlockScaledMMA, mma::sm120::FP8BlockScaledMMA>>>;
     // TMA element type of A/B: packed FP4 counts two elements per byte; BF16 rows hold 64 elements of 2 bytes
     using ab_dtype_t = cute::conditional_t<kIsBF16, cutlass::bfloat16_t,
                        cute::conditional_t<kIsFP4, cutlass::float_e2m1_t, uint8_t>>;
@@ -74,16 +80,20 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     // for FP4 64 bytes (128 elements), which halves the stage size so that twice as many stages are in flight
     DG_STATIC_ASSERT(BLOCK_K == 128 or (BLOCK_K == 64 and kIsFP4), "A K block is one 128-byte (or, for FP4, 64-byte) swizzle atom");
     DG_STATIC_ASSERT(kSwizzleAMode == BLOCK_K and kSwizzleBMode == BLOCK_K, "Swizzling must match the K block (one atom per row)");
-    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
+    // D = alpha * (A @ B^T) (+ D when accumulating; the host copies a distinct C into D first), BF16 or FP32
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> or cute::is_same_v<cd_dtype_t, float>,
+                     "Invalid C/D data dtype");
     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedContiguous or
                      kGemmType == GemmType::MGroupedContiguousWithPsumLayout or
                      kGemmType == GemmType::MGroupedMasked, "Unsupported GEMM type");
     DG_STATIC_ASSERT(not kUseStreamK or kGemmType == GemmType::Normal, "Stream-K is only for normal GEMMs");
-    DG_STATIC_ASSERT(kIsBF16 or kGranK == 32 or (not kIsFP4 and kGranK == 128), "FP4 needs 32-element scales; FP8 accepts 32 or 128");
+    DG_STATIC_ASSERT(kIsBF16 or kGranK == 32 or (kIsFP4 and kGranK == 16) or (not kIsFP4 and kGranK == 128),
+                     "FP4 takes 32- (UE8M0) or 16-element (UE4M3) scales; FP8 32 or 128 (UE8M0)");
     static constexpr uint32_t kElemsPerBlock = kIsFP4 ? BLOCK_K * 2 : (kIsBF16 ? BLOCK_K / 2 : BLOCK_K);
     static constexpr uint32_t kNumKSteps = BLOCK_K / 32;   // 32 bytes of A/B per MMA, for both FP8 and FP4
-    // Packed scale words covering one K block (one scale byte per 32 elements, 4 per word); BF16 has no scales
-    static constexpr uint32_t kNumSFWords = kIsBF16 ? 0 : (kIsFP4 ? BLOCK_K * 2 / 32 / 4 : 1);
+    // Packed scale words covering one K block (one scale byte per `kGranK` elements, 4 per word); BF16 has no scales,
+    // and an FP8 K block (128 elements) takes one word for both granularities (a quarter of a 128-granularity word)
+    static constexpr uint32_t kNumSFWords = kIsBF16 ? 0 : (kIsFP4 ? BLOCK_K * 2 / kGranK / 4 : 1);
     DG_STATIC_ASSERT(kIsBF16 or kNumSFWords >= 1, "A K block must cover whole scale words");
 
     // Warp tiling
@@ -119,8 +129,16 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
     // Scales of one stage, `[kNumSFWords][BLOCK_MN]` words each (TMA destinations are 128B aligned)
     static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = math::constexpr_align(kNumSFWords * BLOCK_M * 4u, 128u);
     static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = math::constexpr_align(kNumSFWords * BLOCK_N * 4u, 128u);
+    // A K-warp covers `kNumLocalKSteps` contiguous MMA steps of each block, and keeps only the scale words of those steps
+    // in registers: NVFP4 one word per step, MXFP4 one per 2 steps, FP8 one per block. Indexing them by the local step
+    // keeps every register-array index a compile-time constant (a runtime index spills the array to local memory)
+    static constexpr uint32_t kNumLocalKSteps = kNumKSteps / kNumKWarps;
+    static constexpr uint32_t kNumLocalSFWords = kIsBF16 ? 0 : (kIsNVFP4 ? kNumLocalKSteps :
+                                                 (kIsFP4 ? math::constexpr_ceil_div(kNumLocalKSteps, 2u) : 1));
+    DG_STATIC_ASSERT(not kIsFP4 or kIsNVFP4 or kNumLocalKSteps == 1 or kNumLocalKSteps % 2 == 0,
+                     "MXFP4 K-warps must own whole scale words");
     // Scale-word arrays need a non-zero extent even when BF16 has none
-    static constexpr uint32_t kNumSFRegs = kNumSFWords > 0 ? kNumSFWords : 1;
+    static constexpr uint32_t kNumSFRegs = kNumLocalSFWords > 0 ? kNumLocalSFWords : 1;
 
     // Configs
     const uint32_t num_k_blocks = math::ceil_div(shape_k, kElemsPerBlock);
@@ -361,16 +379,18 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                     // Wait TMA arrivals (operands and scales)
                     full_barriers[stage_idx]->wait(phase);
 
-                    // The packed scale words of this K block
+                    // The packed scale words of this K-warp's steps, starting at the block's word of its first step
+                    const uint32_t first_k = warp_k_idx * kNumLocalKSteps;
+                    const uint32_t first_word = kIsNVFP4 ? first_k : (kIsFP4 ? first_k / 2 : 0);
                     uint32_t sfa_words[kNumMTiles][kNumSFRegs] = {}, sfb_words[kNumNTiles][kNumSFRegs] = {};
                     #pragma unroll
-                    for (uint32_t w = 0; w < kNumSFWords; ++ w) {
+                    for (uint32_t w = 0; w < kNumLocalSFWords; ++ w) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumMTiles; ++ i)
-                            sfa_words[i][w] = smem_sfa[stage_idx][w * BLOCK_M + sfa_rows[i]];
+                            sfa_words[i][w] = smem_sfa[stage_idx][(first_word + w) * BLOCK_M + sfa_rows[i]];
                         #pragma unroll
                         for (uint32_t j = 0; j < kNumNTiles; ++ j)
-                            sfb_words[j][w] = smem_sfb[stage_idx][w * BLOCK_N + sfb_cols[j]];
+                            sfb_words[j][w] = smem_sfb[stage_idx][(first_word + w) * BLOCK_N + sfb_cols[j]];
                     }
 
                     const uint32_t a_base = mma::sm120::to_smem_addr(smem_a[stage_idx]);
@@ -381,7 +401,6 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                     // Releasing after the MMAs leaves only `kNumStages - 1` in flight; on decode / mid-M shapes the kernel is
                     // latency-bound, and that cost 32% per K block (64x128 FP4: 0.93 vs 0.70 us/block against FlashInfer's b12x,
                     // which stages the same way). Every op is `asm volatile`, so this source order is the issue order
-                    constexpr uint32_t kNumLocalKSteps = kNumKSteps / kNumKWarps;
                     uint32_t a_frag[kNumLocalKSteps][kNumMTiles][4], b_frag[kNumLocalKSteps][kNumNTiles][2];
                     #pragma unroll
                     for (uint32_t k_local = 0; k_local < kNumLocalKSteps; ++ k_local) {
@@ -405,13 +424,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                     #pragma unroll
                     for (uint32_t k_local = 0; k_local < kNumLocalKSteps; ++ k_local) {
                         const uint32_t k = warp_k_idx * kNumLocalKSteps + k_local;
-                        // The scale operand of this K step, in the low bits of a register
+                        // The scale operand of this K step, in the low bits of a register (array indices are local)
                         const auto get_scale = [&](const uint32_t (&words)[kNumSFRegs]) -> uint32_t {
-                            // FP4: a step covers 64 elements, i.e. scale bytes `2k` and `2k + 1` of the block
                             if constexpr (kIsBF16)
                                 return 0u;
-                            else if constexpr (kIsFP4)
-                                return (words[k / 2] >> (16 * (k % 2))) & 0xffffu;
+                            else if constexpr (kIsNVFP4)
+                                return words[k_local];   // NVFP4: a step's 64 elements are exactly one word
+                            else if constexpr (kIsFP4)   // MXFP4: a step takes scale bytes `2k` and `2k + 1` of the block
+                                return (words[kNumLocalKSteps >= 2 ? k_local / 2 : 0] >> (16 * (k % 2))) & 0xffffu;
                             else if constexpr (kGranK == 32)
                                 return (words[0] >> (8 * k)) & 0xffu;
                             else
@@ -532,9 +552,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
             if (num_k_blocks > kNumStages)
                 cudaTriggerProgrammaticLaunchCompletion();
 
-            // Write back BF16 results directly from registers
-            // NOTES: lanes `t` and `t ^ 1` exchange halves so that each stores 4 consecutive columns (8 bytes), and
-            // the 4 lanes of a row cover 16 consecutive columns, i.e. one full 32-byte sector per row and store
+            // Write back results directly from registers: D = alpha * accum (+ D)
             constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
             DG_STATIC_ASSERT(kNumNTiles % 2 == 0, "Paired stores need an even number of N tiles");
             const uint32_t m_global_base = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
@@ -546,21 +564,65 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
                 for (uint32_t half = 0; half < 2; ++ half) {
                     const uint32_t row = warp_m_idx * WARP_M + i * 16 + group_row + half * 8;
                     const bool is_row_valid = is_storing_warp and m_local_base + row < shape_m;
-                    auto d_row = reinterpret_cast<__nv_bfloat16*>(d) + static_cast<uint64_t>(m_global_base + row) * ld_d;
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumNTiles; j += 2) {
-                        const uint32_t idx_lo = (i * kNumNTiles + j) * 4 + half * 2;
-                        const uint32_t idx_hi = idx_lo + 4;
-                        const auto lo = __float22bfloat162_rn({accum[idx_lo], accum[idx_lo + 1]});
-                        const auto hi = __float22bfloat162_rn({accum[idx_hi], accum[idx_hi + 1]});
-                        const uint32_t lo_u32 = *reinterpret_cast<const uint32_t*>(&lo);
-                        const uint32_t hi_u32 = *reinterpret_cast<const uint32_t*>(&hi);
-                        // Even lanes keep tile `j` (and get the odd lane's half), odd lanes keep tile `j + 1`
-                        const uint32_t recv = __shfl_xor_sync(0xffffffff, is_odd_lane ? lo_u32 : hi_u32, 1);
-                        const uint2 value = is_odd_lane ? make_uint2(recv, hi_u32) : make_uint2(lo_u32, recv);
-                        const uint32_t col = n_block_idx * BLOCK_N + warp_n_idx * WARP_N + (j + is_odd_lane) * 8 + (group_col & 2) * 2;
-                        if (is_row_valid and col < shape_n)
-                            *reinterpret_cast<uint2*>(d_row + col) = value;
+                    const uint64_t row_offset = static_cast<uint64_t>(m_global_base + row) * ld_d;
+                    if constexpr (cute::is_same_v<cd_dtype_t, float>) {
+                        // FP32: each lane stores its 2 columns of every N tile (the 4 lanes of a row write 32 bytes)
+                        auto d_row = reinterpret_cast<float*>(d) + row_offset;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumNTiles; ++ j) {
+                            const uint32_t idx = (i * kNumNTiles + j) * 4 + half * 2;
+                            const uint32_t col = n_block_idx * BLOCK_N + warp_n_idx * WARP_N + j * 8 + group_col * 2;
+                            if (not is_row_valid or col >= shape_n)
+                                continue;
+                            float2 value = make_float2(alpha * accum[idx], alpha * accum[idx + 1]);
+                            if constexpr (kWithAccumulation) {
+                                const float2 old = *reinterpret_cast<const float2*>(d_row + col);
+                                value.x += old.x, value.y += old.y;
+                            }
+                            *reinterpret_cast<float2*>(d_row + col) = value;
+                        }
+                    } else {
+                        // BF16: lanes `t` and `t ^ 1` exchange halves so that each stores 4 consecutive columns (8
+                        // bytes), and the 4 lanes of a row cover 16 consecutive columns, i.e. one full 32-byte sector
+                        // per row and store. Even lanes keep tile `j` (and get the odd lane's half), odd lanes tile `j + 1`
+                        auto d_row = reinterpret_cast<__nv_bfloat16*>(d) + row_offset;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumNTiles; j += 2) {
+                            const uint32_t idx_lo = (i * kNumNTiles + j) * 4 + half * 2;
+                            const uint32_t idx_hi = idx_lo + 4;
+                            const uint32_t col = n_block_idx * BLOCK_N + warp_n_idx * WARP_N + (j + is_odd_lane) * 8 + (group_col & 2) * 2;
+                            const bool is_valid = is_row_valid and col < shape_n;
+                            uint2 value;
+                            if constexpr (kWithAccumulation) {
+                                // Exchange FP32 values, so the sum with D is rounded to BF16 once
+                                const float2 lo = make_float2(alpha * accum[idx_lo], alpha * accum[idx_lo + 1]);
+                                const float2 hi = make_float2(alpha * accum[idx_hi], alpha * accum[idx_hi + 1]);
+                                const float2 send = is_odd_lane ? lo : hi;
+                                const float2 recv = make_float2(__shfl_xor_sync(0xffffffff, send.x, 1),
+                                                                __shfl_xor_sync(0xffffffff, send.y, 1));
+                                float2 first = is_odd_lane ? recv : lo, second = is_odd_lane ? hi : recv;
+                                if (is_valid) {
+                                    const uint2 old = *reinterpret_cast<const uint2*>(d_row + col);
+                                    const float2 old_first = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&old.x));
+                                    const float2 old_second = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&old.y));
+                                    first.x += old_first.x, first.y += old_first.y;
+                                    second.x += old_second.x, second.y += old_second.y;
+                                }
+                                const auto first_bf16 = __float22bfloat162_rn(first);
+                                const auto second_bf16 = __float22bfloat162_rn(second);
+                                value = make_uint2(*reinterpret_cast<const uint32_t*>(&first_bf16),
+                                                   *reinterpret_cast<const uint32_t*>(&second_bf16));
+                            } else {
+                                const auto lo = __float22bfloat162_rn({alpha * accum[idx_lo], alpha * accum[idx_lo + 1]});
+                                const auto hi = __float22bfloat162_rn({alpha * accum[idx_hi], alpha * accum[idx_hi + 1]});
+                                const uint32_t lo_u32 = *reinterpret_cast<const uint32_t*>(&lo);
+                                const uint32_t hi_u32 = *reinterpret_cast<const uint32_t*>(&hi);
+                                const uint32_t recv = __shfl_xor_sync(0xffffffff, is_odd_lane ? lo_u32 : hi_u32, 1);
+                                value = is_odd_lane ? make_uint2(recv, hi_u32) : make_uint2(lo_u32, recv);
+                            }
+                            if (is_valid)
+                                *reinterpret_cast<uint2*>(d_row + col) = value;
+                        }
                     }
                 }
             }
