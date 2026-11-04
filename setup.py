@@ -37,6 +37,24 @@ build_include_dirs = [
     'third-party/deep_jit/include',
     'third-party/cutlass/include',
 ]
+
+# Fallback headers from torch's pip CUDA wheels (`nvidia/cu13/include` or the
+# per-library `nvidia/<lib>/include`). torch's `CUDAContextLight.h` includes
+# cuSPARSE/cuSOLVER headers that a trimmed CUDA toolkit (e.g. a runtime image
+# with only cudart/nvcc/cuBLAS) lacks. Appended after `CUDA_HOME`, so a full
+# toolkit's headers still take precedence.
+def get_pip_cuda_include_dirs():
+    try:
+        import nvidia
+    except ImportError:
+        return []
+    dirs = []
+    for root in nvidia.__path__:
+        dirs += sorted(str(p) for p in Path(root).glob('*/include') if p.is_dir())
+    return dirs
+
+
+build_include_dirs += get_pip_cuda_include_dirs()
 build_libraries = ['cudart']
 build_library_dirs = [f'{CUDA_HOME}/lib64']
 third_party_include_dirs = [
