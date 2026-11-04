@@ -179,11 +179,13 @@ struct SM120ArchSpec {
         const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * get_smem_elem_size(desc, desc.a_dtype);
         const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * get_smem_elem_size(desc, desc.b_dtype);
         // NOTES: the FP32 kernel reads SFA from global memory (L1/L2 cached), not staged. The block-scaled 1D1D
-        // kernel TMA-loads the packed UE8M0 words of both operands with each stage: 2 words per row for FP4 (a K block
-        // is 256 elements), 1 for FP8, each tile rounded up to the 128B TMA destination alignment
+        // kernel TMA-loads the packed scale words of both operands with each stage (FP4 128-byte K block: 2 words per
+        // row for MXFP4, 4 for NVFP4; FP8: 1), each tile rounded up to the 128B TMA destination alignment
         int smem_sf_per_stage = 0;
         if (desc.kernel_type == KernelType::Kernel1D1D) {
-            const int num_sf_words = desc.a_dtype == kPackedFP4 ? layout.block_k * 2 / 32 / 4 : 1;
+            // FP4: `block_k * 2` elements per row, one byte per `sf_gran_k` (MXFP4 32, NVFP4 16), 4 bytes per word
+            DG_HOST_ASSERT(desc.sf_gran_k > 0);
+            const int num_sf_words = desc.a_dtype == kPackedFP4 ? layout.block_k * 2 / desc.sf_gran_k / 4 : 1;
             smem_sf_per_stage = align(num_sf_words * storage_config.load_block_m * 4, 128) +
                                 align(num_sf_words * storage_config.load_block_n * 4, 128);
         }
@@ -275,38 +277,43 @@ struct SM120ArchSpec {
         return sk_cost * 10 > dp_cost * 9 ? StreamKConfig{} : split;
     }
 
-    // 1D1D kernel cost model of data-parallel layouts, fitted on FP4 CUDA-graph sweeps of DeepSeek shapes with PDL and
-    // cold weights (`scripts/sm120_sweep_blockscale.py` + `scripts/sm120_fit_blockscale.py`, keep both in sync). Together
-    // with the stream-K rule of `get_stream_k_config`, its picks are within 1.2% of the fastest layout on average over
-    // 63 shapes (worst 10.5%), vs. 8.4% (worst 36%) for the FP32-kernel model. Units: one 128x128 K block of 128 bytes.
+    // 1D1D kernel cost model of data-parallel layouts, fitted jointly on FP4 and UE8M0 FP8 CUDA-graph sweeps of DeepSeek
+    // shapes with PDL and cold weights (`scripts/sm120_sweep_blockscale.py --mode fp4 / fp8g32` +
+    // `scripts/sm120_fit_blockscale.py`, keep both in sync). Everything counts bytes, so one model covers every mode.
+    // Together with the stream-K rule of `get_stream_k_config`, its picks are within 1.3% of the fastest layout on
+    // average over 63 shapes per mode (worst 14%). Fitting on FP4 alone over-penalized shallow pipelines: FP4 always had a
+    // deeper 64-byte-K alternative, while FP8's 128x128 tile has 2 stages, so FP8 fell to 64x64 at large M (1.4-1.6x
+    // slower). Units: one 128x128 K block of 128 bytes.
     // Every wave costs the max of
     //  - its share of DRAM traffic, inflated for small weight boxes (`block_n x block_k` bytes per TMA stream DRAM less
     //    efficiently),
     //  - its share of L2 -> SM traffic,
-    //  - the K loop of one CTA: per K block a layout cost, inflated for pipelines shallower than `kFullDepth` stages
-    //    (latency-bound)
-    static constexpr double k1D1DDRAMBytesPerUnit = 1.8e6;
-    static constexpr double k1D1DL2BytesPerUnit = 4e6;
-    static constexpr double k1D1DCTACostScale = 1.5;
-    static constexpr double k1D1DFullDepth = 6;
+    //  - the K loop of one CTA: per K block a layout cost, inflated by `(kFullDepth / stages) ^ kDepthExp` for pipelines
+    //    shallower than `kFullDepth` stages (latency-bound)
+    static constexpr double k1D1DDRAMBytesPerUnit = 1.6e6;
+    static constexpr double k1D1DL2BytesPerUnit = 3e6;
+    static constexpr double k1D1DCTACostScale = 1.2;
+    static constexpr double k1D1DFullDepth = 3.15;
+    static constexpr double k1D1DDepthExp = 1.58;
     static constexpr double k1D1DBoxRef = 8192;
-    static constexpr double k1D1DBoxExp = 0.75;
+    static constexpr double k1D1DBoxExp = 0.788;
+    static constexpr double k1D1DWaveOverhead = 0.5;
 
     // Per-K-block CTA cost of the 1D1D kernel (relative, 128x128 = 1000)
     static int get_1d1d_block_cost(const Layout& layout) {
         const int bm = layout.block_m, bn = layout.block_n;
-        if (bm == 16  and bn == 32)  return 31;
-        if (bm == 16  and bn == 64)  return 62;
-        if (bm == 16  and bn == 128) return 250;
-        if (bm == 16  and bn == 256) return 250;
-        if (bm == 32  and bn == 32)  return 125;
-        if (bm == 32  and bn == 64)  return 120;
-        if (bm == 32  and bn == 128) return 430;
-        if (bm == 32  and bn == 256) return 500;
-        if (bm == 64  and bn == 64)  return 275;
-        if (bm == 64  and bn == 128) return 500;
-        if (bm == 64  and bn == 256) return 1100;
-        if (bm == 128 and bn == 64)  return 500;
+        if (bm ==  16 and bn ==  32) return 31;
+        if (bm ==  16 and bn ==  64) return 38;
+        if (bm ==  16 and bn == 128) return 220;
+        if (bm ==  16 and bn == 256) return 250;
+        if (bm ==  32 and bn ==  32) return 78;
+        if (bm ==  32 and bn ==  64) return 125;
+        if (bm ==  32 and bn == 128) return 344;
+        if (bm ==  32 and bn == 256) return 500;
+        if (bm ==  64 and bn ==  64) return 344;
+        if (bm ==  64 and bn == 128) return 968;
+        if (bm ==  64 and bn == 256) return 1100;
+        if (bm == 128 and bn ==  64) return 900;
         if (bm == 128 and bn == 128) return 1000;
         return bm * bn * 1000 / (128 * 128);
     }
@@ -319,11 +326,13 @@ struct SM120ArchSpec {
         const int64_t num_tiles = get_num_tiles(desc, layout);
         const double num_k_blocks = ceil_div(static_cast<int>(k_bytes), layout.block_k);
         const double box_penalty = std::pow(std::max(1.0, k1D1DBoxRef / (layout.block_n * layout.block_k)), k1D1DBoxExp);
-        const double dram = (num_groups_b * n * k_bytes + num_groups_a * (m * k_bytes + 2 * m * n)) / k1D1DDRAMBytesPerUnit * box_penalty;
+        // D bytes per element: written, and also read when accumulating
+        const double cd_bytes = static_cast<double>(c10::elementSize(desc.cd_dtype)) * (desc.with_accumulation ? 2 : 1);
+        const double dram = (num_groups_b * n * k_bytes + num_groups_a * (m * k_bytes + cd_bytes * m * n)) / k1D1DDRAMBytesPerUnit * box_penalty;
         const double l2 = static_cast<double>(num_tiles) * num_k_blocks * (layout.block_m + layout.block_n) * layout.block_k / k1D1DL2BytesPerUnit;
         const int num_stages = get_pipeline_config(desc, layout, get_storage_config(desc, layout)).num_stages;
-        const double depth = std::max(1.0, k1D1DFullDepth / num_stages);
-        const double cta = num_k_blocks * layout.block_k / 128.0 * get_1d1d_block_cost(layout) / 1000.0 * k1D1DCTACostScale * depth;
+        const double depth = std::pow(std::max(1.0, k1D1DFullDepth / num_stages), k1D1DDepthExp);
+        const double cta = num_k_blocks * layout.block_k / 128.0 * get_1d1d_block_cost(layout) / 1000.0 * k1D1DCTACostScale * depth + k1D1DWaveOverhead;
         const int64_t num_waves = ceil_div<int64_t>(num_tiles, desc.num_sms);
         const int64_t num_last_blocks = num_tiles % desc.num_sms;
         double cost = 0;

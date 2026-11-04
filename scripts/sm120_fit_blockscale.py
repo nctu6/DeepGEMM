@@ -1,11 +1,13 @@
-# Fit the SM120 block-scaled (1D1D, FP4) layout model offline against `sm120_sweep_blockscale.py` measurements
+# Fit the SM120 1D1D (block-scaled FP4 / UE8M0 FP8, and BF16) layout model offline against `sm120_sweep_blockscale.py`
+# measurements
 #
-# The model mirrors `SM120ArchSpec::get_layout_info` for `KernelType::Kernel1D1D` (keep both in sync):
+# The model mirrors `SM120ArchSpec::get_1d1d_cost` (keep both in sync). Everything is counted in bytes of an operand
+# row, so one model covers every mode:
 #   per wave: max(dram_share, l2_share, cta)
 #   cta = num_k_blocks * (block_k / 128) * cta_cost[layout] / 1000 * cta_scale * depth_penalty(stages) + wave_overhead
 # where `depth_penalty` charges pipelines shallower than `full_depth` stages (latency-bound). The model ranks
-# data-parallel layouts; the chosen layout is then split (stream-K) by the explicit `use_stream_k` policy. Reports the regret
-# (chosen time / best time) per shape. Prints the fitted constants to paste into `sm120.hpp`.
+# data-parallel layouts; the chosen layout is then split (stream-K) by the explicit `use_stream_k` policy. Reports the
+# regret (chosen time / best time) per shape and per mode. Prints the fitted constants to paste into `sm120.hpp`.
 import argparse
 import json
 import math
@@ -15,14 +17,20 @@ SMEM_CAPACITY = 101376
 MAX_STAGES = 16
 
 
+def k_bytes_of(k, mode):
+    """Bytes along K of an operand row (`SM120ArchSpec::get_k_bytes`)"""
+    return {'fp4': k // 2, 'nvfp4': k // 2, 'fp8g32': k, 'bf16': 2 * k}[mode]
+
+
 def num_math_threads(bm, bn):
     if bm == 64 and bn >= 128:
         return 256
     return 128 if bm <= 64 else 256
 
 
-def num_stages(bm, bn, bk):
-    words = bk * 2 // 128
+def num_stages(bm, bn, bk, mode):
+    # Packed scale words per row and stage: a word covers 4 scale groups (32 elements each, 16 for NVFP4)
+    words = {'fp4': bk * 2 // 128, 'nvfp4': bk * 2 // 64, 'fp8g32': 1, 'bf16': 0}[mode]
     align = lambda x: (x + 127) // 128 * 128
     per_stage = bm * bk + bn * bk + align(words * bm * 4) + align(words * bn * 4)
     reduce = 0
@@ -32,31 +40,31 @@ def num_stages(bm, bn, bk):
     return min((SMEM_CAPACITY - (MAX_STAGES * 16 + 16) - reduce) // per_stage, MAX_STAGES)
 
 
-def stream_k_ctas(m, n, k, bm, bn, bk, min_iters=4):
+def stream_k_ctas(m, n, k, bm, bn, bk, mode, min_iters=4):
     """Mirrors `SM120ArchSpec::get_stream_k_split`: 0 means no split"""
     tiles = math.ceil(m / bm) * math.ceil(n / bn)
-    num_kb = math.ceil(k // 2 / bk)
+    num_kb = math.ceil(k_bytes_of(k, mode) / bk)
     if tiles > 1024:
         return 0
     ctas = min(NUM_SMS, tiles * num_kb // min_iters)
     return ctas if ctas > tiles else 0
 
 
-def use_stream_k(m, n, k, bm, bn, bk):
+def use_stream_k(m, n, k, bm, bn, bk, mode):
     """Mirrors `SM120ArchSpec::get_stream_k_config` (1D1D, auto): split only where the data-parallel grid fills under
     1/8 of the GPU, and the split clearly shortens the per-CTA K loop"""
-    ctas = stream_k_ctas(m, n, k, bm, bn, bk)
+    ctas = stream_k_ctas(m, n, k, bm, bn, bk, mode)
     tiles = math.ceil(m / bm) * math.ceil(n / bn)
     if not ctas or tiles * 8 > NUM_SMS:
         return False
-    num_kb = math.ceil(k // 2 / bk)
+    num_kb = math.ceil(k_bytes_of(k, mode) / bk)
     dp = math.ceil(tiles / NUM_SMS) * num_kb
     sk = math.ceil(tiles * num_kb / ctas) + 2
     return sk * 10 <= dp * 9
 
 
-def predict(m, n, k, bm, bn, bk, p, cost):
-    k_bytes = k // 2
+def predict(mode, m, n, k, bm, bn, bk, p, cost):
+    k_bytes = k_bytes_of(k, mode)
     num_kb = math.ceil(k_bytes / bk)
     tiles = math.ceil(m / bm) * math.ceil(n / bn)
     full_waves, last = divmod(tiles, NUM_SMS)
@@ -64,7 +72,7 @@ def predict(m, n, k, bm, bn, bk, p, cost):
     box_penalty = max(1.0, p['box_ref'] / (bn * bk)) ** p['box_exp']
     dram = (n * k_bytes + m * k_bytes + 2 * m * n) / p['dram'] * box_penalty
     l2 = tiles * num_kb * (bm + bn) * bk / p['l2']
-    stages = num_stages(bm, bn, bk)
+    stages = num_stages(bm, bn, bk, mode)
     depth = max(1.0, p['full_depth'] / stages) ** p['depth_exp']
     per_block = bk / 128 * cost[(bm, bn)] / 1000 * p['cta_scale'] * depth
     cta = num_kb * per_block + p['overhead']
@@ -78,6 +86,7 @@ def predict(m, n, k, bm, bn, bk, p, cost):
 def parse(records):
     out = []
     for r in records:
+        mode = r.get('mode', 'fp4')
         times = {}
         for key, v in r['times'].items():
             if key == 'auto':
@@ -85,28 +94,34 @@ def parse(records):
             bm, bn, bk = (int(x) for x in key.split('/')[0].split('x'))
             sk = key.endswith('/sk2')
             # The sweep forces a split whenever there are spare CTAs; keep the ones the policy can choose
-            if sk and not use_stream_k(r['m'], r['n'], r['k'], bm, bn, bk):
+            if sk and not use_stream_k(r['m'], r['n'], r['k'], bm, bn, bk, mode):
                 continue
             times[(bm, bn, bk, sk)] = v
         if times:
-            out.append((r['m'], r['n'], r['k'], times, r['times'].get('auto')))
+            out.append((mode, r['m'], r['n'], r['k'], times, r['times'].get('auto')))
     return out
 
 
 def evaluate(data, p, cost, verbose=False):
-    regrets = []
-    for m, n, k, times, auto in data:
+    regrets, per_mode = [], {}
+    for mode, m, n, k, times, auto in data:
         best = min(times.values())
         # The model ranks data-parallel layouts; the stream-K policy then decides the split
-        layout = min((l for l in times if not l[3]), key=lambda l: predict(m, n, k, *l[:3], p, cost))
+        layout = min((l for l in times if not l[3]), key=lambda l: predict(mode, m, n, k, *l[:3], p, cost))
         chosen = (*layout[:3], True) if (*layout[:3], True) in times else layout
-        regrets.append(times[chosen] / best)
+        regret = times[chosen] / best
+        regrets.append(regret)
+        per_mode.setdefault(mode, []).append(regret)
         if verbose:
             best_l = min(times, key=times.get)
-            print(f'm={m:5} n={n:5} k={k:5} chosen={chosen} {times[chosen] * 1e6:7.2f} best={best_l} {best * 1e6:7.2f} '
-                  f'regret={times[chosen] / best:.3f}' + (f' auto={auto / best:.3f}' if auto else ''))
-    geo = math.exp(sum(map(math.log, regrets)) / len(regrets))
-    return geo, max(regrets)
+            print(f'{mode:6} m={m:5} n={n:5} k={k:5} chosen={chosen} {times[chosen] * 1e6:7.2f} best={best_l} '
+                  f'{best * 1e6:7.2f} regret={regret:.3f}' + (f' auto={auto / best:.3f}' if auto else ''))
+    geo = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs))
+    if verbose:
+        for mode, xs in per_mode.items():
+            print(f'{mode}: geomean regret={geo(xs):.4f}, worst={max(xs):.3f} over {len(xs)} shapes')
+    # The worst mode's geomean comes first, so a fit cannot trade one mode's picks for another's
+    return max(geo(xs) for xs in per_mode.values()), geo(regrets), max(regrets)
 
 
 def main():
@@ -118,9 +133,9 @@ def main():
     records = {}
     for path in args.json:
         for r in json.load(open(path)):
-            records[(r['m'], r['n'], r['k'])] = r
+            records[(r.get('mode', 'fp4'), r['m'], r['n'], r['k'])] = r
     data = parse(list(records.values()))
-    layouts = sorted({(bm, bn) for _, _, _, t, _ in data for (bm, bn, _, _) in t})
+    layouts = sorted({(bm, bn) for _, _, _, _, t, _ in data for (bm, bn, _, _) in t})
 
     p = {'dram': 1.6e6, 'l2': 6e6, 'cta_scale': 1.0, 'overhead': 2.0, 'full_depth': 3.0, 'depth_exp': 1.0,
          'box_ref': 8192.0, 'box_exp': 0.0}
@@ -131,7 +146,7 @@ def main():
         'cta_scale': [0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0],
         'overhead': [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
         'full_depth': [2.0, 3.0, 4.0, 5.0, 6.0, 8.0],
-        'depth_exp': [0.0, 0.25, 0.5, 1.0, 1.5, 2.0],
+        'depth_exp': [0.0, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0],
         'box_ref': [4096.0, 8192.0, 16384.0, 32768.0],
         'box_exp': [0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0],
     }
@@ -179,12 +194,12 @@ def main():
                         cost[l] = old
             if not improved:
                 break
-    print(f'fitted: geomean regret={best[0]:.4f}, worst={best[1]:.3f}')
+    print(f'fitted: worst-mode geomean regret={best[0]:.4f}, overall geomean={best[1]:.4f}, worst={best[2]:.3f}')
     print('params:', {k: (f'{v:.3g}') for k, v in p.items()})
-    print('cta costs (per 128-byte K block, 128x128 FP32 = 1000):')
+    print('cta costs (per 128-byte K block, 128x128 = 1000):')
     for l in layouts:
         print(f'    if (bm == {l[0]:3} and bn == {l[1]:3}) return {round(cost[l])};')
-    autos = [a / min(t.values()) for _, _, _, t, a in data if a]
+    autos = [a / min(t.values()) for _, _, _, _, t, a in data if a]
     if autos:
         print(f'current auto: geomean regret={math.exp(sum(map(math.log, autos)) / len(autos)):.4f}, worst={max(autos):.3f}')
     if args.verbose:
