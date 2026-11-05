@@ -18,17 +18,19 @@ sys.path.insert(0, 'tests')
 from test_attention import make_sparse_kv_block_indices, to_mqa_weights  # noqa: E402
 
 
-def check(num_heads, fmt, num_q_tokens, kv_len, sparse_block_kv, num_max_sparse_blocks, seed=0):
+def check(num_heads, fmt, num_q_tokens, kv_len, sparse_block_kv, num_max_sparse_blocks, use_unaligned_ks=False, seed=0):
     head_dim = 128
     is_mxfp4 = fmt == 'mxfp4'
     cast = per_token_cast_to_fp4 if is_mxfp4 else per_token_cast_to_fp8
     elem_dim = head_dim // 2 if is_mxfp4 else head_dim
     torch.manual_seed(seed)
 
-    # One request, aligned ks starting at 0
-    context_lens = [kv_len] * num_q_tokens
-    context_starts = [0] * num_q_tokens
-    num_kv_tokens = kv_len
+    # One request. Aligned ks starts at 0; unaligned ks starts at a non-multiple of sparse_block_kv.
+    start = (sparse_block_kv + sparse_block_kv // 2) if use_unaligned_ks else 0
+    assert (start % sparse_block_kv != 0) if use_unaligned_ks else (start % sparse_block_kv == 0)
+    context_starts = [start] * num_q_tokens
+    context_lens = [start + kv_len] * num_q_tokens
+    num_kv_tokens = start + kv_len
 
     q_fp, q_sf = cast(torch.randn((num_q_tokens, num_heads, head_dim), device='cuda', dtype=torch.bfloat16).view(-1, head_dim),
                       use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
@@ -44,10 +46,12 @@ def check(num_heads, fmt, num_q_tokens, kv_len, sparse_block_kv, num_max_sparse_
     ends = torch.tensor(context_lens, device='cuda', dtype=torch.int32)
     metadata = deep_gemm.get_sparse_mqa_logits_metadata(
         cu_seq_len_k_start=starts, cu_seq_len_k_end=ends, num_kv_tokens=num_kv_tokens,
-        sparse_kv_block_indices=sparse_indices, qk_dtype=q[0].dtype, sparse_block_kv=sparse_block_kv)
+        sparse_kv_block_indices=sparse_indices, qk_dtype=q[0].dtype, sparse_block_kv=sparse_block_kv,
+        use_unaligned_ks=use_unaligned_ks)
     sparse_logits = deep_gemm.fp8_fp4_sparse_mqa_logits(
         q=q, kv=kv, weights=weights, metadata=metadata,
-        num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv)
+        num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv,
+        use_unaligned_ks=use_unaligned_ks)
 
     # Dequantized reference: relu(Q_deq . KV_deq) * weight, summed over heads
     back = cast_back_from_fp4 if is_mxfp4 else cast_back_from_fp8
@@ -69,7 +73,7 @@ def check(num_heads, fmt, num_q_tokens, kv_len, sparse_block_kv, num_max_sparse_
     diff = (1 - 2 * (x * y).sum() / (x * x + y * y).sum()).item() if x.numel() else 0.0
     ok = diff < 1e-3
     print(f'[{fmt:6}] H={num_heads:2} SQ={num_q_tokens:4} KV={kv_len:6} bkv={sparse_block_kv} '
-          f'nmsb={num_max_sparse_blocks}: n={sp.numel()} diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
+          f'nmsb={num_max_sparse_blocks} uaks={int(use_unaligned_ks)}: n={sp.numel()} diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
     return ok
 
 
@@ -79,7 +83,8 @@ def main():
     for fmt in ('mxfp8', 'mxfp4'):
         for num_heads in (8, 32):
             for (sq, kv, bkv, nmsb) in [(9, 2048, 8, 128), (64, 4096, 8, 512), (9, 1024, 16, 128)]:
-                failed |= not check(num_heads, fmt, sq, kv, bkv, nmsb)
+                for uaks in (False, True):
+                    failed |= not check(num_heads, fmt, sq, kv, bkv, nmsb, use_unaligned_ks=uaks)
     print('FAILED' if failed else 'ALL OK')
     sys.exit(1 if failed else 0)
 
