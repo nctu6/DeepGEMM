@@ -13,9 +13,9 @@ def ref_logits(q_fp8, kv_fp8, kv_sf, weights):
     return (score * weights[:, :, None]).sum(1)
 
 
-def check_contiguous(seq_len, seq_len_kv, num_heads):
-    q = torch.randn(seq_len, num_heads, 128, device='cuda', dtype=torch.bfloat16)
-    kv = torch.randn(seq_len_kv, 128, device='cuda', dtype=torch.bfloat16)
+def check_contiguous(seq_len, seq_len_kv, num_heads, head_dim=128):
+    q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
     weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float)
     q_fp8 = q.to(torch.float8_e4m3fn)
     kv_fp8, kv_sf = per_custom_dims_cast_to_fp8(kv, (0, ), False)
@@ -30,7 +30,7 @@ def check_contiguous(seq_len, seq_len_kv, num_heads):
     mask = idx < ke[:, None]
     ref = full.gather(1, idx.clamp_max(seq_len_kv - 1))
     diff = calc_diff(logits[mask], ref[mask])
-    print(f'contiguous S={seq_len} SK={seq_len_kv} H={num_heads}: diff={diff:.2e}')
+    print(f'contiguous S={seq_len} SK={seq_len_kv} H={num_heads} D={head_dim}: diff={diff:.2e}')
     assert diff < 1e-3
 
 
@@ -75,6 +75,9 @@ if __name__ == '__main__':
     torch.manual_seed(0)
     for s, sk, h in ((128, 4096, 64), (300, 2048, 32), (1024, 8192, 64), (7, 300, 32)):
         check_contiguous(s, sk, h)
+    # Head dim 64 (prefill)
+    for s, sk, h in ((128, 4096, 64), (300, 2048, 32), (1024, 8192, 64)):
+        check_contiguous(s, sk, h, head_dim=64)
     # NOTES: B=32 / next_n=2 cases wrap the 2-stage Q/KV pipelines (they caught a release bug and a 1-Q-stage deadlock)
     for b, nn, h, c in ((4, 1, 64, 1000), (33, 1, 32, 4096), (8, 2, 64, 3000), (64, 1, 64, 300), (3, 1, 64, 20000),
                         (32, 1, 64, 4096), (8, 2, 64, 8000), (64, 2, 64, 4096), (128, 1, 64, 16384)):

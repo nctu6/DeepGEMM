@@ -38,7 +38,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
     // Types
     // NOTES: SM120 has no WGMMA, each math warp computes 16 KV rows against all `kNextN * kNumHeads` Q rows
-    // with `mma.sync`, keeping the SM90 WGMMA accumulator layout (see `warp_mma_16xNx128_ss`)
+    // with `mma.sync`, keeping the SM90 WGMMA accumulator layout (see `warp_mma_16xNxHd_ss`)
     static constexpr uint32_t kNumAccum = kNextN * kNumHeads / 2;
     DG_STATIC_ASSERT(kHeadDim == 128, "SM120 MQA logits only support head dim 128");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -265,7 +265,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Issue MMAs
             DG_STATIC_ASSERT(BLOCK_KV == 64, "Invalid block size");
-            mma::sm120::warp_mma_16xNx128_ss<kNextN * kNumHeads>(
+            mma::sm120::warp_mma_16xNxHd_ss<kNextN * kNumHeads, 128>(
                 mma::sm120::to_smem_addr(smem_kv[kv_stage_idx]), sub_warp_offset,
                 mma::sm120::to_smem_addr(smem_q[q_stage_idx]), accum);
             // Read per-KV scales

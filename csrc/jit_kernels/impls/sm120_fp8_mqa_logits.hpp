@@ -33,7 +33,7 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
     constexpr int num_q_stages = 2, num_kv_stages = 3;
     const int num_sms = runtime->get_num_sms();
     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
-    DG_HOST_ASSERT(head_dim == 128 and "SM120 MQA logits only support head dim 128");
+    DG_HOST_ASSERT((head_dim == 128 or head_dim == 64) and "SM120 MQA logits support head dim 128 or 64");
     DG_HOST_ASSERT(block_kv == kSM120MQALogitsBlockKV and block_kv == num_math_threads / 2);
     DG_HOST_ASSERT(128 % num_heads == 0);
 

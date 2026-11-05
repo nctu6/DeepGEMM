@@ -39,9 +39,9 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Types
     // NOTES: SM120 has no WGMMA, each math warp computes 16 KV rows against all `BLOCK_Q * kNumHeads` Q rows
-    // with `mma.sync`, keeping the SM90 WGMMA accumulator layout (see `warp_mma_16xNx128_ss`)
+    // with `mma.sync`, keeping the SM90 WGMMA accumulator layout (see `warp_mma_16xNxHd_ss`)
     static constexpr uint32_t kNumAccum = BLOCK_Q * kNumHeads / 2;
-    DG_STATIC_ASSERT(kHeadDim == 128, "SM120 MQA logits only support head dim 128");
+    DG_STATIC_ASSERT(kHeadDim == 128 or kHeadDim == 64, "SM120 MQA logits support head dim 128 or 64");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // Prefetch TMA descriptors
@@ -55,8 +55,9 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     __syncwarp();
 
     // Shared memory configs
-    // NOTES: weight may be unaligned
-    static constexpr uint32_t kSwizzleAlignment = kHeadDim * 8;
+    // NOTES: weight may be unaligned. A swizzle atom is `kHeadDim` bytes x 8 rows; TMA needs the tile base aligned to it,
+    // and at least 1024 bytes (the largest swizzle atom)
+    static constexpr uint32_t kSwizzleAlignment = cute::max(kHeadDim * 8, 1024u);
     static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * kHeadDim * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * sizeof(float);
     static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = BLOCK_KV * kHeadDim * sizeof(__nv_fp8_e4m3);
@@ -246,7 +247,7 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
                 // Issue MMAs
                 DG_STATIC_ASSERT(BLOCK_KV == kNumMathThreads / 2, "Invalid block size");
-                mma::sm120::warp_mma_16xNx128_ss<BLOCK_Q * kNumHeads>(
+                mma::sm120::warp_mma_16xNxHd_ss<BLOCK_Q * kNumHeads, kHeadDim>(
                     mma::sm120::to_smem_addr(smem_kv[kv_stage_idx]), warp_idx * 16,
                     mma::sm120::to_smem_addr(smem_q[q_stage_idx]), accum);
 
