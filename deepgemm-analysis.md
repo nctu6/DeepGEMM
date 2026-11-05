@@ -630,6 +630,13 @@ Test: let `test_sparse_mqa_logits` run on arch 12 (the generators treat arch 12
 as SM90-like for FP8; FP4 Q needs the `kPackedFP4` path enabled for arch 12 in
 `generators.py`). Tolerance matches the dense MQA check.
 
+Progress: `mma::sm120::warp_mma_16xNxHd_block_scaled_ss<N, kHeadDim, kIsFP4>`
+landed in `mma/sm120.cuh` (the block-scaled compute primitive: `KV[16,hd] @
+Q[N,hd]^T` with MX UE8M0 scales, SF lane map copied from the 1D1D GEMM). The
+metadata-scheduler smem bound is now device-based. Remaining: the kernel body
+(producer + KV-copy + math warps reusing the accessors), the launcher, and the
+arch-12 dispatch.
+
 Biggest risk: the block-scaled `mma.sync` SF lane map for the MQA operand layout
 (Q as the N operand, KV as the M operand) differs from the GEMM's A/B roles;
 verify the SFA/SFB byte selection against the probe before trusting the full kernel.
