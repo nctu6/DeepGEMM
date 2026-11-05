@@ -413,12 +413,10 @@ static torch::Tensor fp8_fp4_sparse_mqa_logits(const std::tuple<torch::Tensor, s
     const int logits_stride = align(num_output_tokens, 1024 / static_cast<int>(sizeof(nv_bfloat16)));
     auto logits = torch::empty({align<int>(num_q_tokens, kBlockQ), logits_stride}, q_fp.options().dtype(torch::kBFloat16));
     logits = logits.index({torch::indexing::Slice(0, num_q_tokens), torch::indexing::Slice(0, num_output_tokens)});
-    if (arch_major == 12) {
-        // WIP (gated): the SM120 sparse kernel has a known deadlock + undersized-split bug; off by default
-        DG_HOST_ASSERT(deep_jit::get_env<int>("DG_SM120_SPARSE_WIP", 0) == 1 and "SM120 sparse MQA logits is WIP");
+    if (arch_major == 12)
         launch_sm120_sparse_mqa_logits(false, sparse_block_kv, q_fp, q_sf, kv_fp, kv_sf, torch::Tensor(),
                                        weights, metadata, logits);
-    } else
+    else
         launch_sm100_sparse_mqa_logits(false, use_unaligned_ks, sparse_block_kv,
                                        q_fp, q_sf, kv_fp, kv_sf, weights, metadata, logits);
     return logits;
@@ -459,11 +457,10 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
     const int logits_stride = align(num_output_tokens, 1024 / static_cast<int>(sizeof(nv_bfloat16)));
     auto logits = torch::empty({align<int>(num_q_tokens, kBlockQ), logits_stride}, q_fp.options().dtype(torch::kBFloat16));
     logits = logits.index({torch::indexing::Slice(0, num_q_tokens), torch::indexing::Slice(0, num_output_tokens)});
-    if (arch_major == 12) {
-        DG_HOST_ASSERT(deep_jit::get_env<int>("DG_SM120_SPARSE_WIP", 0) == 1 and "SM120 sparse MQA logits is WIP");
+    if (arch_major == 12)
         launch_sm120_sparse_mqa_logits(true, sparse_block_kv, q_fp, q_sf, torch::Tensor(), torch::Tensor(),
                                        fused_kv_cache, weights, metadata, logits);
-    } else
+    else
         launch_sm100_sparse_mqa_logits(true, false, sparse_block_kv, q_fp, q_sf, fused_kv_cache, torch::Tensor(),
                                        weights, metadata, logits);
     return logits;
