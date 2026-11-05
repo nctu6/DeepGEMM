@@ -676,6 +676,18 @@ Effort: the compute primitive is landed and validated; the remaining kernel body
 launcher + dispatch is the bulk and needs the structured editor for safe iteration
 against `test_sparse_mqa_logits` (oracle: bitwise-equal to the dense MQA logits).
 
+Trap found while scoping the gather: the SM100 producer writes KV into a
+UMMA-descriptor smem layout via `get_swizzled_kv_chunk_idx`, which does NOT match
+the TMA 128B/64B `ldmatrix` swizzle (`get_swizzle_offset`) that the SM120
+block-scaled helper reads. So the gather producer must be rewritten to land each
+gathered sparse KV block in the `ldmatrix` layout (as the dense SM120 kernel's TMA
+KV tile already is), not copied from SM100. Plan: gather with `cp.async` (paged) or
+TMA (contiguous) straight into a `[SPLIT_KV][kHeadDim bytes]` tile with the same
+128B swizzle the dense kernel uses, and stage one int32 SF word per token into
+`sf_kv[token]`. Build incrementally: contiguous MXFP8 aligned-ks first (simplest),
+then FP4, unaligned-ks, and paged. Oracle each step against `test_sparse_mqa_logits`
+restricted to that case.
+
 ## 10. Measurements (RTX PRO 6000, GPU 7)
 
 Timing method matters (learned the hard way):
