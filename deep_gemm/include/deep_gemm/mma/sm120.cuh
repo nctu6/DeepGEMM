@@ -224,14 +224,18 @@ CUTLASS_DEVICE void warp_mma_16xNxHd_block_scaled_ss(const uint32_t& a_base, con
     const uint32_t b_ld_row = (lane_idx >> 4) * 8 + (lane_idx & 7);
     const uint32_t b_ld_chunk = (lane_idx >> 3) & 1;
 
-    // This lane's A scale rows (g, g+8) and B scale column (g), across all `kHeadDim / 128` words
+    // This lane's A scale rows (g, g+8) and, for each 8-wide B column tile `c`, the B scale of column `c*8 + g`
+    // (the MMA's SFB lane map takes column `g` from lane `t == 0`), across all `kHeadDim / 128` words
     static constexpr uint32_t kNumWords = kHeadDim / 128;
-    uint32_t a_sf_words[2][kNumWords], b_sf_words[kNumWords];
+    static constexpr uint32_t kNumBTiles = N / 8;
+    uint32_t a_sf_words[2][kNumWords], b_sf_words[kNumBTiles][kNumWords];
     #pragma unroll
     for (uint32_t w = 0; w < kNumWords; ++ w) {
         a_sf_words[0][w] = a_sf[w * a_sf_stride + a_row + g];
         a_sf_words[1][w] = a_sf[w * a_sf_stride + a_row + g + 8];
-        b_sf_words[w] = b_sf[w * b_sf_stride + g];
+        #pragma unroll
+        for (uint32_t c = 0; c < kNumBTiles; ++ c)
+            b_sf_words[c][w] = b_sf[w * b_sf_stride + c * 8 + g];
     }
 
     #pragma unroll
@@ -251,7 +255,6 @@ CUTLASS_DEVICE void warp_mma_16xNxHd_block_scaled_ss(const uint32_t& a_base, con
                 return (words >> (8 * (k % 4))) & 0xffu;
         };
         const uint32_t sfa0 = scale(a_sf_words[0][word]), sfa1 = scale(a_sf_words[1][word]);
-        const uint32_t sfb = scale(b_sf_words[word]);
         uint32_t a_frag[4];
         ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                     a_base + get_swizzle_offset<kRowBytes>(a_ld_row, k * 2 + a_ld_chunk));
@@ -260,9 +263,10 @@ CUTLASS_DEVICE void warp_mma_16xNxHd_block_scaled_ss(const uint32_t& a_base, con
             uint32_t b_frag[2][2];
             ldmatrix_x4(b_frag[0][0], b_frag[0][1], b_frag[1][0], b_frag[1][1],
                         b_base + get_swizzle_offset<kRowBytes>(b_ld_row + j * 16, k * 2 + b_ld_chunk));
-            // The MMA reads SFA of its two M-rows via the lane map (t==0 -> row g, t==1 -> row g+8); SFB from t==0
-            MMA::mma(a_frag, b_frag[0], accum + (j * 2 + 0) * 4, ((t & 1) ? sfa1 : sfa0), sfb);
-            MMA::mma(a_frag, b_frag[1], accum + (j * 2 + 1) * 4, ((t & 1) ? sfa1 : sfa0), sfb);
+            // The MMA reads SFA of its two M-rows via the lane map (t==0 -> row g, t==1 -> row g+8); SFB is the
+            // scale of this 8-col tile's column g (b_frag[0] -> tile 2j, b_frag[1] -> tile 2j+1)
+            MMA::mma(a_frag, b_frag[0], accum + (j * 2 + 0) * 4, ((t & 1) ? sfa1 : sfa0), scale(b_sf_words[j * 2 + 0][word]));
+            MMA::mma(a_frag, b_frag[1], accum + (j * 2 + 1) * 4, ((t & 1) ? sfa1 : sfa0), scale(b_sf_words[j * 2 + 1][word]));
         }
     }
 }

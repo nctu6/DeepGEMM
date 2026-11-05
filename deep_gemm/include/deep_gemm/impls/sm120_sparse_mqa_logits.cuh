@@ -110,11 +110,8 @@ void sm120_sparse_mqa_logits(const uint32_t logits_stride, nv_bfloat16* logits,
         cute::prefetch_tma_descriptor(&tensor_map_q);
         cute::prefetch_tma_descriptor(&tensor_map_sf_q);
         cute::prefetch_tma_descriptor(&tensor_map_weights);
-        full_q_barrier->init(1);
-        cutlass::arch::fence_barrier_init();
     }
     __syncthreads();
-    uint32_t q_phase = 0;
 
     const PagedKVAccessor paged{fused_kv_cache, page_stride_bytes, page_kv, SPARSE_BLOCK_KV, kRowBytes};
     cudaGridDependencySynchronize();
@@ -126,15 +123,21 @@ void sm120_sparse_mqa_logits(const uint32_t logits_stride, nv_bfloat16* logits,
         const uint32_t q_token_base = entry.q_token_base;
         const uint32_t num_q_tokens = entry.num_q_tokens;
 
-        // Load Q, SF-Q, weights for this q-block via TMA (init-once barrier, toggling phase)
+        // Load Q, SF-Q, weights for this q-block via TMA. Fresh barrier per wave (init -> fence -> sync -> wait(0)).
+        // Order the previous wave's ldmatrix (generic proxy) reads of smem_q before this wave's TMA (async proxy) write.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        if (is_tma_warp and cute::elect_one_sync()) {
+            full_q_barrier->init(1);
+            cutlass::arch::fence_barrier_init();
+        }
+        __syncthreads();
         if (is_tma_warp and cute::elect_one_sync()) {
             tma::copy<kHeadDim, kN, kRowBytes>(&tensor_map_q, full_q_barrier, smem_q, 0, q_token_base * kNumHeads);
-            tma::copy<kN, 1, 0>(&tensor_map_sf_q, full_q_barrier, smem_sf_q, 0, q_token_base);
+            tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_sf_q, full_q_barrier, smem_sf_q, 0, q_token_base);
             tma::copy<kNumWeightElems, BLOCK_Q, 0>(&tensor_map_weights, full_q_barrier, smem_weights, 0, q_token_base);
-            full_q_barrier->arrive_and_expect_tx(SMEM_Q + SMEM_SF_Q + BLOCK_Q * kNumWeightElems * 2);
+            full_q_barrier->arrive_and_expect_tx(SMEM_Q + kN * 4 + BLOCK_Q * kNumWeightElems * 2);
         }
-        full_q_barrier->wait(q_phase ^ 1);
-        q_phase ^= 1;
+        full_q_barrier->wait(0);
 
         // Per-lane Q weights (dense-kernel layout): weights[i][j] packs heads for the reduction
         float weights[BLOCK_Q][kNumHeads / 4];
