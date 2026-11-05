@@ -197,4 +197,74 @@ CUTLASS_DEVICE void warp_mma_16xNxHd_ss(const uint32_t& a_base, const uint32_t& 
     }
 }
 
+/// One warp computes `accum[16, N] = A[16, kHeadDim] @ B[N, kHeadDim]^T` with block-scaled FP8 (E4M3, 32-element UE8M0)
+/// or FP4 (E2M1, 32-element UE8M0 / `kIsFP4`) operands, the tensor core applying the scales. Same accumulator layout as
+/// `warp_mma_16xNxHd_ss`. `a_sf` / `b_sf` are the per-row packed UE8M0 words in shared memory (one int32 per 4 K groups,
+/// i.e. per 128 elements), laid out `[kHeadDim / 128 words][row]`; `a_sf_stride` / `b_sf_stride` are the row counts of
+/// those arrays. The SF lane map matches the 1D1D GEMM: a lane supplies the A scale of row `g` (`t == 0`) or `g + 8`
+/// (`t == 1`), and the B scale of column `g` (`t == 0`), with `g = lane / 4`, `t = lane % 4`
+template <uint32_t N, uint32_t kHeadDim, bool kIsFP4>
+CUTLASS_DEVICE void warp_mma_16xNxHd_block_scaled_ss(const uint32_t& a_base, const uint32_t& a_row,
+                                                     const uint32_t& b_base,
+                                                     const uint32_t* a_sf, const uint32_t a_sf_stride,
+                                                     const uint32_t* b_sf, const uint32_t b_sf_stride,
+                                                     float* accum) {
+    DG_STATIC_ASSERT(N % 16 == 0, "Invalid N");
+    DG_STATIC_ASSERT(kHeadDim == 128, "Block-scaled MQA head dim must be 128");
+    using MMA = cute::conditional_t<kIsFP4, FP4BlockScaledMMA, FP8BlockScaledMMA>;
+    // One K step (one MMA) is `MMA::K` elements, which is 32 bytes of a packed row for both: FP8 32 elems x 1 byte,
+    // FP4 64 elems / 2 per byte. So an `ldmatrix.x4` (4 regs = 32 bytes = 2 swizzle chunks) feeds exactly one step
+    constexpr uint32_t kRowBytes = kHeadDim / (kIsFP4 ? 2 : 1);  // 128 FP8 / 64 FP4 bytes per row
+    constexpr uint32_t kNumSteps = kRowBytes / 32;              // 4 FP8 / 2 FP4
+    const uint32_t lane_idx = threadIdx.x % 32, g = lane_idx / 4, t = lane_idx % 4;
+
+    // `ldmatrix` source rows/chunks of this lane (16-byte chunks within a `kRowBytes`-byte swizzled row)
+    const uint32_t a_ld_row = a_row + ((lane_idx >> 3) & 1) * 8 + (lane_idx & 7);
+    const uint32_t a_ld_chunk = lane_idx >> 4;
+    const uint32_t b_ld_row = (lane_idx >> 4) * 8 + (lane_idx & 7);
+    const uint32_t b_ld_chunk = (lane_idx >> 3) & 1;
+
+    // This lane's A scale rows (g, g+8) and B scale column (g), across all `kHeadDim / 128` words
+    static constexpr uint32_t kNumWords = kHeadDim / 128;
+    uint32_t a_sf_words[2][kNumWords], b_sf_words[kNumWords];
+    #pragma unroll
+    for (uint32_t w = 0; w < kNumWords; ++ w) {
+        a_sf_words[0][w] = a_sf[w * a_sf_stride + a_row + g];
+        a_sf_words[1][w] = a_sf[w * a_sf_stride + a_row + g + 8];
+        b_sf_words[w] = b_sf[w * b_sf_stride + g];
+    }
+
+    #pragma unroll
+    for (uint32_t i = 0; i < N / 8 * 4; ++ i)
+        accum[i] = 0;
+
+    #pragma unroll
+    for (uint32_t k = 0; k < kNumSteps; ++ k) {
+        // The UE8M0 scale byte of step `k`: its K covers `MMA::K` elements, i.e. `MMA::K / 32` scale groups. A word
+        // holds 4 groups (128 elements). FP8: group `k`, byte `k % 4` of word `k / 4`. FP4: a step is 64 elements = 2
+        // groups, the 16-bit pair `k % 2` of word `k / 2`
+        const uint32_t word = kIsFP4 ? k / 2 : k / 4;
+        const auto scale = [&](const uint32_t& words) -> uint32_t {
+            if constexpr (kIsFP4)
+                return (words >> (16 * (k % 2))) & 0xffffu;
+            else
+                return (words >> (8 * (k % 4))) & 0xffu;
+        };
+        const uint32_t sfa0 = scale(a_sf_words[0][word]), sfa1 = scale(a_sf_words[1][word]);
+        const uint32_t sfb = scale(b_sf_words[word]);
+        uint32_t a_frag[4];
+        ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                    a_base + get_swizzle_offset<kRowBytes>(a_ld_row, k * 2 + a_ld_chunk));
+        #pragma unroll
+        for (uint32_t j = 0; j < N / 16; ++ j) {
+            uint32_t b_frag[2][2];
+            ldmatrix_x4(b_frag[0][0], b_frag[0][1], b_frag[1][0], b_frag[1][1],
+                        b_base + get_swizzle_offset<kRowBytes>(b_ld_row + j * 16, k * 2 + b_ld_chunk));
+            // The MMA reads SFA of its two M-rows via the lane map (t==0 -> row g, t==1 -> row g+8); SFB from t==0
+            MMA::mma(a_frag, b_frag[0], accum + (j * 2 + 0) * 4, ((t & 1) ? sfa1 : sfa0), sfb);
+            MMA::mma(a_frag, b_frag[1], accum + (j * 2 + 1) * 4, ((t & 1) ? sfa1 : sfa0), sfb);
+        }
+    }
+}
+
 } // namespace deep_gemm::mma::sm120
