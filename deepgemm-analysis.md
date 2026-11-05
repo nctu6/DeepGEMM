@@ -786,3 +786,33 @@ measurement. A future pass needs a ground-up pipeline, not an incremental patch.
 
 Full regression on GPU 6: `tests/test_fp8_fp4.py` (k-grouped skipped), the four
 MQA checks, all green.
+
+
+## 9.7 Cost-model refit + V3.2 indexer SM120 finding (2026-11-06)
+
+**Cost-model refit.** Re-swept every legal 1D1D layout of the DeepSeek-V3 TP8
+dense linears for MXFP4 and UE8M0 FP8 (serving condition: CUDA graph, cold
+weights, PDL) and jointly refit the model. Worst-mode geomean regret on the
+sweep data: 1.027 -> 1.014. New constants (`depth_exp` 1.58 -> 0.5,
+`cta_scale` 1.2 -> 1.5, recalibrated per-tile cost table: 64x128 968 -> 476,
+128x64 900 -> 525) make mid-M shapes prefer the 64x128 / 128x64 tiles the sweep
+measures fastest. End to end vs FlashInfer MXFP4 (63 points): geomean speedup
+1.315x -> 1.33x, still 59/63 wins. Committed `1b065a2`.
+
+The 4 remaining ties (q_b M=256, o_proj M=128, dense gate_up M=256, dense down
+M=128; 0.96-0.99x vs b12x) are **not closable with the available tools**: the
+analytic model cannot pick a per-M tile (its cost table is one value per tile
+shape), and `DG_SM120_AUTOTUNE=1` is *worse* (geomean 1.318, q_b M=256 0.94)
+because eager timing cannot see the graph-mode PDL overlap. Genuine kernel-level
+parity at that M/N boundary; leave at the model's pick.
+
+**V3.2 sparse indexer on SM120 is blocked upstream, not in DeepGEMM.** The
+DeepGEMM sparse MQA scoring kernel works on SM120 (section 9.6), but TokenSpeed's
+native DSV4.1 indexer (`dsv41/deep_gemm.py`) gates on `platform.is_blackwell`,
+which is arch-major==10 only (SM100); SM120 is arch 12 (`is_blackwell` False,
+`is_blackwell_plus` True). More fundamentally, the top-k **DeepSelect** half needs
+~207 KB of shared memory (sized for SM100's 227 KB); SM120 has 99 KB, so a launch
+on sm_120a fails `CUDA_ERROR_INVALID_CONFIG` (probed directly with cluster_size=1).
+Enabling the DeepGEMM indexer on SM120 therefore needs an SM120 smem-reduced
+DeepSelect port (CuTe DSL, tokenspeed-kernel, core-team-owned), plus flipping the
+`is_blackwell` gates to `is_blackwell_plus`. Hand-off noted; out of DeepGEMM scope.
