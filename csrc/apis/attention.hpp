@@ -30,8 +30,10 @@ static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std:
     DG_HOST_ASSERT(q_fp.is_contiguous());
     DG_HOST_ASSERT(q_fp.scalar_type() == (is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn));
 
-    // Check SF Q (SM100 uses MX scale factors, SM90 per-token float KV scales)
-    DG_HOST_ASSERT(is_mx_sf == (arch_major == 10));
+    // Check SF Q. MX scale factors on SM100 and SM120 (block-scaled); SM90/SM120-FP8 use per-token float KV scales.
+    // SM120 supports both: MX-scaled (this check's is_mx_sf path) and the FP8 per-token-scale kernel (is_mx_sf false).
+    DG_HOST_ASSERT(is_mx_sf == (arch_major == 10) or (arch_major == 12 and (is_mx_sf or not is_fp4)));
+    DG_HOST_ASSERT(not is_fp4 or is_mx_sf);   // FP4 always needs MX scales
     if (is_mx_sf) {
         DG_HOST_ASSERT(q_sf->sizes() == q_fp.sizes().slice(0, q_fp.dim() - 1));
         DG_HOST_ASSERT(q_sf->is_contiguous());
@@ -42,7 +44,7 @@ static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std:
     const auto [_num_q_tokens, _num_heads] = get_shape<2>(weights);
     DG_HOST_ASSERT(num_q_tokens == _num_q_tokens and num_heads == _num_heads);
     DG_HOST_ASSERT(weights.stride(1) == 1 and (weights.stride(0) * weights.element_size()) % 16 == 0);
-    DG_HOST_ASSERT(weights.scalar_type() == (arch_major == 10 ? torch::kBFloat16 : torch::kFloat32));
+    DG_HOST_ASSERT(weights.scalar_type() == ((arch_major == 10 or (arch_major == 12 and is_mx_sf)) ? torch::kBFloat16 : torch::kFloat32));
 }
 
 static torch::Tensor get_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_start,
@@ -79,7 +81,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     const bool is_fp4 = qk_dtype == kPackedFP4;
     const bool is_mx_sf = q_sf.has_value();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = arch_major == 10 ? torch::kBFloat16 : torch::kFloat32;
+    const auto out_dtype = (arch_major == 10 or (arch_major == 12 and is_mx_sf)) ? torch::kBFloat16 : torch::kFloat32;
 
     // Check Q, SF Q and weights
     const auto [seq_len, num_heads, head_dim] = get_logical_shape<3>(q_fp);
@@ -131,10 +133,17 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
                             seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q, block_kv);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(not schedule_meta.has_value());
-        DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
         DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
-        sm120_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
-                             seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q, block_kv);
+        if (is_mx_sf) {
+            // Block-scaled MXFP8 / MXFP4 (head dim 128)
+            DG_HOST_ASSERT(head_dim == 128);
+            sm120_fp8_fp4_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
+                                     logits, seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q);
+        } else {
+            DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
+            sm120_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
+                                 seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q, block_kv);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -198,7 +207,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     int block_table_stride = block_table.stride(0);
     int num_sms = runtime->get_num_sms();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = arch_major == 10 ? torch::kBFloat16 : torch::kFloat32;
+    const auto out_dtype = (arch_major == 10 or (arch_major == 12 and is_mx_sf)) ? torch::kBFloat16 : torch::kFloat32;
 
     // Check Q, SF Q and weights
     const auto [batch_size, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
