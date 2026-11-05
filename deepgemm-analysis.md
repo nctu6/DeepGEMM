@@ -637,11 +637,44 @@ metadata-scheduler smem bound is now device-based. Remaining: the kernel body
 (producer + KV-copy + math warps reusing the accessors), the launcher, and the
 arch-12 dispatch.
 
-Biggest risk: the block-scaled `mma.sync` SF lane map for the MQA operand layout
-(Q as the N operand, KV as the M operand) differs from the GEMM's A/B roles;
-verify the SFA/SFB byte selection against the probe before trusting the full kernel.
-Effort: large (the one multi-session kernel). Metadata + accessors + epilogue are
-~1 day; the block-scaled core + SF staging + validation is the bulk.
+Risk retired: the SF lane map the helper uses (SFA t&1 -> row g / g+8, SFB t==0
+-> col g; FP4 16-bit byte0=K0-31/byte1=K32-63) is the one the 2026-11-04 probe
+already confirmed on hardware, so the compute primitive rests on validated facts.
+
+Kernel skeleton (for `sm120_sparse_mqa_logits.cuh`, synthesizing the dense SM120
+MQA kernel's compute with the SM100 sparse kernel's metadata-driven schedule):
+- Warp roles (collapse the SM100 5-role layout to 3; no UMMA/SF-transpose warps):
+  (a) one Q+metadata producer warp: per ScheduleEntry, TMA Q / SF-Q / weights into
+      a Q-stage ring (as the SM100 producer does), and cp.async the KVSplit header +
+      KVBlockInfo array into a KV-stage ring; (b) KV-copy warps: the SM100 gather
+      (contiguous TMA or paged cp.async via the two accessors) into smem KV + SF-KV;
+      (c) math warps: per KV split, each warp owns 16 KV rows and calls
+      `warp_mma_16xNxHd_block_scaled_ss<BLOCK_Q*kNumHeads, 128, kIsFP4>` with the
+      staged KV/Q SF words, then the dense kernel's ReLU x weight head reduction.
+- SharedStorage: reuse the dense kernel's Q/KV/weights rings, add smem SF-Q
+  `[qstage][BLOCK_Q*kNumHeads words]` and SF-KV `[kvstage][SPLIT_KV words]` (int32,
+  one per 128 elements = one per token here since hd=128), plus the metadata rings
+  (`kv_split_headers`, `kv_block_infos`, `q_blocks`) from the SM100 layout. Drop the
+  TMEM barriers / `tmem_ptr_in_smem`.
+- SF staging: the SF word of KV token `r` goes to smem `sf_kv[r]`; the helper reads
+  `a_sf[a_row + g (+8)]` with `a_sf_stride = SPLIT_KV` (words laid out `[word][row]`,
+  one word for hd=128). Q SF likewise `b_sf[g]`, stride `BLOCK_Q*kNumHeads`. No
+  transpose (unlike SM100's UTCCP-into-TMEM path).
+- Store: the slot map from the SM100 math tail. `accum` layout is the dense
+  kernel's (`accum[i*kNumAccumPerReduce ...]`, i over BLOCK_Q, reduced to `v_0`/`v_1`
+  for KV rows `warp_offset + lane/4` and `+8`). Map each to a compressed column via
+  `packed_slot_offsets` / `q{0,1}_slot_base` from `kv_block_infos` /
+  `kv_split_headers`, writing `output_rows[q][ (q_slot_base + q_slot_offset) *
+  SPARSE_BLOCK_KV + token_in_kv_block ]` when the slot != kInvalidSparseSlot. No
+  FP32 per-KV `scale_kv` multiply (the MX scale is applied in the MMA).
+- Launcher `sm120_sparse_mqa_logits.hpp`: mirror the SM100 one (TMA descs for Q /
+  SF-Q / weights; KV via accessor), size smem from the new SharedStorage, grid =
+  num_sms, `get_sparse_mqa_split_kv` 640 fp4 / 512 fp8. Dispatch in `attention.hpp`
+  (four entry points), flip `test_sparse_mqa_logits` to `>= 10`.
+
+Effort: the compute primitive is landed and validated; the remaining kernel body +
+launcher + dispatch is the bulk and needs the structured editor for safe iteration
+against `test_sparse_mqa_logits` (oracle: bitwise-equal to the dense MQA logits).
 
 ## 10. Measurements (RTX PRO 6000, GPU 7)
 
