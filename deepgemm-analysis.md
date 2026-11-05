@@ -586,6 +586,56 @@ host still rejects them, so there is no silent wrong path):
 | 2026-11-05 | MQA head dim 64 | done | `warp_mma_16xNx128_ss` -> `warp_mma_16xNxHd_ss<N, kHeadDim>` (128 or 64) with the matching TMA swizzle. The contiguous/prefill kernel + launcher accept head dim 64 (`sm120_mqa_check.py` D=64 cases pass, ~1e-14); the paged kernel stays at 128 (its KV gather has its own swizzle assumptions). FP4 MQA is still unported. |
 | 2026-11-05 | Commits | done | DeepGEMM `nctu6`: `eff4cea` (joint refit), `eb61610` (NVFP4 + epilogue + spill fix, kernel), `4659181` (NVFP4/epilogue host), `bfb637c` (tf32 hc), `5dfd734` (einsum), `38ef2a2` (MQA head dim 64). Local, not pushed. |
 
+## 9.5 Sparse MQA logits SM120 port plan (in progress, 2026-11-05)
+
+Target: `fp8_fp4_sparse_mqa_logits` + `fp8_fp4_paged_sparse_mqa_logits` +
+the two metadata entry points, on arch 12. Ground truth: `test_sparse_mqa_logits`
+in `tests/test_attention.py` (MXFP4 + MXFP8, contiguous + paged + unaligned-ks,
+num_heads 8/12/20/32, sparse_block_kv 8/16). No SM90 template exists (only
+`sm100_sparse_mqa_logits.cuh`), so the compute core is a from-scratch SM120 kernel.
+
+Math per (q_token, kv_token): `logits[q, slot] = sum_h relu(Q[q,h,:] . KV[kv,:]) * weight[q,h]`,
+with Q and KV block-scaled (per-32-element UE8M0, int32 words); output BF16, written
+to a compressed column via the metadata slot map.
+
+Reuse unchanged:
+- `scheduler/sm100_sparse_mqa_logits_metadata.cuh` and its launcher: pure CUDA
+  scheduling, no TMEM/cluster/UMMA (grep confirmed 0 hits). Rename to a
+  shared/`smxx` name or include as-is from an sm120 launcher.
+- `layout/sparse_mqa_logits.cuh` structs (MetadataHeader, KVSplitHeader,
+  KVBlockInfo, ScheduleEntry, QBlock). `SharedStorage` must be re-derived (drop
+  the TMEM barriers / `tmem_ptr_in_smem`; keep Q/KV/SF/weights smem + barriers).
+- The two KV accessors (`ContiguousSparseKVAccessor` TMA, `PagedSparseKVAccessor`
+  cp.async gather from the fused cache) and `get_swizzled_kv_chunk_idx`.
+- The ReLU x weight head-reduction epilogue and the slot-mapped compressed store
+  (identical to the SM100 math-warpgroup tail and to the dense SM120 MQA epilogue).
+
+Rewrite (the SM100 core uses UMMA m128nN with SF in TMEM; replace with mma.sync):
+- Per KV split: one math warp owns 16 KV rows; run block-scaled `mma.sync`
+  (FP8BlockScaledMMA m16n8k32 / FP4BlockScaledMMA m16n8k64) of
+  `[16 KV, kHeadDim] x [BLOCK_Q*kNumHeads, kHeadDim]^T`, accumulating in registers
+  (like `warp_mma_16xNxHd_ss`, but block-scaled). kHeadDim 128 -> 4 FP8 / 2 FP4
+  K steps; stage the Q and KV MX SF words in smem and read them with the SFA/SFB
+  lane map (g = lane/4, t = lane%4) already used by the 1D1D GEMM.
+- Q is loaded once per q-block (TMA); KV is gathered per split (the accessors);
+  SF words likewise. BLOCK_Q = 2 (two packed Q slots), kNumMaxHeads = 32.
+
+Host: `sm120_sparse_mqa_logits.hpp` mirroring the SM100 launcher (TMA descs for
+Q/SF-Q/weights, KV via accessor), smem sized from the new SharedStorage, grid =
+num_sms. `get_sparse_mqa_split_kv` (640 fp4 / 512 fp8) and `get_num_metadata_bytes`
+are reusable. Dispatch: `attention.hpp` arch-12 branches (all four entry points),
+and the metadata launch is arch-agnostic.
+
+Test: let `test_sparse_mqa_logits` run on arch 12 (the generators treat arch 12
+as SM90-like for FP8; FP4 Q needs the `kPackedFP4` path enabled for arch 12 in
+`generators.py`). Tolerance matches the dense MQA check.
+
+Biggest risk: the block-scaled `mma.sync` SF lane map for the MQA operand layout
+(Q as the N operand, KV as the M operand) differs from the GEMM's A/B roles;
+verify the SFA/SFB byte selection against the probe before trusting the full kernel.
+Effort: large (the one multi-session kernel). Metadata + accessors + epilogue are
+~1 day; the block-scaled core + SF staging + validation is the bulk.
+
 ## 10. Measurements (RTX PRO 6000, GPU 7)
 
 Timing method matters (learned the hard way):
