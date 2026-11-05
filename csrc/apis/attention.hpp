@@ -8,6 +8,7 @@
 
 #include "../jit_kernels/impls/sm100_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
+#include "../jit_kernels/impls/sm120_sparse_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_fp8_mqa_logits.hpp"
 
@@ -324,7 +325,7 @@ static torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_
                                                     const at::ScalarType& qk_dtype,
                                                     const int& sparse_block_kv,
                                                     const bool& use_unaligned_ks) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 or jit->device.get_arch_major() == 12);
     const auto [num_q_tokens, num_max_sparse_blocks] = get_shape<2>(sparse_kv_block_indices);
     DG_HOST_ASSERT(num_q_tokens > 0 and num_kv_tokens >= 0);
     DG_HOST_ASSERT(cu_seq_len_k_start.dim() == 1 and cu_seq_len_k_start.size(0) == num_q_tokens);
@@ -355,7 +356,7 @@ static torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& c
                                                           const torch::Tensor& sparse_kv_block_indices,
                                                           const at::ScalarType& qk_dtype,
                                                           const int& sparse_block_kv) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 or jit->device.get_arch_major() == 12);
     const auto [num_q_tokens, num_max_sparse_blocks] = get_shape<2>(sparse_kv_block_indices);
     DG_HOST_ASSERT(num_q_tokens > 0);
     DG_HOST_ASSERT(context_lens.numel() == num_q_tokens and context_lens.scalar_type() == torch::kInt and context_lens.is_contiguous());
@@ -391,7 +392,8 @@ static torch::Tensor fp8_fp4_sparse_mqa_logits(const std::tuple<torch::Tensor, s
     using namespace layout::sparse_mqa_logits;
     const auto [q_fp, q_sf_optional] = q;
     const auto [kv_fp, kv_sf] = kv;
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and q_sf_optional.has_value());
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and q_sf_optional.has_value());
     DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     const auto& q_sf = q_sf_optional.value();
@@ -411,8 +413,14 @@ static torch::Tensor fp8_fp4_sparse_mqa_logits(const std::tuple<torch::Tensor, s
     const int logits_stride = align(num_output_tokens, 1024 / static_cast<int>(sizeof(nv_bfloat16)));
     auto logits = torch::empty({align<int>(num_q_tokens, kBlockQ), logits_stride}, q_fp.options().dtype(torch::kBFloat16));
     logits = logits.index({torch::indexing::Slice(0, num_q_tokens), torch::indexing::Slice(0, num_output_tokens)});
-    launch_sm100_sparse_mqa_logits(false, use_unaligned_ks, sparse_block_kv,
-                                   q_fp, q_sf, kv_fp, kv_sf, weights, metadata, logits);
+    if (arch_major == 12) {
+        // WIP (gated): the SM120 sparse kernel has a known deadlock + undersized-split bug; off by default
+        DG_HOST_ASSERT(deep_jit::get_env<int>("DG_SM120_SPARSE_WIP", 0) == 1 and "SM120 sparse MQA logits is WIP");
+        launch_sm120_sparse_mqa_logits(false, sparse_block_kv, q_fp, q_sf, kv_fp, kv_sf, torch::Tensor(),
+                                       weights, metadata, logits);
+    } else
+        launch_sm100_sparse_mqa_logits(false, use_unaligned_ks, sparse_block_kv,
+                                       q_fp, q_sf, kv_fp, kv_sf, weights, metadata, logits);
     return logits;
 }
 
@@ -425,7 +433,8 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
                                                      const int& sparse_block_kv) {
     using namespace layout::sparse_mqa_logits;
     const auto [q_fp, q_sf_optional] = q;
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and q_sf_optional.has_value());
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and q_sf_optional.has_value());
     DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     const auto& q_sf = q_sf_optional.value();
@@ -450,8 +459,13 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
     const int logits_stride = align(num_output_tokens, 1024 / static_cast<int>(sizeof(nv_bfloat16)));
     auto logits = torch::empty({align<int>(num_q_tokens, kBlockQ), logits_stride}, q_fp.options().dtype(torch::kBFloat16));
     logits = logits.index({torch::indexing::Slice(0, num_q_tokens), torch::indexing::Slice(0, num_output_tokens)});
-    launch_sm100_sparse_mqa_logits(true, false, sparse_block_kv, q_fp, q_sf, fused_kv_cache, torch::Tensor(),
-                                   weights, metadata, logits);
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(deep_jit::get_env<int>("DG_SM120_SPARSE_WIP", 0) == 1 and "SM120 sparse MQA logits is WIP");
+        launch_sm120_sparse_mqa_logits(true, sparse_block_kv, q_fp, q_sf, torch::Tensor(), torch::Tensor(),
+                                       fused_kv_cache, weights, metadata, logits);
+    } else
+        launch_sm100_sparse_mqa_logits(true, false, sparse_block_kv, q_fp, q_sf, fused_kv_cache, torch::Tensor(),
+                                       weights, metadata, logits);
     return logits;
 }
 
