@@ -290,30 +290,30 @@ struct SM120ArchSpec {
     //  - its share of L2 -> SM traffic,
     //  - the K loop of one CTA: per K block a layout cost, inflated by `(kFullDepth / stages) ^ kDepthExp` for pipelines
     //    shallower than `kFullDepth` stages (latency-bound)
-    static constexpr double k1D1DDRAMBytesPerUnit = 1.6e6;
-    static constexpr double k1D1DL2BytesPerUnit = 3e6;
-    static constexpr double k1D1DCTACostScale = 1.2;
+    static constexpr double k1D1DDRAMBytesPerUnit = 1.8e6;
+    static constexpr double k1D1DL2BytesPerUnit = 4e6;
+    static constexpr double k1D1DCTACostScale = 1.5;
     static constexpr double k1D1DFullDepth = 3.15;
-    static constexpr double k1D1DDepthExp = 1.58;
+    static constexpr double k1D1DDepthExp = 0.5;
     static constexpr double k1D1DBoxRef = 8192;
-    static constexpr double k1D1DBoxExp = 0.788;
+    static constexpr double k1D1DBoxExp = 0.75;
     static constexpr double k1D1DWaveOverhead = 0.5;
 
     // Per-K-block CTA cost of the 1D1D kernel (relative, 128x128 = 1000)
     static int get_1d1d_block_cost(const Layout& layout) {
         const int bm = layout.block_m, bn = layout.block_n;
         if (bm ==  16 and bn ==  32) return 31;
-        if (bm ==  16 and bn ==  64) return 38;
-        if (bm ==  16 and bn == 128) return 220;
+        if (bm ==  16 and bn ==  64) return 62;
+        if (bm ==  16 and bn == 128) return 250;
         if (bm ==  16 and bn == 256) return 250;
-        if (bm ==  32 and bn ==  32) return 78;
-        if (bm ==  32 and bn ==  64) return 125;
-        if (bm ==  32 and bn == 128) return 344;
+        if (bm ==  32 and bn ==  32) return 62;
+        if (bm ==  32 and bn ==  64) return 105;
+        if (bm ==  32 and bn == 128) return 275;
         if (bm ==  32 and bn == 256) return 500;
-        if (bm ==  64 and bn ==  64) return 344;
-        if (bm ==  64 and bn == 128) return 968;
+        if (bm ==  64 and bn ==  64) return 352;
+        if (bm ==  64 and bn == 128) return 476;
         if (bm ==  64 and bn == 256) return 1100;
-        if (bm == 128 and bn ==  64) return 900;
+        if (bm == 128 and bn ==  64) return 525;
         if (bm == 128 and bn == 128) return 1000;
         return bm * bn * 1000 / (128 * 128);
     }
