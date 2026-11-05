@@ -163,7 +163,8 @@ static void launch_sm100_sparse_mqa_logits_metadata(const bool is_paged,
     num_smem_bytes = align(num_smem_bytes, 16);
     const int num_q_block_bytes = align<int>((3 + kBlockQ) * static_cast<int>(sizeof(uint32_t)), 16);
     num_smem_bytes = align(num_smem_bytes + num_q_block_bytes + static_cast<int>(sizeof(uint32_t)), 128);
-    DG_HOST_ASSERT(num_ctas > 0 and num_smem_bytes <= SM100ArchSpec::smem_capacity);
+    // The metadata kernel is arch-agnostic (no TMEM/cluster/UMMA), so bound its smem by the live device, not SM100
+    DG_HOST_ASSERT(num_ctas > 0 and num_smem_bytes <= jit->device.get_num_smem_bytes());
 
     const auto kernel = jit->compile("sm100_sparse_mqa_logits_metadata", std::format(R"(
 #include <deep_gemm/scheduler/sm100_sparse_mqa_logits_metadata.cuh>
