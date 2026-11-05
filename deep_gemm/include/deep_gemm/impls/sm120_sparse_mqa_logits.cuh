@@ -132,7 +132,7 @@ void sm120_sparse_mqa_logits(const uint32_t logits_stride, nv_bfloat16* logits,
         }
         __syncthreads();
         if (is_tma_warp and cute::elect_one_sync()) {
-            tma::copy<kHeadDim, kN, kRowBytes>(&tensor_map_q, full_q_barrier, smem_q, 0, q_token_base * kNumHeads);
+            tma::copy<kRowBytes, kN, kRowBytes>(&tensor_map_q, full_q_barrier, smem_q, 0, q_token_base * kNumHeads);
             tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_sf_q, full_q_barrier, smem_sf_q, 0, q_token_base);
             tma::copy<kNumWeightElems, BLOCK_Q, 0>(&tensor_map_weights, full_q_barrier, smem_weights, 0, q_token_base);
             full_q_barrier->arrive_and_expect_tx(SMEM_Q + kN * 4 + BLOCK_Q * kNumWeightElems * 2);
