@@ -816,3 +816,20 @@ on sm_120a fails `CUDA_ERROR_INVALID_CONFIG` (probed directly with cluster_size=
 Enabling the DeepGEMM indexer on SM120 therefore needs an SM120 smem-reduced
 DeepSelect port (CuTe DSL, tokenspeed-kernel, core-team-owned), plus flipping the
 `is_blackwell` gates to `is_blackwell_plus`. Hand-off noted; out of DeepGEMM scope.
+
+
+## 9.8 FP8 1D2D model already optimal; FP8 competitive state (2026-11-06)
+
+Benchmarked the FP8 FP32-scale path (the 1D2D kernel TokenSpeed's DSA/dense
+linears use) at TP8 vs Triton/FlashInfer (`sm120_vs_tokenspeed.py --tp 8`):
+**geomean 1.61x over 112 points**, 7 losses all 0.94-0.99x (q_b M=2048/4096,
+kv_b M=256, o_proj M=1024, shared gate_up M=4096, shared down M=4096/8192).
+
+Re-swept the 1D2D layouts (`sm120_sweep_graph.py`) and refit
+(`sm120_fit_heuristic.py`): the current model is already near-optimal (geomean
+regret 1.0081; a refit only reaches 1.0077, changing just
+`kDRAMBytesPerUnit` 1.6e6 -> 1.2e6). The one mid-M mispick (kv_b M=256: auto
+64x128 6.0us vs best 128x64 5.7us) is **not fixed by the refit** either (it
+still picks 64x128). The large-M losses are `auto == best` in the sweep, i.e.
+genuine kernel-level parity, not tile choice. Not committing the refit: no real
+gain, target shape unfixed. The FP8 path stays at the proven model.
