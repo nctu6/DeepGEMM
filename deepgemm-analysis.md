@@ -18,7 +18,8 @@ new work so we don't drift into one of the known dead ends.
   - **BF16 GEMMs** on the same kernel: `bf16_gemm_nt` (cuBLASLt stays the default unless deterministic mode; `alpha` and C accumulation supported), `m_grouped_bf16_gemm_nt_contiguous` (incl. PSUM), `m_grouped_bf16_gemm_nt_masked`.
   - **`tf32_hc_prenorm_gemm`** (TF32 `m16n8k8`): `d = a @ b.T` and the row squared-norm, with K-split.
   - **`einsum`** `bmk,bnk->mn` (BF16) and **`fp8_einsum`** `bhr,hdr->bhd` (via a per-batch FP32-scale GEMM).
-- **Not implemented on sm120** (rejected at the host): sparse MQA logits, paged MQA with head dim != 128, FP4 MQA, k-grouped GEMMs / Wgrad (training, MN-major operands), the other `einsum` / `fp8_einsum` expressions (MN-major operands), and mega MoE/gate/mHC. See section 8 for why each is deferred.
+- **Done since this section was first written (2026-11-05/06):** sparse MQA logits (`fp8_fp4_sparse_mqa_logits` + paged + the two metadata entry points) and **block-scaled MXFP8/MXFP4 dense MQA logits** (`fp8_fp4_mqa_logits` MX path for arch 12). Both validated against a dequantized reference (`scripts/sm120_sparse_mqa_check.py`, `sm120_sparse_paged_check.py`, `sm120_mqa_blockscale_check.py`), diff ~1e-6.
+- **Still not implemented on sm120** (rejected at the host, genuinely blocked on this SKU): paged MQA with head dim != 128, k-grouped GEMMs / Wgrad (training, MN-major operands), the MN-major `einsum` / `fp8_einsum` expressions (`bhd,hdr->bhr`, `bhd,bhr->hdr` need a transpose-on-load the K-major `ldmatrix` path lacks), and mega MoE/gate/mHC (NVLink symmetric memory or TMEM/UMMA). See section 8.
 - **Implemented on sm120 but unused by TokenSpeed on this box:** the m-grouped contiguous (incl. psum) and masked FP8 GEMMs have real `arch_major == 12` branches (`gemm.hpp`) and pass `test_fp8_fp4.py`. TokenSpeed only reaches them through DeepEP MoE, which needs NVLink/RDMA (this box is PCIe-only), so nothing calls them here.
 - **Tests (GPU 7):** `tests/test_fp8_fp4.py` passes (k-grouped skipped). `scripts/sm120_mqa_check.py` passes. The TokenSpeed tests pass (17).
 - **Performance vs the TokenSpeed sm120 fallbacks:**
@@ -507,17 +508,16 @@ for that op on sm120**. Keep the TokenSpeed fallback, cap the registration's
 
 Deferred features (feasible but out of scope for inference on this box; the
 host still rejects them, so there is no silent wrong path):
-- **Sparse MQA logits** (`fp8_fp4_sparse_mqa_logits` + paged + metadata): the
-  biggest real gap for DeepSeek-V3.2. It needs a gathered-KV producer
-  (`cp.async`, not TMA), a new index-driven scheduler and metadata kernel, MX
-  UE8M0 scales on the logits path (the dense SM120 kernels take FP32 KV scales),
-  and BF16 weights/output. A multi-day kernel; do it after the dense MQA kernels
-  gain MX scales. Top of the remaining list.
+- **Sparse MQA logits** and **block-scaled MXFP8/MXFP4 dense MQA logits**: DONE
+  (2026-11-06, section 9.6). Both ship for arch 12 and are validated against a
+  dequantized reference. No longer deferred.
 - **k-grouped GEMMs / Wgrad**: training only, and the `tn` variants need
   MN-major operands, which the SM120 kernels (K-major, FP8/FP4 `ldmatrix`)
   don't load. No inference value here.
-- **MN-major einsum expressions** (`bhd,hdr->bhr`, `bhd,bhr->hdr`) and **FP4
-  MQA**: same MN-major-operand blocker / a separate FP4-MQA kernel.
+- **MN-major einsum expressions** (`bhd,hdr->bhr`, `bhd,bhr->hdr`): the
+  contraction operand is MN-major (strided), which the K-major `ldmatrix` path
+  cannot load without a transpose-on-load. Training/Wgrad only, no inference
+  caller. (FP4 dense MQA is no longer here: it is done, section 9.6.)
 - **Mega MoE**: its point is NVLink symmetric-memory dispatch/combine across
   ranks; on a single PCIe GPU it degenerates to a local grouped-GEMM chain that
   `m_grouped_*` already covers, and a port is effectively a UMMA/TMEM -> mma.sync
@@ -750,3 +750,39 @@ DSA indexer (H=64, D=128, page 64, top-k 2048), Triton time / DeepGEMM time:
 | prefill T x prefix | 1024x0 | 4096x0 | 4096x4096 | 2048x14336 | 8192x0 |
 |---|---|---|---|---|---|
 | speedup (DG logits + Triton radix top-k) | 7.8 | 32.5 | 35.3 | 30.1 | 52.3 |
+
+
+## 9.6 Sparse MQA done + block-scaled dense MQA + perf findings (2026-11-06)
+
+Sparse MQA logits SM120 port **complete and enabled by default** (gate removed):
+contiguous (aligned and unaligned ks) and paged, MXFP8 and MXFP4, H {8,32},
+sparse_block_kv {8,16}, KV up to 4096 all match a dequantized `relu(Q.K)*w`
+reference at diff ~1e-6 (`scripts/sm120_sparse_mqa_check.py`,
+`sm120_sparse_paged_check.py`). The kernel is a from-scratch SM120 compute core
+(single warpgroup, `cp.async` gather, `warp_mma_16xNxHd_block_scaled_ss`) on the
+SM100 metadata scheduler. Five correctness bugs fixed along the way: SF-Q TMA box
+shape/expect_tx, Q-barrier phase, the block-scaled MMA's per-N-tile B scale, and
+the FP4 Q TMA byte count (commits eeb4926, 678df95, c384000, 0cd1e67).
+
+**Block-scaled dense MQA logits** (`sm120_fp8_fp4_mqa_logits.cuh`): the MX path
+of `fp8_fp4_mqa_logits` for arch 12, matching SM100 (UE8M0 MXFP8/MXFP4, per-row
+int32 SF for Q and KV, BF16 weights/output, head dim 128). Reuses the FP8 dense
+kernel's pipeline + the sparse block-scaled MMA. The FP8 per-token-scale kernel
+(the DSA indexer path) is unchanged; the host dispatches by `is_mx_sf`. Two bugs
+fixed: the Q/KV/SF-Q TMA outer strides (must be the contiguous row stride, and
+`row_bytes` for packed FP4), and a missing `num_total_kv_blocks` advance in the
+consumer that deadlocked the multi-q-block path. Validated at diff ~1e-6.
+
+**Sparse MQA performance**: ~190 TFLOP/s MXFP8 / ~230 MXFP4, ncu shows ~46%/46%
+compute/memory at 16.7% occupancy (1 block/SM, exactly one wave of CTAs). The
+structural limiter is too few CTAs to exceed 1 block/SM. Tried and reverted:
+smaller SPLIT_KV, a 2-stage gather/compute pipeline, `launch_bounds(256,2)`, and
+three dedicated-producer/consumer multi-stage rewrites (the dense-kernel pattern).
+None beat the baseline: the single-wave pipeline wasn't faster, and the multi-wave
+path had recurring subtle shared-memory sync bugs. The "more CTAs" route is blocked
+by the shared metadata scheduler's `kNumSMs <= 256` assert. Left at the correct
+baseline; `scripts/sm120_sparse_bench.py` / `sm120_sparse_prof.py` capture the
+measurement. A future pass needs a ground-up pipeline, not an incremental patch.
+
+Full regression on GPU 6: `tests/test_fp8_fp4.py` (k-grouped skipped), the four
+MQA checks, all green.

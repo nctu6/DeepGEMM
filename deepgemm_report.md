@@ -651,7 +651,12 @@ A full image build was not run.
 **Added since the first report (SM120 now supports):** NVFP4 (UE4M3,
 16-element scales); BF16/FP4 `alpha`, C accumulation and FP32 output;
 `tf32_hc_prenorm_gemm`; `einsum bmk,bnk->mn` and `fp8_einsum bhr,hdr->bhd`;
-and MQA logits head dim 64 (contiguous/prefill). See section 7.
+and MQA logits head dim 64 (contiguous/prefill); **sparse MQA logits**
+(`fp8_fp4_sparse_mqa_logits` + paged + the two metadata entry points, MXFP8 and
+MXFP4, contiguous aligned/unaligned ks and paged); and **block-scaled
+MXFP8/MXFP4 dense MQA logits** (the MX path of `fp8_fp4_mqa_logits` for arch 12,
+matching SM100). Both validated against a dequantized reference, diff ~1e-6.
+See section 7.
 
 **Not implemented on SM120.** The host dispatch still rejects these
 (`DG_HOST_UNREACHABLE` or an arch assert); none has a silent wrong path:
@@ -660,10 +665,10 @@ and MQA logits head dim 64 (contiguous/prefill). See section 7.
 - Custom epilogue classes (stochastic rounding, FP8 cast): SM100 only.
 - k-grouped GEMMs and Wgrad (training-only; the `tn` variants need MN-major
   operands, which the SM120 FP8/FP4 `ldmatrix` path doesn't load).
-- The MN-major einsum expressions (`bhd,hdr->bhr`, `bhd,bhr->hdr`) and FP4
-  MQA logits (same MN-major / separate-kernel blockers).
-- Sparse MQA logits (needs a gathered-KV producer, an index-driven scheduler,
-  and MX scales on the logits path) and paged MQA with head dim != 128.
+- The MN-major einsum expressions (`bhd,hdr->bhr`, `bhd,bhr->hdr`): the
+  contraction operand is MN-major, which the K-major `ldmatrix` path can't load
+  without a transpose-on-load. Training/Wgrad only.
+- Paged MQA with head dim != 128.
 - mega MoE/gate/mHC. MoE's point is NVLink symmetric-memory dispatch across
   ranks (pointless on one PCIe GPU); gate/mHC are TMEM/TF32-pipeline rewrites.
 
