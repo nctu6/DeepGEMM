@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Development helper for the SM120 port, run on the test machine (aws-raichu, GPU 7 only)
+# Development helper for the SM120 port, run on the test machine (aws-raichu). GPU via DG_GPU (default 7); 6 is also free
 #   sm120_remote.sh build            rebuild both the DeepGEMM venv (py3.15) and the TokenSpeed-venv build (py3.12)
 #   sm120_remote.sh dg  <args...>    run python in the DeepGEMM venv (repo root on PYTHONPATH)
 #   sm120_remote.sh ts  <args...>    run python in the TokenSpeed venv with this DeepGEMM build first on PYTHONPATH
@@ -7,7 +7,9 @@
 set -euo pipefail
 DG=/workspace/nctu6/infra/DeepGEMM
 TS_PY=/workspace/nctu6/infra/tokenspeed/.venv/bin/python
-export CUDA_HOME=/usr/local/cuda CUDA_VISIBLE_DEVICES=7
+# GPU is configurable (DG_GPU, default 7); GPU 6 is now also available for builds/tests while 7 runs benchmarks
+GPU=${DG_GPU:-7}
+export CUDA_HOME=/usr/local/cuda CUDA_VISIBLE_DEVICES=$GPU
 cmd=$1; shift
 case $cmd in
     build)
@@ -36,12 +38,12 @@ case $cmd in
         # (default 1800): the GPU is shared with other jobs, and benchmarks taken while they run are not comparable
         need=${1:-20}; budget=${2:-1800}; quiet=0; waited=0
         while [ $quiet -lt $need ]; do
-            util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i 7 | tr -d ' ')
+            util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i $GPU | tr -d ' ')
             if [ "$util" = "0" ]; then quiet=$((quiet + 1)); else quiet=0; fi
             sleep 1; waited=$((waited + 1))
-            if [ $waited -ge $budget ]; then echo "GPU 7 not idle after ${budget}s" >&2; exit 2; fi
+            if [ $waited -ge $budget ]; then echo "GPU $GPU not idle after ${budget}s" >&2; exit 2; fi
         done
-        echo "GPU 7 idle for ${need}s (waited ${waited}s)"
+        echo "GPU $GPU idle for ${need}s (waited ${waited}s)"
         ;;
     *)
         echo "unknown command: $cmd" >&2; exit 1
