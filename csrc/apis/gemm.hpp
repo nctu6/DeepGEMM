@@ -765,6 +765,26 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, grouped_layout,
                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout,
                                   resolve_epilogue_class(epilogue_class, c, d));
+    } else if (arch_major == 12) {
+        // One MN-major BF16 GEMM per group over its K slice: `D[g] = a[K_g]^T @ b[K_g]` (+ C[g], which `early_return`
+        // has already copied into D). Like SM90, the group sizes come from the host
+        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty() and
+                       "SM120 k-grouped BF16 GEMMs need host-side `ks` and no PSUM layout");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        int k_start = 0;
+        for (int i = 0; i < num_groups; ++ i) {
+            const int k = ks_cpu.value()[i];
+            const auto d_group = d[i];
+            if (k == 0) {
+                if (not c.has_value())
+                    d_group.zero_();
+            } else {
+                sm120_bf16_gemm_1d1d(a.narrow(0, k_start, k).transpose(0, 1), b.narrow(0, k_start, k).transpose(0, 1),
+                                     c.has_value() ? std::make_optional(d_group) : std::nullopt, d_group,
+                                     m, n, k, cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, 1.0f);
+            }
+            k_start += k;
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

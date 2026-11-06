@@ -52,6 +52,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm120_fp8_fp4_gemm_1d1d_impl<
         {}, {}, {},
+        {}, {},
         {}, {}, {},
         {},
         {}, {}, {},
@@ -65,6 +66,7 @@ static void __instantiate_kernel() {{
 }};
 )",
         args.is_fp4 ? "true" : "false", args.is_bf16 ? "true" : "false", args.gran_k,
+        to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
@@ -299,7 +301,15 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
         DG_HOST_ASSERT(is_bf16 ? gran_k_a == 32 : (gran_k_a == 32 or gran_k_a == 128));
     DG_HOST_ASSERT(is_bf16 or desc.sf_gran_k == gran_k_a);
     DG_HOST_ASSERT(d.scalar_type() == desc.cd_dtype and (d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat));
-    DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
+    // MN-major operands are BF16 only (the kernel reads them with the 16-bit `ldmatrix.trans`), and an MN-major A has no
+    // groups. A grouped MN-major B (`[G, K, N]`) must have whole K blocks: TMA bounds-checks only the stacked `G * K`
+    // rows, so a tail block would read the next group's rows instead of zeros
+    if (not is_bf16)
+        DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
+    if (desc.major_a == cute::UMMA::Major::MN)
+        DG_HOST_ASSERT(desc.gemm_type == GemmType::Normal);
+    if (desc.major_b == cute::UMMA::Major::MN and desc.gemm_type != GemmType::Normal)
+        DG_HOST_ASSERT(desc.k % 64 == 0 and "Grouped MN-major B needs K to be a multiple of 64");
     // K is whole scale groups (the packed scale tensors are padded, and TMA zero-fills the tail K block), and the
     // epilogue stores 8 bytes at a time (4 BF16 or 2 FP32 columns)
     // (BF16: 16-byte aligned rows)

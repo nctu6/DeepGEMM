@@ -25,6 +25,15 @@ CUTLASS_DEVICE void ldmatrix_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32
                  : "memory");
 }
 
+/// `ldmatrix.x4.trans`: each 8x8 matrix is stored with rows along K (an MN-major tile), and is delivered transposed, so
+/// the registers hold the same fragment as `ldmatrix_x4` of the K-major tile
+CUTLASS_DEVICE void ldmatrix_x4_trans(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const uint32_t& smem_addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(smem_addr)
+                 : "memory");
+}
+
 /// Byte offset of the 16-byte chunk `chunk` of row `row` inside a TMA 128B-swizzled tile whose rows are 128 bytes
 /// NOTES: the tile base must be 1024-byte aligned
 CUTLASS_DEVICE uint32_t get_swizzle_128b_offset(const uint32_t& row, const uint32_t& chunk) {

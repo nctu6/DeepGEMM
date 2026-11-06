@@ -23,6 +23,7 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
                        const std::optional<torch::Tensor>& c) {
     // Currently FP32 only support the accumulated expression
     if (d.scalar_type() == torch::kFloat) {
+        DG_HOST_ASSERT(c.has_value() and "FP32 `bmk,bnk->mn` accumulates: pass `c` aliasing `d`");
         DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
     } else {
         DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
@@ -94,6 +95,13 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
         sm90_bf16_bhr_hdr_bhd(A, B, C, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhr_hdr_bhd(A, B, C, D, b, h, r, d, "nk", resolved_epilogue_class);
+    } else if (arch_major == 12) {
+        // One BF16 GEMM per head on strided views: `D[:, i] = A[:, i] @ B[i]^T` (+ C, which `early_return` has already
+        // copied into D), all K-major
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        for (int i = 0; i < h; ++ i)
+            sm120_bf16_gemm_1d1d(A.select(1, i), B[i], C.has_value() ? std::make_optional(D) : std::nullopt, D.select(1, i),
+                                 b, d, r, cute::UMMA::Major::K, cute::UMMA::Major::K, "nk", 1.0f);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -128,6 +136,13 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
         sm90_bf16_bhd_hdr_bhr(A, B, C, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhd_hdr_bhr(A, B, C, D, b, h, r, d, "nk", resolved_epilogue_class);
+    } else if (arch_major == 12) {
+        // One BF16 GEMM per head: `D[:, i] = A[:, i] @ B[i]` (+ C, already in D). `B[i]` is `[d, r]` with `r` contiguous,
+        // i.e. an MN-major `[r, d]` B operand
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        for (int i = 0; i < h; ++ i)
+            sm120_bf16_gemm_1d1d(A.select(1, i), B[i].transpose(0, 1), C.has_value() ? std::make_optional(D) : std::nullopt,
+                                 D.select(1, i), b, r, d, cute::UMMA::Major::K, cute::UMMA::Major::MN, "nk", 1.0f);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -313,6 +328,8 @@ static void fp8_einsum(const std::string& expr,
         const auto perm_b = b.first.permute({1, 2, 0});
         const auto perm_sfb = b.second.permute({1, 2, 0});
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn", epilogue_class);
+    } else if (expr == "bhd,hdr->bhr" or expr == "bhd,bhr->hdr") {
+        DG_HOST_UNREACHABLE(std::format("fp8_einsum `{}` needs MN-major FP8 operands, supported on SM100 only", expr));
     } else {
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
     }

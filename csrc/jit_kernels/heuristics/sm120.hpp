@@ -93,7 +93,10 @@ struct SM120ArchSpec {
         // 1D2D: FP32 scales promoted on CUDA cores; 1D1D: packed UE8M0 scales applied by the block-scaled MMA
         // NoSF: BF16 operands on the 1D1D kernel
         DG_HOST_ASSERT(desc.kernel_type == KernelType::Kernel1D2D or is_1d1d_kernel(desc.kernel_type));
-        DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
+        // MN-major operands only on the BF16 kernel, whose MN-major tiles are whole 64-element swizzle atoms
+        const bool is_mn_major_a = desc.major_a == cute::UMMA::Major::MN;
+        const bool is_mn_major_b = desc.major_b == cute::UMMA::Major::MN;
+        DG_HOST_ASSERT(desc.kernel_type == KernelType::KernelNoSF or (not is_mn_major_a and not is_mn_major_b));
 
         // Block M candidates
         std::vector<int> block_m_candidates;
@@ -103,7 +106,8 @@ struct SM120ArchSpec {
         } else {
             // Small M blocks help memory-bound (decoding) shapes fill the GPU; skip blocks much larger than M
             for (const int block_m: {16, 32, 64, 128}) {
-                if (block_m == 16 or block_m < 2 * desc.get_expected_m())
+                if (is_mn_major_a ? (block_m == 64 or (block_m == 128 and block_m < 2 * desc.get_expected_m())) :
+                                    (block_m == 16 or block_m < 2 * desc.get_expected_m()))
                     block_m_candidates.push_back(block_m);
             }
         }
@@ -114,6 +118,8 @@ struct SM120ArchSpec {
         // flight; only the 1D1D kernel implements the K-warp split it requires
         for (const int block_n: {32, 64, 128, 256}) {
             if (block_n == 32 and not is_1d1d_kernel(desc.kernel_type))
+                continue;
+            if (is_mn_major_b and block_n % 64 != 0)
                 continue;
             if (block_n % heuristics_runtime->get_block_n_multiple_of() == 0)
                 block_n_candidates.push_back(block_n);
