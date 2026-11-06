@@ -25,12 +25,12 @@ case $cmd in
         ;;
     dg)
         cd $DG
-        DG_JIT_CACHE_DIR=/tmp/dg_cache_nctu6 PYTHONPATH=$DG:$DG/scripts:$DG/tests $DG/.venv/bin/python "$@"
+        DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR:-/tmp/dg_cache_nctu6} PYTHONPATH=$DG:$DG/scripts:$DG/tests $DG/.venv/bin/python "$@"
         ;;
     ts)
         # NOTES: run outside the repo so the source `deep_gemm` directory does not shadow the build
         cd /tmp
-        PATH=$(dirname $TS_PY):$PATH DG_JIT_CACHE_DIR=/tmp/dg_cache_nctu6_312 \
+        PATH=$(dirname $TS_PY):$PATH DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR:-/tmp/dg_cache_nctu6_312} \
             PYTHONPATH=$(ls -d $DG/build312/lib.*):$DG/scripts $TS_PY "$@"
         ;;
     idle)

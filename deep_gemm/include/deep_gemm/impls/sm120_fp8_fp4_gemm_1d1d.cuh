@@ -222,11 +222,15 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     // Task iteration: a task is a tile, or with stream-K, a K range of a tile
     uint32_t tile_idx = 0, k_block_begin = 0, k_block_end = num_k_blocks;
     uint64_t sk_iter = 0, sk_iter_end = 0, sk_num_iters = 0;
-    if constexpr (kUseStreamK) {
-        sk_num_iters = static_cast<uint64_t>(scheduler.num_blocks) * num_k_blocks;
-        sk_iter = sk_num_iters * blockIdx.x / gridDim.x;
-        sk_iter_end = sk_num_iters * (blockIdx.x + 1) / gridDim.x;
-    }
+    // NOTES: called by each warp role after its register reconfiguration. Computed before it, the 64-bit range is live
+    // across `setmaxnreg.dealloc` and ptxas spills it to local memory (seen on BF16 16x64 stream-K tiles)
+    const auto init_stream_k_range = [&]() {
+        if constexpr (kUseStreamK) {
+            sk_num_iters = static_cast<uint64_t>(scheduler.num_blocks) * num_k_blocks;
+            sk_iter = sk_num_iters * blockIdx.x / gridDim.x;
+            sk_iter_end = sk_num_iters * (blockIdx.x + 1) / gridDim.x;
+        }
+    };
     // The CTA whose range contains iteration `x`
     const auto get_sk_owner = [&](const uint64_t& x) -> uint32_t {
         return static_cast<uint32_t>(((x + 1) * gridDim.x + sk_num_iters - 1) / sk_num_iters - 1);
@@ -257,6 +261,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     if (warp_idx >= kNumMathWarps) {
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+        init_stream_k_range();
 
         if (warp_idx == kNumMathWarps and cute::elect_one_sync()) {
             constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
@@ -357,6 +362,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     } else {
         // Math warps
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+        init_stream_k_range();
 
         // Wait for the previous kernel before anything that reads its results or writes memory it may still read
         cudaGridDependencySynchronize();
