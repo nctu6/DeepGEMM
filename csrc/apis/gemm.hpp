@@ -403,6 +403,15 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, grouped_layout, gran_k, k_alignment,
                                       cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout,
                                       resolve_epilogue_class(epilogue_class, c, d));
+    } else if (arch_major == 12) {
+        // One block-scaled GEMM per group over its K slice, with the group sizes from the host (like SM90)
+        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty() and
+                       "SM120 k-grouped FP8 GEMMs need host-side `ks` and no PSUM layout");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, false);
+        const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, false);
+        sm120_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c.has_value(), d, m, n, ks_cpu.value(), gran_k,
+                                      cute::UMMA::Major::MN, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -459,6 +468,12 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     if (arch_major == 9) {
         sm90_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks_cpu.value(), grouped_layout, tensor_map_buffer,
                                      cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
+    } else if (arch_major == 12) {
+        // Same per-group path as `k_grouped_fp8_gemm_tn_contiguous`, on K-major blocks. SM120 casts the FP32 scales to
+        // packed UE8M0 (exact only for power-of-two scales), as SM100 does
+        DG_HOST_ASSERT(m % 16 == 0 and n % 16 == 0 and "SM120 K-major k-grouped FP8 GEMMs need M and N multiples of 16");
+        sm120_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, true, d, m, n, ks_cpu.value(), 128,
+                                      cute::UMMA::Major::K, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

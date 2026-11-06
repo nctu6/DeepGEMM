@@ -484,4 +484,41 @@ static void sm120_m_grouped_bf16_gemm_masked_1d1d(const torch::Tensor& a, const 
                                    masked_m.data_ptr(), num_groups, num_groups, num_groups, num_groups, 32, 32, 1.0f);
 }
 
+// K-grouped FP8 GEMM (weight gradients): `D[g] = A[K_g]^T @ B[K_g]` (+ C[g], already copied into D by `early_return`), one
+// block-scaled GEMM per group over its K slice, with the group sizes from the host like SM90. `sfa` / `sfb` are the packed
+// UE8M0 scales of `transform_k_grouped_sf_into_required_layout`, `[sum(ceil(K_g / (gran_k * 4))), MN]` with MN contiguous:
+// a group's rows, transposed, are exactly the `[MN, packed_k]` MN-major scales of a normal GEMM. Operands are either MN-major
+// `[sum_k, MN]` (TN: `major` MN) or K-major `[MN, K_g]` blocks laid end to end (NT: `major` K)
+static void sm120_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                          const torch::Tensor& b, const torch::Tensor& sfb,
+                                          const bool& accumulate, const torch::Tensor& d,
+                                          const int& m, const int& n, const std::vector<int>& ks,
+                                          const int& gran_k, const cute::UMMA::Major& major,
+                                          const std::string& compiled_dims) {
+    DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn and b.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
+    const bool is_mn_major = major == cute::UMMA::Major::MN;
+    int64_t k_start = 0, sf_start = 0;
+    for (size_t i = 0; i < ks.size(); ++ i) {
+        const int k = ks[i];
+        const auto d_group = d[i];
+        if (k == 0) {
+            if (not accumulate)
+                d_group.zero_();
+            continue;
+        }
+        const int packed_k = ceil_div(k / gran_k, 4);
+        const auto slice = [&](const torch::Tensor& t, const int& mn) {
+            return is_mn_major ? t.narrow(0, k_start, k).transpose(0, 1) :
+                                 t.narrow(0, k_start * mn, static_cast<int64_t>(k) * mn).view({mn, k});
+        };
+        sm120_fp8_fp4_gemm_1d1d(slice(a, m), sfa.narrow(0, sf_start, packed_k).transpose(0, 1),
+                                slice(b, n), sfb.narrow(0, sf_start, packed_k).transpose(0, 1),
+                                accumulate ? std::make_optional(d_group) : std::nullopt, d_group,
+                                m, n, k, gran_k, gran_k, major, major, compiled_dims, 1.0f);
+        k_start += k;
+        sf_start += packed_k;
+    }
+}
 } // namespace deep_gemm

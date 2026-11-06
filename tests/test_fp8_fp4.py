@@ -17,7 +17,7 @@ from utils import (
 )
 
 from generators import (
-    KernelType, QuantConfig, get_ue8m0_usage,
+    KernelType, QuantConfig, get_ue8m0_usage, is_sm120_loop,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
@@ -243,10 +243,6 @@ def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped GEMM:')
 
     arch_major = get_arch_major()
-    if arch_major == 12:
-        # Training-only (weight gradients), not implemented on SM120
-        print(' > Skipped: k-grouped FP8 GEMMs are not supported on SM120\n')
-        return
     test_sf_k_padding = arch_major == 10
     test_options = [(torch.float8_e4m3fn, QuantConfig(),
                      deep_gemm.k_grouped_fp8_gemm_nt_contiguous if arch_major == 9 else
@@ -254,7 +250,8 @@ def test_k_grouped_gemm_contiguous() -> None:
     if arch_major == 10:
         test_options.append((torch.float4_e2m1fn_x2, QuantConfig((32, 32, True, True)),
                              deep_gemm.k_grouped_fp4_gemm_nt_contiguous))
-    use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
+    # The 1x128 / 1x32 scales of both operands run on the block-scaled kernel as packed UE8M0 on SM100 and SM120
+    use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D) or arch_major == 12
     for dtype, quant_config, gemm in test_options:
         is_fp4 = dtype == torch.float4_e2m1fn_x2
         dtype_opt = 'FP4' if is_fp4 else 'FP8'
@@ -309,7 +306,8 @@ def test_k_grouped_gemm_contiguous() -> None:
                             a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
                             recipe=recipe, use_psum_layout=use_psum_layout)
                         assert_direct_output_matches_fp32_accumulation(d, launch, case_label)
-                        if out_dtype == torch.bfloat16:
+                        # Stochastic rounding is an SM100 epilogue
+                        if out_dtype == torch.bfloat16 and arch_major == 10:
                             gemm(a, b, d, test_host_ks_cpu, grouped_layout, None,
                                  recipe=recipe, use_psum_layout=use_psum_layout,
                                  epilogue=deep_gemm.epilogue.BF16StochasticRounding())
@@ -369,7 +367,7 @@ def test_k_grouped_gemm_contiguous() -> None:
                             packed_a, packed_b, output, host_ks_cpu, grouped_layout, accumulator,
                             recipe=recipe, use_psum_layout=use_psum_layout)
                         assert_direct_output_matches_fp32_accumulation(packed_d, launch, case_label)
-                        if out_dtype == torch.bfloat16:
+                        if out_dtype == torch.bfloat16 and arch_major == 10:
                             gemm(packed_a, packed_b, packed_d, host_ks_cpu, grouped_layout, None,
                                  recipe=recipe, use_psum_layout=use_psum_layout,
                                  epilogue=deep_gemm.epilogue.BF16StochasticRounding())
@@ -387,7 +385,8 @@ def test_k_grouped_gemm_contiguous() -> None:
                 gemm(a, b, d, host_ks_cpu, grouped_layout, c,
                      recipe=recipe, use_psum_layout=use_psum_layout)
 
-            t = bench_kineto(test_func, 'gemm_', suppress_kineto_output=True)
+            # SM120 launches one GEMM per group: sum them
+            t = bench_kineto(test_func, 'gemm_', suppress_kineto_output=True, per_call_total=is_sm120_loop())
             logical_k = sum(real_ks_cpu)
             out_opt = 'FP32' if out_dtype == torch.float else 'BF16'
             print(f' > Perf ({dtype_opt}, {num_groups=:2}, m={m:5}, n={n:5}, k={logical_k:5}, gran_k={gran_k:3}, '
@@ -395,6 +394,9 @@ def test_k_grouped_gemm_contiguous() -> None:
                   f'{t * 1e6:4.0f} us | '
                   f'{2 * m * n * logical_k / t / 1e12:4.0f} TFLOPS | '
                   f'{count_bytes(a, b, c, d) / 1e9 / t:4.0f} GB/s')
+    # `enumerate_k_grouped_contiguous` leaves the contiguous-layout MK alignment at its last value; restore the 128
+    # default so later tests (e.g. the m-grouped mixed-scale pair) see a block_m their heuristics can tile
+    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
     print()
 
 
