@@ -13,7 +13,7 @@ from utils import (
     assert_psum_zero_padding,
 )
 from generators import (
-    get_arch_major,
+    get_arch_major, get_bf16_gemm_kernel_name, bench_cublaslt, is_sm120_loop,
     enumerate_normal, enumerate_batched_syrk_symm, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
@@ -53,9 +53,9 @@ def test_gemm() -> None:
                 lambda output, accumulator: deep_gemm.bf16_gemm_nt(a, b, output, c=accumulator),
                 f'BF16 GEMM stochastic rounding, {m=}, {n=}, {k=}, {major_opt=}')
 
-        t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
+        t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), get_bf16_gemm_kernel_name(), suppress_kineto_output=True)
         deep_gemm.use_deterministic_algorithms(False)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
+        cublas_t, split_k_t = bench_cublaslt(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:7.1f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
@@ -63,7 +63,8 @@ def test_gemm() -> None:
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
         if cublas_t > 0:
             scores.append((cublas_t + split_k_t) / t)
-    print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+    if scores:
+        print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -99,7 +100,7 @@ def test_m_grouped_gemm_contiguous() -> None:
             deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, use_psum_layout=use_psum_layout,
                                                         ensure_zero_padding=ensure_zero_padding)
 
-        t = bench_kineto(test_func, 'bf16_gemm', suppress_kineto_output=True)
+        t = bench_kineto(test_func, get_bf16_gemm_kernel_name(), suppress_kineto_output=True)
         print(f' > Perf ({num_groups=}, m={m:5}, n={n:5}, k={k:5}, layout={major_opt}, '
               f'psum={use_psum_layout}, zero_pad={ensure_zero_padding}): '
               f'{t * 1e6:4.0f} us | '
@@ -140,7 +141,7 @@ def test_m_grouped_gemm_masked() -> None:
 
             # Test performance with fixed shapes
             valid_m = int(valid_mask.sum().item())
-            t = bench_kineto(test_func, 'bf16_gemm', suppress_kineto_output=True)
+            t = bench_kineto(test_func, get_bf16_gemm_kernel_name(), suppress_kineto_output=True)
 
             sum_t += t
             max_t = max(max_t, t)
@@ -186,7 +187,8 @@ def test_k_grouped_gemm_contiguous() -> None:
                         a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
                         use_psum_layout=use_psum_layout)
                     assert_direct_output_matches_fp32_accumulation(d, launch, case_label)
-                    if out_dtype == torch.bfloat16:
+                    # Stochastic rounding is an SM100 epilogue
+                    if out_dtype == torch.bfloat16 and get_arch_major() == 10:
                         deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
                             a, b, d, test_host_ks_cpu, grouped_layout, None, use_psum_layout=use_psum_layout,
                             epilogue=deep_gemm.epilogue.BF16StochasticRounding())
@@ -202,7 +204,7 @@ def test_k_grouped_gemm_contiguous() -> None:
         def test_func():
             deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, host_ks_cpu, grouped_layout, c, use_psum_layout=use_psum_layout)
 
-        t = bench_kineto(test_func, 'bf16_gemm', suppress_kineto_output=True)
+        t = bench_kineto(test_func, get_bf16_gemm_kernel_name(), suppress_kineto_output=True, per_call_total=is_sm120_loop())
         logical_k = sum(real_ks_cpu)
         out_opt = 'FP32' if out_dtype == torch.float else 'BF16'
         print(f' > Perf ({num_groups=:2}, m={m:5}, n={n:5}, k={logical_k:5}, align={alignment:3}, '
@@ -235,7 +237,7 @@ def test_cublaslt_gemm() -> None:
             assert diff < threshold, (f'{diff=}, {use_alpha=}, {alpha=}, '
                                       f'({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})')
 
-        t_nvjet, t_gemv, t_gemm = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
+        t_nvjet, t_gemv, t_gemm = bench_cublaslt(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
         t = t_nvjet + t_gemv + t_gemm
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:5.0f} us | '
@@ -268,7 +270,7 @@ def test_cublaslt_batched_syrk() -> None:
                     f'{diff=}, ({batch_shape=}, {padding=}, {rows=}, {cols=}, {major_opt=}, {out_dtype=})'
                 )
 
-            t_nvjet, t_gemv, t_gemm = bench_kineto(
+            t_nvjet, t_gemv, t_gemm = bench_cublaslt(
                 lambda: deep_gemm.batched_syrk(a, d),
                 ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
             t = t_nvjet + t_gemv + t_gemm
@@ -311,7 +313,7 @@ def test_cublaslt_batched_symm() -> None:
                     f'{diff=}, ({batch_shape=}, {padding=}, {rows=}, {cols=}, {major_opt=}, {out_dtype=})'
                 )
 
-            t_nvjet, t_gemv, t_gemm = bench_kineto(
+            t_nvjet, t_gemv, t_gemm = bench_cublaslt(
                 lambda: deep_gemm.batched_symm(a, b, d),
                 ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
             t = t_nvjet + t_gemv + t_gemm

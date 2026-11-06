@@ -5,7 +5,7 @@ import torch
 from math import prod
 from typing import Generator, List, Optional, Tuple
 
-from deep_gemm.testing import get_arch_major
+from deep_gemm.testing import bench_kineto, get_arch_major
 from deep_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
@@ -90,6 +90,29 @@ def reset_seed(seed: int = 0):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+
+
+def get_bf16_gemm_kernel_name() -> str:
+    # Profiler name of DeepGEMM's own BF16 GEMM; SM120 runs BF16 on its 1D1D block-scaled GEMM kernel
+    return 'sm120_fp8_fp4_gemm_1d1d' if get_arch_major() == 12 else 'bf16_gemm'
+
+
+def bench_cublaslt(fn, kernel_names, **kwargs):
+    """Time the cuBLASLt kernels of `fn` like `bench_kineto(fn, kernel_names)`.
+
+    On SM120 cuBLASLt has no `nvjet` kernels: it runs CUTLASS SM75/SM80 GEMMs, split-K reductions, GEMV and dot kernels,
+    often several per call. There the per-call total of all of them is returned in the first slot (0 in the others).
+    """
+    if get_arch_major() != 12:
+        return bench_kineto(fn, kernel_names, **kwargs)
+    total = sum(bench_kineto(fn, ('cutlass_', 'splitKreduce', 'gemvx', 'dot_kernel', 'reduce_1Block'),
+                             per_call_total=True, **kwargs))
+    return (total, ) + (0, ) * (len(kernel_names) - 1) if isinstance(kernel_names, tuple) else total
+
+
+def is_sm120_loop() -> bool:
+    # SM120 runs batched/grouped BF16 einsum and k-grouped GEMMs as one GEMM launch per batch slice, head or group
+    return get_arch_major() == 12
 
 
 def is_sm90_like_fp8() -> bool:

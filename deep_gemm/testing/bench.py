@@ -80,7 +80,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
                  suppress_kineto_output: bool = False,
                  trace_path: str = None, flush_l2: bool = True,
                  with_multiple_kernels: bool = False,
-                 barrier: Optional[Callable] = None):
+                 barrier: Optional[Callable] = None,
+                 per_call_total: bool = False):
+    # `per_call_total`: return the summed time of every matching kernel launched by one `fn()` call, for implementations
+    # that launch several (e.g. one GEMM per group); by default the average time of one matching kernel is returned
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
 
@@ -118,7 +121,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     # Parse the profiling table
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
-    if not with_multiple_kernels:
+    if not with_multiple_kernels and not per_call_total:
         for name in kernel_names:
             assert sum([name in line for line in prof_lines]) <= 1, f'Errors of the kernel {name} in the profiling table {prof_lines}'
 
@@ -141,6 +144,9 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
                         total_time += float(time_str.replace(unit, '')) / scale * int(num_str)
                         total_num += int(num_str)
                         break
-        kernel_times.append(total_time / total_num if total_num > 0 else 0)
+        if per_call_total:
+            kernel_times.append(total_time / num_tests)
+        else:
+            kernel_times.append(total_time / total_num if total_num > 0 else 0)
 
     return tuple(kernel_times) if is_tuple else kernel_times[0]
