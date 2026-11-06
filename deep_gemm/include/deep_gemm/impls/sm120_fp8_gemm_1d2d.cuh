@@ -263,15 +263,13 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
 
             // SFA rows of this thread (clamped, as out-of-bound rows are never stored)
             const float* local_sfa = sfa + (kGemmType == GemmType::MGroupedMasked ? scheduler.current_group_idx * sfa_stride_g : 0);
-            uint32_t sfa_row_offsets[kNumMTiles][2];
-            #pragma unroll
-            for (uint32_t i = 0; i < kNumMTiles; ++ i) {
-                #pragma unroll
-                for (uint32_t half = 0; half < 2; ++ half) {
-                    const uint32_t row = m_block_idx * BLOCK_M + warp_m_idx * WARP_M + i * MMA::M + group_row + half * 8;
-                    sfa_row_offsets[i][half] = cute::min(row, shape_m - 1) * sfa_stride_m;
-                }
-            }
+            // NOTES: only the first row is kept live across the mainloop: the 2 * `kNumMTiles` clamped offsets are
+            // recomputed at each load (a few integer ops per K block), as the masked scheduler leaves too few of the
+            // math warps' registers for them
+            const uint32_t sfa_row_base = m_block_idx * BLOCK_M + warp_m_idx * WARP_M + group_row;
+            const auto get_sfa_offset = [&](const uint32_t& i, const uint32_t& half) {
+                return cute::min(sfa_row_base + i * MMA::M + half * 8, shape_m - 1) * sfa_stride_m;
+            };
 
             float final_accum[kNumAccum] = {0};
             auto empty_barrier_arrive = [&]() {
@@ -291,7 +289,7 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                 for (uint32_t i = 0; i < kNumMTiles; ++ i) {
                     #pragma unroll
                     for (uint32_t half = 0; half < 2; ++ half)
-                        scale_a[i][half] = __ldg(local_sfa + sfa_row_offsets[i][half] + k_block_begin * sfa_stride_k);
+                        scale_a[i][half] = __ldg(local_sfa + get_sfa_offset(i, half) + k_block_begin * sfa_stride_k);
                 }
                 #pragma unroll 1
                 for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
@@ -303,7 +301,7 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                     for (uint32_t i = 0; i < kNumMTiles; ++ i) {
                         #pragma unroll
                         for (uint32_t half = 0; half < 2; ++ half)
-                            next_scale_a[i][half] = __ldg(local_sfa + sfa_row_offsets[i][half] + next_k_block_idx * sfa_stride_k);
+                            next_scale_a[i][half] = __ldg(local_sfa + get_sfa_offset(i, half) + next_k_block_idx * sfa_stride_k);
                     }
 
                     // Wait TMA arrivals
