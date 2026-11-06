@@ -7,7 +7,7 @@ from deep_gemm.testing import (
     assert_bitwise_equal,
     bench_kineto,
     calc_diff, count_bytes,
-    get_arch_major
+    get_arch_major, test_filter
 )
 from utils import (
     add_sf_k_padding, assert_direct_output_matches_fp32_accumulation,
@@ -397,6 +397,48 @@ def test_k_grouped_gemm_contiguous() -> None:
     print()
 
 
+@test_filter(lambda: get_arch_major() in (10, 12))
+def test_mixed_ue8m0_and_fp32_scale_pair() -> None:
+    # Packed UE8M0 activation scales with FP32 128x128 weight scales: the FP32 side is cast to packed UE8M0 (exact for
+    # power-of-two scales), as on SM100. SM120 otherwise keeps 128-element FP32 scales in FP32 for its FP32-scale kernel
+    print('Testing mixed UE8M0 / FP32 scale pairs:')
+    block, num_groups, m_per_group, n, k = 128, 4, 256, 512, 1024
+    x = torch.randn((num_groups * m_per_group, k), device='cuda')
+    w = torch.randn((num_groups, n, k), device='cuda') * 0.1
+    x_blocks = x.view(-1, k // block, block)
+    x_sf = deep_gemm.ceil_to_ue8m0(x_blocks.abs().amax(-1, keepdim=True).clamp(min=1e-6) / 448)
+    x_fp8 = (x_blocks / x_sf).to(torch.float8_e4m3fn).view(-1, k)
+    x_sf = x_sf.squeeze(-1).contiguous()
+    w_blocks = w.view(num_groups, n // block, block, k // block, block)
+    w_sf = deep_gemm.ceil_to_ue8m0(w_blocks.abs().amax(dim=(2, 4), keepdim=True).clamp(min=1e-6) / 448)
+    w_fp8 = (w_blocks / w_sf).to(torch.float8_e4m3fn).view(num_groups, n, k)
+    w_sf = w_sf.view(num_groups, n // block, k // block).contiguous()
+    x_ref = x_fp8.float() * x_sf.repeat_interleave(block, -1)
+    w_ref = w_fp8.float() * w_sf.repeat_interleave(block, -2).repeat_interleave(block, -1)
+    x_sf_packed = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(x_sf)
+
+    m_indices = torch.arange(num_groups, device='cuda', dtype=torch.int32).repeat_interleave(m_per_group)
+    ref = torch.cat([x_ref[i * m_per_group:(i + 1) * m_per_group] @ w_ref[i].T for i in range(num_groups)])
+    d = torch.empty((num_groups * m_per_group, n), device='cuda', dtype=torch.bfloat16)
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous((x_fp8, x_sf_packed), (w_fp8, w_sf), d, m_indices, recipe=(1, block, block))
+    diff = calc_diff(d, ref)
+    assert diff < 1e-5, f'm-grouped contiguous: {diff=}'
+
+    d = torch.empty((num_groups * m_per_group, n), device='cuda', dtype=torch.bfloat16)
+    deep_gemm.fp8_gemm_nt((x_fp8, x_sf_packed), (w_fp8[0], w_sf[0]), d, recipe=(1, block, block))
+    diff = calc_diff(d, x_ref @ w_ref[0].T)
+    assert diff < 1e-5, f'normal: {diff=}'
+
+    if get_arch_major() == 12:
+        try:
+            deep_gemm.fp8_gemm_nt((x_fp8, x_sf_packed), (w_fp8[0], w_sf[0]), d, recipe=(1, block, block),
+                                  disable_ue8m0_cast=True)
+            assert False, 'mixing scale formats without the UE8M0 cast must be rejected'
+        except RuntimeError as e:
+            assert 'needs the UE8M0 cast' in str(e)
+    print(' > Passed\n')
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -408,3 +450,4 @@ if __name__ == '__main__':
     test_m_grouped_gemm_contiguous()
     test_m_grouped_gemm_masked()
     test_k_grouped_gemm_contiguous()
+    test_mixed_ue8m0_and_fp32_scale_pair()

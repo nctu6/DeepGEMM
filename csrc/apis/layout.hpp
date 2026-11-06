@@ -97,13 +97,39 @@ static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into
     DG_HOST_ASSERT(recipe_a.has_value() == recipe_b.has_value());
     DG_HOST_ASSERT(recipe_a.has_value() != recipe.has_value());
 
+    const int gran_k_a = recipe_a.has_value() ? std::get<1>(recipe_a.value()) : std::get<2>(recipe.value());
+    const int gran_k_b = recipe_b.has_value() ? std::get<1>(recipe_b.value()) : std::get<2>(recipe.value());
+    const int gran_mn_a = recipe_a.has_value() ? std::get<0>(recipe_a.value()) : std::get<0>(recipe.value());
+    const int gran_mn_b = recipe_b.has_value() ? std::get<0>(recipe_b.value()) : std::get<1>(recipe.value());
+
+    // SM120 keeps 128-element FP32 scales in FP32 for its FP32-scale kernel, but a pair with one side already packed
+    // UE8M0 can only run on the UE8M0 kernel: cast the FP32 side to packed per-row UE8M0, as SM100 always does. The
+    // cast reads each FP32 scale's exponent, so it is exact for power-of-two scales
+    if (jit->device.get_arch_major() == 12 and gran_k_a == 128 and gran_k_b == 128 and
+        (sfa.scalar_type() == torch::kInt) != (sfb.scalar_type() == torch::kInt)) {
+        DG_HOST_ASSERT(not disable_ue8m0_cast and "Mixing packed UE8M0 and FP32 scales needs the UE8M0 cast");
+        const auto to_packed_ue8m0 = [](const torch::Tensor& sf, const int& mn, const int& gran_mn,
+                                        const std::optional<torch::Tensor>& layout) {
+            if (sf.scalar_type() == torch::kInt)
+                return sf;
+            DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat);
+            const auto broadcasted = gran_mn == 1 ? sf :
+                                     sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));
+            return get_mn_major_tma_aligned_packed_ue8m0_tensor(broadcasted, layout);
+        };
+        const auto packed_sfa = to_packed_ue8m0(sfa, m, gran_mn_a, psum_layout);
+        const auto packed_sfb = to_packed_ue8m0(sfb, n, gran_mn_b, std::nullopt);
+        return std::make_tuple(
+            check_sf_layout(packed_sfa, m, k, 1, gran_k_a, num_groups_a, true, false, torch::kInt),
+            check_sf_layout(packed_sfb, n, k, 1, gran_k_b, num_groups_b, true, false, torch::kInt),
+            gran_k_a, gran_k_b);
+    }
+
     // Transform SFA and SFB layout (PSUM only for SFA)
     const auto transformed_sfa = recipe.has_value() ? transform_sf_into_required_layout(sfa, m, k, recipe.value(), num_groups_a, true, disable_ue8m0_cast, psum_layout)
                                                     : transform_sf_into_required_layout(sfa, m, k, recipe_a.value(), num_groups_a, std::nullopt, disable_ue8m0_cast, psum_layout);
     const auto transformed_sfb = recipe.has_value() ? transform_sf_into_required_layout(sfb, n, k, recipe.value(), num_groups_b, false, disable_ue8m0_cast)
                                                     : transform_sf_into_required_layout(sfb, n, k, recipe_b.value(), num_groups_b, std::nullopt, disable_ue8m0_cast);
-    const int gran_k_a = recipe_a.has_value() ? std::get<1>(recipe_a.value()) : std::get<2>(recipe.value());
-    const int gran_k_b = recipe_b.has_value() ? std::get<1>(recipe_b.value()) : std::get<2>(recipe.value());
     return std::make_tuple(transformed_sfa, transformed_sfb, gran_k_a, gran_k_b);
 }
 
