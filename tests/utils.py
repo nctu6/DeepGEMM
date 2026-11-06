@@ -2,7 +2,7 @@ import torch
 from typing import Callable, Tuple
 
 import deep_gemm
-from deep_gemm.testing import assert_bitwise_equal
+from deep_gemm.testing import assert_bitwise_equal, get_arch_major
 from deep_gemm.utils import align, ceil_div, get_mk_alignment_for_contiguous_layout
 
 
@@ -117,4 +117,9 @@ def make_cublas_gemm(a: Tuple[torch.Tensor, torch.Tensor], b: Tuple[torch.Tensor
         b_nvfp4 = b[0], to_cublaslt_vec16_sf_layout(b[1])
         return lambda: deep_gemm.cublaslt_nvfp4_gemm_nt(a_nvfp4, b_nvfp4, d, c=c)
     a_fp8, b_fp8 = convert_to_fp8(a), convert_to_fp8(b)
-    return lambda: deep_gemm.cublaslt_gemm_nt(a_fp8[0], b_fp8[0], d, c=c)
+    a_data, b_data = a_fp8[0], b_fp8[0]
+    if get_arch_major() == 12:
+        # cuBLASLt FP8 GEMMs need K-major operands on SM120: time it on pre-transposed copies of MN-major ones
+        a_data = a_data if a_data.stride(-1) == 1 else a_data.contiguous()
+        b_data = b_data if b_data.stride(-1) == 1 else b_data.contiguous()
+    return lambda: deep_gemm.cublaslt_gemm_nt(a_data, b_data, d, c=c)

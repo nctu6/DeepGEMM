@@ -130,10 +130,14 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
         counters = get_stream_k_counters();
     }
 
-    // Requires no TMA splits: a tile row is exactly one swizzle atom of `block_k` bytes (for packed FP4 the TMA
-    // descriptor converts it into elements itself; BF16 rows hold `block_k / 2` elements)
-    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
-    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    // Requires no TMA splits: a K-major tile row is exactly one swizzle atom of `block_k` bytes (for packed FP4 the TMA
+    // descriptor converts it into elements itself; BF16 rows hold `block_k / 2` elements). An MN-major atom is 64 or 128
+    // MN bytes
+    const int elem_bytes = is_bf16 ? 2 : 1;
+    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == (desc.major_a == cute::UMMA::Major::K ? config.layout.block_k :
+                                                            std::min(128, config.layout.block_m * elem_bytes)));
+    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == (desc.major_b == cute::UMMA::Major::K ? config.layout.block_k :
+                                                            std::min(128, config.layout.block_n * elem_bytes)));
     const int tma_block_k = is_bf16 ? config.layout.block_k / 2 : config.layout.block_k;
     const auto tensor_map_a = make_tma_a_desc(desc.major_a, a, desc.m, desc.k,
                                               config.storage_config.load_block_m,
@@ -279,9 +283,9 @@ static SM120BlockScaledChoice sm120_block_scaled_choice(const GemmDesc& desc, co
 }
 
 static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
-                                           const GemmDesc& desc,
-                                           const torch::Tensor& a, const torch::Tensor& sfa,
-                                           const torch::Tensor& b, const torch::Tensor& sfb,
+                                           const GemmDesc& desc_in,
+                                           const torch::Tensor& a_in, const torch::Tensor& sfa,
+                                           const torch::Tensor& b_in, const torch::Tensor& sfb,
                                            const torch::Tensor& d,
                                            void* grouped_layout,
                                            const int& num_groups_a, const int& num_groups_b,
@@ -289,9 +293,20 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                            const int& gran_k_a, const int& gran_k_b,
                                            const float& alpha) {
     // `desc.k` counts logical elements, so FP4 (packed two per byte) has `a.size(-1) * 2 == k`
-    const bool is_fp4 = a.scalar_type() == kPackedFP4;
-    const bool is_bf16 = a.scalar_type() == torch::kBFloat16;
-    DG_HOST_ASSERT(a.scalar_type() == b.scalar_type());
+    const bool is_fp4 = a_in.scalar_type() == kPackedFP4;
+    const bool is_bf16 = a_in.scalar_type() == torch::kBFloat16;
+    DG_HOST_ASSERT(a_in.scalar_type() == b_in.scalar_type());
+    // MN-major operands: BF16 is read in-kernel with the 16-bit `ldmatrix.trans`; FP8 either in-kernel (the 8-bit
+    // transposing `ldmatrix`) or through a host transpose (see `sm120_resolve_mn_major_fp8`); FP4 must be K-major, as there
+    // is no sub-byte transposing load. An MN-major A has no groups, and a grouped MN-major B (`[G, K, N]`) must have whole K
+    // blocks: TMA bounds-checks only the stacked `G * K` rows, so a tail block would read the next group's rows
+    if (is_fp4)
+        DG_HOST_ASSERT(desc_in.major_a == cute::UMMA::Major::K and desc_in.major_b == cute::UMMA::Major::K and
+                       "SM120 FP4 operands must be K-major (there is no sub-byte transposing load)");
+    auto desc = desc_in;
+    auto a = a_in, b = b_in;
+    if (not is_bf16 and not is_fp4)
+        sm120_resolve_mn_major_fp8(desc, a, b);
     DG_HOST_ASSERT(is_bf16 == (desc.kernel_type == KernelType::KernelNoSF));
     DG_HOST_ASSERT(gran_k_a == gran_k_b);
     // FP4: 32-element UE8M0 (MXFP4) or 16-element UE4M3 (NVFP4) scales. BF16 has no scales and passes a nominal 32
@@ -301,11 +316,6 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
         DG_HOST_ASSERT(is_bf16 ? gran_k_a == 32 : (gran_k_a == 32 or gran_k_a == 128));
     DG_HOST_ASSERT(is_bf16 or desc.sf_gran_k == gran_k_a);
     DG_HOST_ASSERT(d.scalar_type() == desc.cd_dtype and (d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat));
-    // MN-major operands are BF16 only (the kernel reads them with the 16-bit `ldmatrix.trans`), and an MN-major A has no
-    // groups. A grouped MN-major B (`[G, K, N]`) must have whole K blocks: TMA bounds-checks only the stacked `G * K`
-    // rows, so a tail block would read the next group's rows instead of zeros
-    if (not is_bf16)
-        DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
     if (desc.major_a == cute::UMMA::Major::MN)
         DG_HOST_ASSERT(desc.gemm_type == GemmType::Normal);
     if (desc.major_b == cute::UMMA::Major::MN and desc.gemm_type != GemmType::Normal)

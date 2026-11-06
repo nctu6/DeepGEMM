@@ -43,6 +43,9 @@ namespace deep_gemm {
 // Narrow tiles (`BLOCK_N == 32`, for thin-N decode GEMMs that otherwise launch too few CTAs to saturate DRAM) split
 // the 4 MMA steps of every K block over two K-warps per output sub-tile, as the 128-thread math group must stay a whole
 // warpgroup for `setmaxnreg`; the K-warps' accumulators are summed through shared memory before the epilogue.
+// MN-major operands (`kMajorA` / `kMajorB`): BF16 is read with the 16-bit `ldmatrix.trans`, FP8 with the native 8-bit
+// transposing `ldmatrix.m16n16.trans.b8`; both give the same fragments as a K-major operand. FP4 stays K-major (there is no
+// sub-byte transposing load)
 // The TMA pipeline, scheduler, warp tiling, stream-K and epilogue are shared with `sm120_fp8_gemm_1d2d_impl`: with
 // `kUseStreamK` (normal GEMMs whose tiles fill the GPU poorly, e.g. decoding with a long K), the
 // `num_tiles x num_k_blocks` iteration space is split evenly over the CTAs, and a tile covered by several CTAs is
@@ -75,11 +78,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     using ab_dtype_t = cute::conditional_t<kIsBF16, cutlass::bfloat16_t,
                        cute::conditional_t<kIsFP4, cutlass::float_e2m1_t, uint8_t>>;
     DG_STATIC_ASSERT(not (kIsFP4 and kIsBF16), "Invalid operand kind");
-    // MN-major operands (BF16 only: `ldmatrix.trans` is 16-bit) are stored as 128B-swizzled atoms of 64 MN elements by
-    // `kElemsPerBlock` K rows, and read with `ldmatrix.trans`
+    // MN-major operands are stored as TMA-swizzled atoms of `kElemsPerBlock` K rows by 128 MN bytes (64 BF16 or 128 FP8
+    // elements; FP8 tiles of 64 MN use 64-byte atoms), and read with `ldmatrix.trans` (BF16, 16-bit) or its 8-bit form (FP8)
     static constexpr bool kIsMNMajorA = kMajorA == cute::UMMA::Major::MN;
     static constexpr bool kIsMNMajorB = kMajorB == cute::UMMA::Major::MN;
-    DG_STATIC_ASSERT(kIsBF16 or (not kIsMNMajorA and not kIsMNMajorB), "Only BF16 operands may be MN-major");
+    static constexpr uint32_t kElemBytes = kIsBF16 ? 2 : 1;
+    static constexpr uint32_t kMNAtomBytesA = BLOCK_M * kElemBytes >= 128 ? 128 : 64;
+    static constexpr uint32_t kMNAtomBytesB = BLOCK_N * kElemBytes >= 128 ? 128 : 64;
+    DG_STATIC_ASSERT(not kIsFP4 or (not kIsMNMajorA and not kIsMNMajorB), "FP4 operands must be K-major");
     DG_STATIC_ASSERT(not kIsMNMajorA or (BLOCK_M % 64 == 0 and kGemmType == GemmType::Normal),
                      "MN-major A needs whole 64-row atoms and no groups");
     DG_STATIC_ASSERT(not kIsMNMajorB or BLOCK_N % 64 == 0, "MN-major B needs whole 64-column atoms");
@@ -88,7 +94,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     // Checks. `BLOCK_K` is the byte width of a tile row (one swizzle atom): 128 bytes (128 FP8 or 256 FP4 elements), or
     // for FP4 64 bytes (128 elements), which halves the stage size so that twice as many stages are in flight
     DG_STATIC_ASSERT(BLOCK_K == 128 or (BLOCK_K == 64 and kIsFP4), "A K block is one 128-byte (or, for FP4, 64-byte) swizzle atom");
-    DG_STATIC_ASSERT(kSwizzleAMode == BLOCK_K and kSwizzleBMode == BLOCK_K, "Swizzling must match the K block (one atom per row)");
+    DG_STATIC_ASSERT(kSwizzleAMode == (kIsMNMajorA ? kMNAtomBytesA : BLOCK_K) and
+                     kSwizzleBMode == (kIsMNMajorB ? kMNAtomBytesB : BLOCK_K),
+                     "Swizzling must match the K block (one atom per row), or the MN atom of an MN-major operand");
     // D = alpha * (A @ B^T) (+ D when accumulating; the host copies a distinct C into D first), BF16 or FP32
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> or cute::is_same_v<cd_dtype_t, float>,
                      "Invalid C/D data dtype");
@@ -387,6 +395,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
         const uint32_t a_t_k_row = ((lane_idx >> 4) & 1) * 8 + (lane_idx & 7);
         const uint32_t b_t_mn = warp_n_idx * WARP_N + (lane_idx >> 4) * 8;
         const uint32_t b_t_k_row = ((lane_idx >> 3) & 1) * 8 + (lane_idx & 7);
+        // MN-major FP8 (`ldmatrix.trans.b8`, lane `l` points at K row `l` of the step): the warp's first MN byte
+        const uint32_t a_b8_mn = warp_m_idx * WARP_M, b_b8_mn = warp_n_idx * WARP_N;
         // Byte offset of the 8 MN elements at `mn` (a multiple of 8) of K row `k_row` in an MN-major stage
         const auto get_mn_major_offset = [](const uint32_t& k_row, const uint32_t& mn) -> uint32_t {
             return (mn / 64) * (kElemsPerBlock * 128) + mma::sm120::get_swizzle_offset<128>(k_row, (mn % 64) / 8);
@@ -453,7 +463,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                         const uint32_t k = warp_k_idx * kNumLocalKSteps + k_local;
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumMTiles; ++ i) {
-                            if constexpr (kIsMNMajorA) {
+                            if constexpr (kIsMNMajorA and not kIsBF16) {
+                                mma::sm120::ldmatrix_b8_x2_trans(a_frag[k_local][i][0], a_frag[k_local][i][1], a_frag[k_local][i][2], a_frag[k_local][i][3],
+                                                                 a_base + mma::sm120::get_mn_major_offset<kMNAtomBytesA, kElemsPerBlock>(
+                                                                     k * 32 + lane_idx, a_b8_mn + i * 16));
+                            } else if constexpr (kIsMNMajorA) {
                                 mma::sm120::ldmatrix_x4_trans(a_frag[k_local][i][0], a_frag[k_local][i][1], a_frag[k_local][i][2], a_frag[k_local][i][3],
                                                               a_base + get_mn_major_offset(k * 16 + a_t_k_row, a_t_mn + i * 16));
                             } else {
@@ -463,7 +477,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                         }
                         #pragma unroll
                         for (uint32_t j = 0; j < kNumNTiles / 2; ++ j) {
-                            if constexpr (kIsMNMajorB) {
+                            if constexpr (kIsMNMajorB and not kIsBF16) {
+                                // The two 8-column tiles of 16 columns: {b0, b1} = {r0, r2} and {r1, r3}
+                                mma::sm120::ldmatrix_b8_x2_trans(b_frag[k_local][j * 2][0], b_frag[k_local][j * 2 + 1][0],
+                                                                 b_frag[k_local][j * 2][1], b_frag[k_local][j * 2 + 1][1],
+                                                                 b_base + mma::sm120::get_mn_major_offset<kMNAtomBytesB, kElemsPerBlock>(
+                                                                     k * 32 + lane_idx, b_b8_mn + j * 16));
+                            } else if constexpr (kIsMNMajorB) {
                                 mma::sm120::ldmatrix_x4_trans(b_frag[k_local][j * 2][0], b_frag[k_local][j * 2][1],
                                                               b_frag[k_local][j * 2 + 1][0], b_frag[k_local][j * 2 + 1][1],
                                                               b_base + get_mn_major_offset(k * 16 + b_t_k_row, b_t_mn + j * 16));

@@ -1,8 +1,9 @@
+import os
 import random
 import torch
 
 import deep_gemm
-from deep_gemm.utils import align, pack_ue8m0_to_int
+from deep_gemm.utils import align, pack_ue8m0_to_int, cast_back_from_fp8, per_block_cast_to_fp8, per_token_cast_to_fp8
 from deep_gemm.testing import (
     assert_bitwise_equal,
     bench_kineto,
@@ -439,6 +440,76 @@ def test_mixed_ue8m0_and_fp32_scale_pair() -> None:
     print(' > Passed\n')
 
 
+@test_filter(lambda: get_arch_major() == 12)
+def test_mn_major_fp8_sm120() -> None:
+    # SM120 reads MN-major FP8 operands in-kernel (the 8-bit transposing `ldmatrix`), or, where the host policy says so (a
+    # small MN-major A, shapes the TMA descriptors cannot express), through an explicit byte transpose and the K-major
+    # kernel. Both routes, on both FP8 kernels (FP32 block scales, and packed UE8M0 scales of 32/128 elements), must match
+    # the dequantized reference as tightly as the K-major kernel does
+    print('Testing MN-major FP8 operands on SM120:')
+    mn_major = lambda x: x.mT.contiguous().mT
+    shapes = [(16, 576, 1024), (48, 1536, 2048), (128, 2112, 7168), (192, 4096, 1536), (4096, 512, 512), (256, 24, 1152)]
+    for route in ('0', '1', '2'):
+        os.environ['DG_SM120_MN_MAJOR_FP8'] = route
+        for kind in ('1d2d', 'g32', 'g128'):
+            for m, n, k in shapes:
+                if kind != '1d2d' and n < 1024 and m <= 256 and k <= 1152:
+                    # NOTES: the K-major 16x32 stream-K tile of the packed-UE8M0 FP8 kernel spills registers (ptxas, under
+                    # `DG_JIT_CHECK_NO_SPILLS=1`) with or without MN-major operands: kept out of this test
+                    continue
+                a_bf16 = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+                b_bf16 = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+                if kind == '1d2d':
+                    qa, sfa = per_token_cast_to_fp8(a_bf16, use_ue8m0=False)
+                    qb, sfb = per_block_cast_to_fp8(b_bf16, use_ue8m0=False)
+                    ref = cast_back_from_fp8(qa, sfa, gran_k=128) @ (qb.float() * sfb.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)[:, :k]).T
+                    kwargs = dict(disable_ue8m0_cast=True)
+                else:
+                    gran_k = 32 if kind == 'g32' else 128
+                    qa, sfa = per_token_cast_to_fp8(a_bf16, use_ue8m0=True, gran_k=gran_k)
+                    qb, sfb = per_token_cast_to_fp8(b_bf16, use_ue8m0=True, gran_k=gran_k)
+                    ref = cast_back_from_fp8(qa, sfa, gran_k=gran_k) @ cast_back_from_fp8(qb, sfb, gran_k=gran_k).T
+                    if gran_k == 128:
+                        sfa = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sfa)
+                        sfb = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sfb)
+                    kwargs = dict(recipe=(1, 1, gran_k))
+                for major_a, major_b in ((False, True), (True, False), (True, True)):
+                    d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+                    deep_gemm.fp8_fp4_gemm_nt((mn_major(qa) if major_a else qa, sfa), (mn_major(qb) if major_b else qb, sfb), d, **kwargs)
+                    diff = calc_diff(d, ref)
+                    assert diff < QuantConfig().max_diff(), f'{route=}, {kind=}, {m=}, {n=}, {k=}, {major_a=}, {major_b=}, {diff=}'
+
+    # m-grouped contiguous with an MN-major B `[G, K, N]`: whole K blocks run in-kernel, a K tail takes the host transpose
+    os.environ.pop('DG_SM120_MN_MAJOR_FP8', None)
+    num_groups, m_per_group, n = 4, 128, 512
+    for k in (1152, 1184):
+        a_bf16 = torch.randn((num_groups * m_per_group, k), device='cuda', dtype=torch.bfloat16)
+        b_bf16 = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+        qa, sfa = per_token_cast_to_fp8(a_bf16, use_ue8m0=True, gran_k=32)
+        qb = torch.empty_like(b_bf16, dtype=torch.float8_e4m3fn)
+        sfb = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            qb[i], sfb[i] = per_token_cast_to_fp8(b_bf16[i], use_ue8m0=True, gran_k=32)
+        a_ref = cast_back_from_fp8(qa, sfa, gran_k=32)
+        ref = torch.cat([a_ref[i * m_per_group:(i + 1) * m_per_group] @ cast_back_from_fp8(qb[i], sfb[i], gran_k=32).T for i in range(num_groups)])
+        m_indices = torch.arange(num_groups, device='cuda', dtype=torch.int32).repeat_interleave(m_per_group)
+        d = torch.empty((num_groups * m_per_group, n), device='cuda', dtype=torch.bfloat16)
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous((qa, sfa), (mn_major(qb), sfb), d, m_indices, recipe=(1, 1, 32))
+        diff = calc_diff(d, ref)
+        assert diff < QuantConfig().max_diff(), f'm-grouped MN-major B, {k=}, {diff=}'
+
+    # FP4 stays K-major (no sub-byte transposing load): a clear error, not a wrong result
+    fp4 = torch.zeros((64, 16), device='cuda', dtype=torch.int8).T   # packed FP4 `[16, 64]`, MN-major
+    fp4_sf = torch.ones((16, 1), device='cuda', dtype=torch.int)
+    try:
+        deep_gemm.fp8_fp4_gemm_nt((fp4, fp4_sf), (fp4.contiguous(), fp4_sf), torch.empty((16, 16), device='cuda', dtype=torch.bfloat16),
+                                  recipe=(1, 1, 32))
+        assert False, 'MN-major FP4 must be rejected'
+    except RuntimeError as e:
+        assert 'K-major' in str(e), str(e)
+    print(' > Passed\n')
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -451,3 +522,4 @@ if __name__ == '__main__':
     test_m_grouped_gemm_masked()
     test_k_grouped_gemm_contiguous()
     test_mixed_ue8m0_and_fp32_scale_pair()
+    test_mn_major_fp8_sm120()

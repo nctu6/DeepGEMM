@@ -92,8 +92,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
     if (fp8_fp4_requires_k_major(a.first, b.first)) {
-        DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
-        DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+        DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K and
+                       "These operands must be K-major (SM90 FP8, FP4 on SM120, FP4 x FP4 on SM100)");
     }
 
     // C/D must be N-major
@@ -209,9 +209,10 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
-    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and "The grouped A operand must be K-major");
     if (fp8_fp4_requires_k_major(a.first, b.first))
-        DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+        DG_HOST_ASSERT(major_b == cute::UMMA::Major::K and
+                       "These operands must be K-major (SM90 FP8, FP4 on SM120, FP4 x FP4 on SM100)");
     DG_HOST_ASSERT(grouped_layout.is_contiguous());
 
     // Type and shape checks
@@ -306,7 +307,8 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
-    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K and
+                   "Masked grouped GEMM operands must be K-major");
     DG_HOST_ASSERT(masked_m.is_contiguous());
 
     // Type and shape checks

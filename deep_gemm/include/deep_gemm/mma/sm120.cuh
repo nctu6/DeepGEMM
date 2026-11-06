@@ -34,6 +34,22 @@ CUTLASS_DEVICE void ldmatrix_x4_trans(uint32_t& r0, uint32_t& r1, uint32_t& r2, 
                  : "memory");
 }
 
+/// `ldmatrix.m16n16.x2.trans.b8`: the native 8-bit transposing load (`LDSM.8.MT1616`, sm_120a/f), for MN-major FP8 tiles
+/// (K rows of MN bytes). Lanes 0-15 supply the addresses of K rows 0-15 (16 contiguous MN bytes each), lanes 16-31 of K rows
+/// 16-31. With `g = lane / 4`, `t = lane % 4`, thread `(g, t)` receives, as 4 consecutive K bytes of one MN byte:
+///  - `r0`: K `4t..4t+3` of MN `g`        `r1`: K `4t..4t+3` of MN `g + 8`
+///  - `r2`: K `16+4t..16+4t+3` of MN `g`  `r3`: K `16+4t..` of MN `g + 8`
+/// which are exactly the E4M3 `m16n8k32` fragment registers of a 16 MN x 32 K block: A `{a0, a1, a2, a3} = {r0, r1, r2, r3}`,
+/// and for B (the MN bytes are the N columns) the first 8-column tile is `{b0, b1} = {r0, r2}` and the second `{r1, r3}`.
+/// No byte permutes, and no MN reordering. (Verified bit-exact on hardware by `scripts/sm120_fp8_trans_probe.cu`, which also
+/// times the alternatives.) The B pairs are not adjacent registers, so ptxas copies them before each MMA
+CUTLASS_DEVICE void ldmatrix_b8_x2_trans(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const uint32_t& smem_addr) {
+    asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(smem_addr)
+                 : "memory");
+}
+
 /// Byte offset of the 16-byte chunk `chunk` of row `row` inside a TMA 128B-swizzled tile whose rows are 128 bytes
 /// NOTES: the tile base must be 1024-byte aligned
 CUTLASS_DEVICE uint32_t get_swizzle_128b_offset(const uint32_t& row, const uint32_t& chunk) {
@@ -50,6 +66,13 @@ CUTLASS_DEVICE uint32_t get_swizzle_offset(const uint32_t& row, const uint32_t& 
         return row * 128 + ((chunk ^ (row & 7)) << 4);
     else
         return row * 64 + ((chunk ^ ((row >> 1) & 3)) << 4);
+}
+
+/// Byte offset inside a stage of MN-major FP8 atoms (`kAtomBytes` = 64 or 128 MN bytes per atom row, `kNumKRows` K rows
+/// per atom) of the 16-byte chunk starting at MN byte `mn` (a multiple of 16) of K row `k_row`
+template <uint32_t kAtomBytes, uint32_t kNumKRows>
+CUTLASS_DEVICE uint32_t get_mn_major_offset(const uint32_t& k_row, const uint32_t& mn) {
+    return (mn / kAtomBytes) * (kNumKRows * kAtomBytes) + get_swizzle_offset<kAtomBytes>(k_row, (mn % kAtomBytes) / 16);
 }
 
 /// `D = A * B + D` with E4M3 A (16x32, row) and B (32x8, col), FP32 accumulation

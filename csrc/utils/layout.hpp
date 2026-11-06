@@ -40,10 +40,15 @@ static void check_major_type_cd(const torch::Tensor& t) {
 }
 
 static bool fp8_fp4_requires_k_major(const torch::Tensor& a, const torch::Tensor& b) {
-    // SM90 WGMMA and SM120 `mma.sync` FP8 kernels both require K-major operands
     const auto arch_major = jit->device.get_arch_major();
-    return arch_major == 9 or arch_major == 12 or
-           (a.scalar_type() == kPackedFP4 and b.scalar_type() == kPackedFP4);
+    // SM90 WGMMA needs K-major operands
+    if (arch_major == 9)
+        return true;
+    // SM120 `mma.sync` reads MN-major FP8 with the 8-bit transposing `ldmatrix` (or a host transpose), but packed FP4 has
+    // no sub-byte transposing load
+    if (arch_major == 12)
+        return a.scalar_type() == kPackedFP4 or b.scalar_type() == kPackedFP4;
+    return a.scalar_type() == kPackedFP4 and b.scalar_type() == kPackedFP4;
 }
 
 // Tensor utils

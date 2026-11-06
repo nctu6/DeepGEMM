@@ -12,6 +12,7 @@
 #include "../heuristics/sm120.hpp"
 
 #include "runtime_utils.hpp"
+#include "sm120_fp8_transpose.hpp"
 
 namespace deep_gemm {
 
@@ -41,7 +42,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm120_fp8_gemm_1d2d_impl<
-        {},
+        {}, {}, {},
         {}, {}, {},
         {},
         {}, {}, {},
@@ -54,6 +55,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         to_string(args.major_sfb),
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
@@ -130,16 +132,60 @@ static float* get_stream_k_workspace(const size_t& num_floats) {
     return ptr;
 }
 
+// MN-major FP8 operands. The kernels read an MN-major operand in-kernel with the 8-bit transposing `ldmatrix`
+// (`mma::sm120::ldmatrix_b8_x2_trans`); operands the kernels do not cover, and the cases where an explicit byte transpose
+// followed by the K-major kernel is faster, take that route on the host instead (`sm120_transpose_fp8_to_k_major`).
+// `DG_SM120_MN_MAJOR_FP8` (developer override): 0 auto, 1 always transpose on the host, 2 in-kernel whenever supported
+//  - Supported in-kernel A: normal GEMMs only (no group offset along M), `M % 16 == 0` (TMA row stride)
+//  - Supported in-kernel B: `N % 16 == 0`; grouped B (`[G, K, N]`) needs whole K blocks, as TMA bounds-checks only the
+//    stacked rows
+//  - Auto policy (measured, CUDA graph with cold operands, DeepSeek-V3 shapes and squares, `deepgemm-analysis.md`):
+//    an MN-major B always runs in-kernel (1.4-2.0x faster than the explicit transpose at M <= 256, tied from M = 1024 up).
+//    An MN-major A runs in-kernel from M = 256: the kernel's MN-major A tiles are at least 64 rows, so at M <= 64 it computes
+//    mostly padding and loses to the transpose of the small activation (0.3-1.1x), while at M = 256 and up it ties or wins
+//    (0.86-1.4x, 1.0-1.16x for all but one shape). M = 128 was not measured, so it keeps the transpose
+static bool sm120_fp8_mn_major_supported_in_kernel(const GemmDesc& desc, const bool& is_a, const torch::Tensor& t) {
+    // TMA: 16-byte aligned base and row stride
+    if (t.stride(-1) % 16 != 0 or reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 != 0)
+        return false;
+    if (is_a)
+        return desc.gemm_type == GemmType::Normal and desc.m % 16 == 0;
+    return desc.n % 16 == 0 and (desc.gemm_type == GemmType::Normal or desc.k % 128 == 0);
+}
+
+static bool sm120_fp8_mn_major_use_in_kernel(const GemmDesc& desc, const bool& is_a, const torch::Tensor& t) {
+    const int mode = deep_jit::get_env<int>("DG_SM120_MN_MAJOR_FP8", 0);
+    if (mode == 1 or not sm120_fp8_mn_major_supported_in_kernel(desc, is_a, t))
+        return false;
+    return mode == 2 or not is_a or desc.m >= 256;
+}
+
+// Returns the operands the kernel will read: an MN-major operand that does not run in-kernel is replaced by a compact
+// K-major copy (and `desc` is updated)
+static void sm120_resolve_mn_major_fp8(GemmDesc& desc, torch::Tensor& a, torch::Tensor& b) {
+    if (desc.major_a == cute::UMMA::Major::MN and not sm120_fp8_mn_major_use_in_kernel(desc, true, a)) {
+        a = sm120_transpose_fp8_to_k_major(a);
+        desc.major_a = cute::UMMA::Major::K;
+    }
+    if (desc.major_b == cute::UMMA::Major::MN and not sm120_fp8_mn_major_use_in_kernel(desc, false, b)) {
+        b = sm120_transpose_fp8_to_k_major(b);
+        desc.major_b = cute::UMMA::Major::K;
+    }
+}
+
 static void sm120_fp8_gemm_1d2d_launch(const std::string& tag,
-                                       const GemmDesc& desc,
-                                       const torch::Tensor& a, const torch::Tensor& sfa,
-                                       const torch::Tensor& b, const torch::Tensor& sfb,
+                                       const GemmDesc& desc_in,
+                                       const torch::Tensor& a_in, const torch::Tensor& sfa,
+                                       const torch::Tensor& b_in, const torch::Tensor& sfb,
                                        const torch::Tensor& d,
                                        void* grouped_layout,
                                        const int& num_groups_a, const int& num_groups_b, const int& num_groups_sfa,
                                        const cute::UMMA::Major& major_sfb) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(a_in.scalar_type() == torch::kFloat8_e4m3fn and b_in.scalar_type() == torch::kFloat8_e4m3fn);
+    auto desc = desc_in;
+    auto a = a_in, b = b_in;
+    sm120_resolve_mn_major_fp8(desc, a, b);
     // The epilogue stores 4 BF16 columns (8 bytes) at a time
     DG_HOST_ASSERT(desc.n % 8 == 0 and d.stride(-2) % 4 == 0);
     DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(d.data_ptr()) % 8 == 0);
@@ -155,9 +201,11 @@ static void sm120_fp8_gemm_1d2d_launch(const std::string& tag,
         counters = get_stream_k_counters();
     }
 
-    // Requires no TMA splits
-    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
-    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    // Requires no TMA splits: a K-major row is one swizzle atom, an MN-major atom is 64 or 128 MN bytes
+    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == (desc.major_a == cute::UMMA::Major::K ? config.layout.block_k :
+                                                            std::min(128, config.layout.block_m)));
+    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == (desc.major_b == cute::UMMA::Major::K ? config.layout.block_k :
+                                                            std::min(128, config.layout.block_n)));
     const auto tensor_map_a = make_tma_a_desc(desc.major_a, a, desc.m, desc.k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,

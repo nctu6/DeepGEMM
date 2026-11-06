@@ -92,7 +92,8 @@ from .compat import fp8_mqa_logits, fp8_paged_mqa_logits
 def get_supported_arch_majors() -> tuple:
     """Compute capability majors with FP8 GEMM (normal, m-grouped contiguous/masked) and FP8 MQA logits kernels.
 
-    SM120 kernels take FP32 scaling factors (the SM90 recipe) and K-major operands; see `deepgemm-analysis.md`.
+    SM120 kernels take FP32 scaling factors (the SM90 recipe) or packed UE8M0 ones, and K- or MN-major FP8 operands (FP4
+    operands are K-major); see `deepgemm-analysis.md`.
     Callers can probe this to tell a build with SM120 support from an older one.
     """
     return 9, 10, 12

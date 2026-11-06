@@ -25,6 +25,8 @@ namespace deep_gemm {
 //
 // Same contract as `sm90_fp8_gemm_1d2d_impl`, but built on `mma.sync` because SM120 has no WGMMA:
 //  - One TMA warp-group loads A/B (128B swizzled) into a `kNumStages` ring guarded by mbarriers
+//  - An MN-major operand (`kMajorA` / `kMajorB`) is loaded as swizzled atoms of 128 (or 64) MN bytes by 128 K rows, and read
+//    with the native 8-bit transposing `ldmatrix.m16n16.trans.b8` into the same fragments as a K-major operand
 //  - SFA is read by the math warps straight from global memory with runtime strides, so both the activation
 //    quantizer's K-major `[M, K / 128]` scales and MN-major (TMA-aligned) scales work without a transpose kernel
 //  - Math warps form a `kNumWarpsM x kNumWarpsN` grid; each warp owns a `WARP_M x WARP_N` tile,
@@ -36,7 +38,7 @@ namespace deep_gemm {
 //    iteration space is split evenly into `gridDim.x` contiguous ranges, one per CTA. A tile covered by several
 //    CTAs is reduced through `workspace`: each contributor writes an FP32 partial into its slot, and the last one
 //    to finish (tracked by self-resetting `counters`) sums all slots in order, so results are deterministic
-template <cute::UMMA::Major kMajorSFB,
+template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB, cute::UMMA::Major kMajorSFB,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -59,7 +61,15 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
 
     // Scaling and layout checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(kSwizzleAMode == 128 and kSwizzleBMode == 128, "Only 128B swizzling (one atom per K block) is supported");
+    // K-major tiles are one 128B swizzle atom per row; MN-major ones are atoms of 128 (64 for 64-wide tiles) MN bytes
+    static constexpr bool kIsMNMajorA = kMajorA == cute::UMMA::Major::MN;
+    static constexpr bool kIsMNMajorB = kMajorB == cute::UMMA::Major::MN;
+    static constexpr uint32_t kMNAtomBytesA = BLOCK_M >= 128 ? 128 : 64;
+    static constexpr uint32_t kMNAtomBytesB = BLOCK_N >= 128 ? 128 : 64;
+    DG_STATIC_ASSERT(kSwizzleAMode == (kIsMNMajorA ? kMNAtomBytesA : 128) and kSwizzleBMode == (kIsMNMajorB ? kMNAtomBytesB : 128),
+                     "Only 128B swizzling (one atom per K block) or the MN atom of an MN-major operand is supported");
+    DG_STATIC_ASSERT(not kIsMNMajorA or (BLOCK_M % 64 == 0 and kGemmType == GemmType::Normal), "MN-major A needs whole 64-row atoms and no groups");
+    DG_STATIC_ASSERT(not kIsMNMajorB or BLOCK_N % 64 == 0, "MN-major B needs whole 64-column atoms");
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
     DG_STATIC_ASSERT(kGemmType != GemmType::Batched and not is_k_grouped_contiguous(kGemmType), "Unsupported GEMM type");
     DG_STATIC_ASSERT(not kUseStreamK or kGemmType == GemmType::Normal, "Stream-K is only for normal GEMMs");
@@ -198,8 +208,13 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                         // cannot complete the phase: the single arrival comes with A, after the wait
                         auto& full_barrier = *full_barriers[k_block_idx];
                         full_barrier.expect_transaction(SMEM_B_SIZE_PER_STAGE);
-                        tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
-                                 smem_b[k_block_idx], k_block_idx * BLOCK_K, first_n_block_idx * BLOCK_N);
+                        if constexpr (kIsMNMajorB) {
+                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
+                                     smem_b[k_block_idx], first_n_block_idx * BLOCK_N, k_block_idx * BLOCK_K);
+                        } else {
+                            tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
+                                     smem_b[k_block_idx], k_block_idx * BLOCK_K, first_n_block_idx * BLOCK_N);
+                        }
                     }
                 }
             }
@@ -215,14 +230,26 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
 
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
-                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3>(&tensor_map_a, &full_barrier,
-                             smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx));
+                    if constexpr (kIsMNMajorA) {
+                        tma::copy<BLOCK_M, BLOCK_K, kSwizzleAMode, __nv_fp8_e4m3>(&tensor_map_a, &full_barrier,
+                                 smem_a[stage_idx], scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx), k_idx);
+                    } else {
+                        tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3>(&tensor_map_a, &full_barrier,
+                                 smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx));
+                    }
                     // B of the first stages of the first task was issued before the wait
                     if (is_first_task and k_block_idx < num_preissued_k_blocks) {
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
                     } else {
-                        tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
-                                 smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
+                        if constexpr (kIsMNMajorB) {
+                            // A grouped MN-major B is `[G, K, N]`: the group offset goes to the outer dimension, K
+                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
+                                     smem_b[stage_idx], scheduler.get_global_idx<false>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                                     scheduler.template get_global_idx<true, sched::IndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx));
+                        } else {
+                            tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
+                                     smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
+                        }
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
                     }
                 }
@@ -252,6 +279,8 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
         const uint32_t a_ld_chunk = lane_idx >> 4;
         const uint32_t b_ld_row = warp_n_idx * WARP_N + (lane_idx >> 4) * 8 + (lane_idx & 7);
         const uint32_t b_ld_chunk = (lane_idx >> 3) & 1;
+        // MN-major operands (`ldmatrix.trans.b8`): the warp's MN byte offsets in the stage
+        const uint32_t a_trans_mn = warp_m_idx * WARP_M, b_trans_mn = warp_n_idx * WARP_N;
 
         while (get_next_task(m_block_idx, n_block_idx)) {
             // SFB of this warp: `WARP_N` divides 128, so a single row (or column) of SFB per K block
@@ -320,13 +349,26 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                         uint32_t a_frag[kNumMTiles][4], b_frag[kNumNTiles][2];
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumMTiles; ++ i) {
-                            mma::sm120::ldmatrix_x4(a_frag[i][0], a_frag[i][1], a_frag[i][2], a_frag[i][3],
-                                                    a_base + mma::sm120::get_swizzle_128b_offset(a_ld_row + i * MMA::M, k * 2 + a_ld_chunk));
+                            if constexpr (kIsMNMajorA) {
+                                mma::sm120::ldmatrix_b8_x2_trans(a_frag[i][0], a_frag[i][1], a_frag[i][2], a_frag[i][3],
+                                                                 a_base + mma::sm120::get_mn_major_offset<kMNAtomBytesA, BLOCK_K>(
+                                                                     k * 32 + lane_idx, a_trans_mn + i * MMA::M));
+                            } else {
+                                mma::sm120::ldmatrix_x4(a_frag[i][0], a_frag[i][1], a_frag[i][2], a_frag[i][3],
+                                                        a_base + mma::sm120::get_swizzle_128b_offset(a_ld_row + i * MMA::M, k * 2 + a_ld_chunk));
+                            }
                         }
                         #pragma unroll
                         for (uint32_t j = 0; j < kNumNTiles / 2; ++ j) {
-                            mma::sm120::ldmatrix_x4(b_frag[j * 2][0], b_frag[j * 2][1], b_frag[j * 2 + 1][0], b_frag[j * 2 + 1][1],
-                                                    b_base + mma::sm120::get_swizzle_128b_offset(b_ld_row + j * 16, k * 2 + b_ld_chunk));
+                            if constexpr (kIsMNMajorB) {
+                                // The two 8-column tiles of 16 columns: {b0, b1} = {r0, r2} and {r1, r3}
+                                mma::sm120::ldmatrix_b8_x2_trans(b_frag[j * 2][0], b_frag[j * 2 + 1][0], b_frag[j * 2][1], b_frag[j * 2 + 1][1],
+                                                                 b_base + mma::sm120::get_mn_major_offset<kMNAtomBytesB, BLOCK_K>(
+                                                                     k * 32 + lane_idx, b_trans_mn + j * 16));
+                            } else {
+                                mma::sm120::ldmatrix_x4(b_frag[j * 2][0], b_frag[j * 2][1], b_frag[j * 2 + 1][0], b_frag[j * 2 + 1][1],
+                                                        b_base + mma::sm120::get_swizzle_128b_offset(b_ld_row + j * 16, k * 2 + b_ld_chunk));
+                            }
                         }
                         #pragma unroll
                         for (uint32_t i = 0; i < kNumMTiles; ++ i) {
@@ -335,7 +377,6 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                                 MMA::mma(a_frag[i], b_frag[j], accum + (i * kNumNTiles + j) * 4);
                         }
                     }
-
 
                     // Promote with scales
                     #pragma unroll

@@ -190,9 +190,10 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
                             override_major = MajorTypeAB.KMajor
                             override_kernel_type = KernelType.Kernel1D1D
                         if get_arch_major() == 12 and dtype == torch.float8_e4m3fn:
-                            # SM120 FP8 has no 1D1D (per-channel SFB) kernel, FP32 output or accumulation: Dgrad only
-                            override_major = MajorTypeAB.KMajor
+                            # SM120 FP8 has no 1D1D (per-channel SFB) kernel, FP32 output or accumulation: BF16 Dgrad and
+                            # non-accumulating BF16 Wgrad, with MN-major operands (in-kernel `ldmatrix.trans.b8`)
                             yield emit(kernel_type, quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16)  # Dgrad
+                            yield emit(kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.bfloat16)      # Wgrad
                             continue
                         yield emit(kernel_type,          quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16)  # Dgrad
                         yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, True,  torch.float)         # Wgrad
@@ -237,7 +238,8 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
                     reset_seed()
                     for num_groups, expected_m_per_group in m_group_list:
                         for n, k in n_k_list:
-                            for major_a, major_b in get_major_ab(False, not is_sm90_like_fp8() or dtype != torch.float8_e4m3fn):
+                            # MN-major B: SM100, and SM120 (`ldmatrix.trans.b8`); not SM90 FP8
+                            for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
                                 if quant_config is not None and quant_config.is_fp4_fp4() and major_b.is_mn_major():
                                     continue
                                 yield kernel_type, quant_config, num_groups, expected_m_per_group, n, k, major_a, major_b, use_psum_layout, ensure_zero_padding

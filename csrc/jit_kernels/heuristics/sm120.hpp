@@ -93,10 +93,11 @@ struct SM120ArchSpec {
         // 1D2D: FP32 scales promoted on CUDA cores; 1D1D: packed UE8M0 scales applied by the block-scaled MMA
         // NoSF: BF16 operands on the 1D1D kernel
         DG_HOST_ASSERT(desc.kernel_type == KernelType::Kernel1D2D or is_1d1d_kernel(desc.kernel_type));
-        // MN-major operands only on the BF16 kernel, whose MN-major tiles are whole 64-element swizzle atoms
+        // MN-major operands (BF16 with the 16-bit `ldmatrix.trans`, FP8 with its 8-bit form) are whole 64-byte swizzle atoms
+        // in MN (FP4 is K-major only: there is no sub-byte transposing load)
         const bool is_mn_major_a = desc.major_a == cute::UMMA::Major::MN;
         const bool is_mn_major_b = desc.major_b == cute::UMMA::Major::MN;
-        DG_HOST_ASSERT(desc.kernel_type == KernelType::KernelNoSF or (not is_mn_major_a and not is_mn_major_b));
+        DG_HOST_ASSERT((desc.a_dtype != kPackedFP4 and desc.b_dtype != kPackedFP4) or (not is_mn_major_a and not is_mn_major_b));
 
         // Block M candidates
         std::vector<int> block_m_candidates;
@@ -163,9 +164,14 @@ struct SM120ArchSpec {
 
     static StorageConfig get_storage_config(const GemmDesc& desc, const Layout& layout) {
         DG_HOST_ASSERT(layout.swap_ab == 0);
-        // The 1D1D kernel's `block_k` is already in bytes
-        const auto swizzle_mode_a = get_swizzle_mode(layout.block_k, get_smem_elem_size(desc, desc.a_dtype));
-        const auto swizzle_mode_b = get_swizzle_mode(layout.block_k, get_smem_elem_size(desc, desc.b_dtype));
+        // The 1D1D kernel's `block_k` is already in bytes. An MN-major operand is swizzled along MN: 128-byte atoms, or
+        // 64-byte ones for 64-wide FP8 tiles
+        const auto swizzle_mode_a = desc.major_a == cute::UMMA::Major::MN ?
+            get_swizzle_mode(layout.block_m, static_cast<int>(c10::elementSize(desc.a_dtype))) :
+            get_swizzle_mode(layout.block_k, get_smem_elem_size(desc, desc.a_dtype));
+        const auto swizzle_mode_b = desc.major_b == cute::UMMA::Major::MN ?
+            get_swizzle_mode(layout.block_n, static_cast<int>(c10::elementSize(desc.b_dtype))) :
+            get_swizzle_mode(layout.block_k, get_smem_elem_size(desc, desc.b_dtype));
         // D is stored directly from registers
         return {
             layout.block_m, layout.block_n,
