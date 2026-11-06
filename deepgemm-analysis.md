@@ -511,13 +511,13 @@ host still rejects them, so there is no silent wrong path):
 - **Sparse MQA logits** and **block-scaled MXFP8/MXFP4 dense MQA logits**: DONE
   (2026-11-06, section 9.6). Both ship for arch 12 and are validated against a
   dequantized reference. No longer deferred.
-- **k-grouped FP8 GEMMs / Wgrad and MN-major FP8 operands** (`k_grouped_fp8_gemm_tn_contiguous`,
-  `fp8_einsum` `bhd,hdr->bhr` / `bhd,bhr->hdr`): MN-major FP8 needs a byte-granular
-  transpose-on-load, and `ldmatrix.b8` doesn't exist on sm_120 (the BF16 path uses
-  the 16-bit `ldmatrix.trans`, section 9.9). Training only, no inference caller. The
-  host rejects them (`Unsupported architecture` for k-grouped, "needs MN-major FP8
-  operands, supported on SM100 only" for the einsum). FP4 dense MQA is no longer
-  here: it is done, section 9.6.
+- **k-grouped FP8 GEMMs / Wgrad and MN-major `fp8_einsum`** (`k_grouped_fp8_gemm_tn_contiguous`,
+  `fp8_einsum` `bhd,hdr->bhr` / `bhd,bhr->hdr`): training only, no inference caller. The host still rejects
+  them (`Unsupported architecture` for k-grouped, "needs MN-major FP8 operands, supported on SM100 only" for the
+  einsum). The reason given here earlier, that MN-major FP8 needs a byte-granular transpose and
+  `ldmatrix.b8` doesn't exist on sm_120, was wrong: `ldmatrix.m16n16.x{1,2}.trans.b8` exists on sm_120a/f
+  (section 9.10), and MN-major FP8 GEMM operands are now supported. FP4 dense MQA is no longer here: it is
+  done, section 9.6.
 - **Mega MoE**: its point is NVLink symmetric-memory dispatch/combine across
   ranks; on a single PCIe GPU it degenerates to a local grouped-GEMM chain that
   `m_grouped_*` already covers, and a port is effectively a UMMA/TMEM -> mma.sync
@@ -878,4 +878,97 @@ Commits on `nctu6` after `df1bb16`, not pushed.
   kept now; the offsets are recomputed at each load. 0 B. Masked FP8 sweep: within
   +-0.4% on 20 of 26 configs, 0.8-2.5% faster on 6, none slower beyond noise.
 
-Limits that remain on SM120: k-grouped FP8 and MN-major FP8 operands/einsum (section 8).
+Limits that remain on SM120: k-grouped FP8 and MN-major FP8 einsum (section 8; MN-major FP8 GEMM operands are in section 9.10).
+
+## 9.10 MN-major FP8 operands (2026-11-06)
+
+`fp8_fp4_gemm_{nn,tn,tt}` and m-grouped contiguous with an MN-major B now run on both SM120 FP8 kernels
+(`sm120_fp8_gemm_1d2d`, and `sm120_fp8_fp4_gemm_1d1d` in its FP8 UE8M0 g32/g128 modes) as `kMajorA` / `kMajorB`
+template parameters of the existing kernels. FP4 operands stay K-major (there is no sub-byte transposing load).
+
+**`ldmatrix.b8` exists on sm_120.** Section 8 said it didn't. `ldmatrix.sync.aligned.m16n16.x{1,2}.trans.shared.b8`
+assembles for `compute_120a` and `sm_120f` (SASS `LDSM.8.MT1616`); there is no `m8n8` b8 form, and `.trans` is required.
+`scripts/sm120_fp8_trans_probe.cu` verifies its layout bit-exact on hardware. For a 16 K-row x 16 MN-byte block (`.x1`;
+lane `l < 16` supplies the address of K row `l`, 16 contiguous MN bytes), with `g = lane / 4`, `t = lane % 4`:
+
+| register | contents |
+|---|---|
+| `r0` | K `4t..4t+3` of MN byte `g` |
+| `r1` | K `4t..4t+3` of MN byte `g + 8` |
+| `r2`, `r3` (`.x2`, lanes 16-31 point at K rows 16-31) | the same for K + 16 |
+
+These are exactly the E4M3 `m16n8k32` fragment registers: an A fragment is `{r0, r1, r2, r3}`, and the B fragments of two
+8-column tiles are `{r0, r2}` and `{r1, r3}`. No byte permutes and no MN reordering, so the epilogue, the scale lookups and
+the K order are those of the K-major path, and an MN-major operand pairs with a K-major one. The TMA tile is the BF16
+path's: swizzled atoms of 128 (64 for 64-wide tiles) MN bytes by 128 K rows.
+
+**Design choice.** Four designs for the transpose-on-load were built and timed.
+
+| design | what | probe (ns / 128x128x128 K block, 8 warps, 188 CTAs, smem resident) | in the real 1D2D kernel |
+|---|---|---|---|
+| bound | K-major `ldmatrix.x4` | 872 | - |
+| (a) | b16 `ldmatrix.x4.trans` + 4 `prmt` per 16x32 block | 907 (1.04x) | bit-exact; MN order permuted inside 16, so the epilogue, scale rows and columns are remapped; at 4096^3 B-MN 1.00x, A-MN 1.05x, both 1.07x of the bound |
+| (b) | helper warps transpose the next stage in shared memory | 2404 (2.76x) | not built (the probe already doubles smem traffic and needs a sync per stage) |
+| (c) | 32-bit `ld.shared` + 4x4 byte transpose with `prmt` | 877 (1.01x) | spills 7 of 8 shapes under `DG_JIT_CHECK_NO_SPILLS=1`, and 8-18% slower than (a) |
+| (d) | native `ldmatrix.trans.b8` | 881 (1.01x) | bit-exact, no remapping; at 4096^3 A-MN 0.99x, B-MN 1.06x, both 1.05x of the bound |
+
+(d) is used. It is exact, needs no remapping, and its A side beats (a). Its B side costs about 6% on compute-bound
+128x128 tiles (4096^3: 218 vs 205 us for the K-major bound): the B pairs come out of the instruction as `{r0, r2}` and
+`{r1, r3}`, but an MMA reads its B operand as an adjacent register pair, so ptxas copies the pair into a scratch pair
+before each MMA (two `MOV` per `QMMA`, and a write-after-read dependency on the scratch). Looping over N tiles first, and
+packing the pairs into 64-bit registers, produced the same SASS. Using (a) for B only would recover that 6%, at the cost of
+the MN permutation in the epilogue and the scale lookups on the B side; not done, since the explicit transpose ties there.
+
+**Host routing.** An MN-major operand either runs in-kernel or is transposed first by a JIT byte-transpose kernel
+(`sm120_fp8_transpose.cuh`, a 128x64 tile through shared memory with 4x4 `prmt` transposes and 16-byte stores) followed by the
+K-major kernel; that transpose is also the route for what the kernels don't cover (`M % 16 != 0` or `N % 16 != 0`, which
+TMA can't express for MN-major rows, a grouped MN-major B whose K is not a multiple of 128, an MN-major A in a grouped GEMM).
+`DG_SM120_MN_MAJOR_FP8` = 0 auto, 1 always host transpose, 2 in-kernel when supported (developer override).
+Auto picks per operand: **B in-kernel always; A in-kernel from M = 256.** An MN-major A tile is at least 64 rows (the TMA
+atom), so below that the kernel computes padding.
+
+**Numbers** (`scripts/sm120_bench_mn_major_fp8.py`; RTX PRO 6000, GPU 7; CUDA graph over enough operand copies to exceed L2, so
+operands are cold; min of 3 interleaved rounds; FP32-scale 1D2D kernel, BF16 out; DeepSeek-V3 TP8 linears 2112x7168, 576x7168,
+3072x1536, 4096x512, 7168x2048, 4608x7168, 7168x2304, 512x7168, 7168x256 and squares 2048, 4096, 8192, M in
+{1, 16, 64, 256, 1024, 4096}; A-MN and both-MN on a 7-shape subset, M in {16, 64, 256, 1024, 4096}). "explicit" is the
+byte-transpose kernel then the K-major kernel; "bound" the K-major kernel on pre-transposed data; Triton is TokenSpeed's
+block-FP8 kernel called on the strided MN-major operands (its wrapper asserts contiguity, the kernel itself takes strides);
+FlashInfer needs K-major, so its time is on pre-transposed data and excludes the transpose. Ratios are geomeans (range):
+
+| MN-major | M | n | default route / explicit | default route / bound | Triton (strided) / default | FlashInfer (K-major) / default |
+|---|---|---|---|---|---|---|
+| B (weights) | <= 64 | 36 | 1.63x (1.36-1.96) | 1.00x | 2.92x (1.47+) | 2.44x (1.35+) |
+| B | 256 | 12 | 1.47x (1.32-1.89) | 1.00x | 1.97x | 1.43x |
+| B | >= 1024 | 24 | 1.09x (0.97-1.27) | 0.96x | 1.65x | 1.02x (0.92+) |
+| A (activations) | <= 64 | 14 | 1.00x (host route) | 0.88x | 4.08x | 2.78x |
+| A | 256 | 7 | 1.07x (0.86-1.16) | 0.97x | 2.47x | 1.32x |
+| A | >= 1024 | 14 | 1.08x (0.95-1.39) | 0.99x | 2.16x | 0.99x |
+| A and B (Wgrad) | <= 64 | 14 | 1.57x (1.35+) | 0.93x | 4.60x | 1.78x |
+| A and B | 256 | 7 | 1.57x (1.09-1.89) | 0.94x | 3.76x | 1.25x |
+| A and B | >= 1024 | 14 | 1.20x (1.02-1.47) | 0.96x | 3.07x | 0.96x |
+
+The in-kernel path (forced) against the explicit transpose: B 1.00-1.96x everywhere (1.00 at the compute-bound M = 4096);
+A 0.32-0.61x at M = 16, 0.62-1.13x at M = 64 (hence the M >= 256 rule), 0.86-1.39x above; both operands 0.79-1.49x at M = 16,
+0.83-1.88x at M = 64, 1.07-1.89x from 256. The default route is within 6% of the better of the two in 137 of 142 points
+(the rest: A-MN 0.86x at 576x7168 M = 256, 0.89x at 7168x2048 M = 64, 0.90x at 8192^2 M = 64; both-MN 0.93x at 8192^2
+M = 4096; B-MN 0.94x at 2112x7168 M = 4096). Measurement noise at M = 4096 is about 5%: the same code measured later in a
+round came out 4-6% slower.
+The 1D1D UE8M0 g128 kernel gives the same picture (b/a/ab at M in {16, 256, 4096} on 3 shapes: B 1.04-1.77x over explicit, A from
+M = 256 1.06-1.12x, both 1.09-1.74x from M = 256). Where FlashInfer's K-major kernel is ahead of the default route (B-MN and
+both-MN at M >= 256, up to 13%), 0-4% of that is already its lead over DeepGEMM's own K-major kernel there, and the rest is
+the B-side `MOV` cost above.
+
+**K-major unchanged.** The shared kernels were edited, so the K-major benchmark was rerun against a build of the previous
+commit (`scripts/sm120_bench_kmajor.py`, 7 shapes x M in {1, 16, 64, 256, 1024, 4096}, min of 3 alternating rounds x 3 repeats):
+1D2D geomean new/old 0.9997 (worst +0.7%), 1D1D UE8M0 g128 1.000 (worst +0.5%).
+
+**Tests.** `tests/generators.py` now yields the SM120 FP8 Dgrad (K-major A, MN-major B) and non-accumulating BF16 Wgrad (both
+MN-major) cases and the m-grouped contiguous MN-major B cases; `test_mn_major_fp8_sm120` in `tests/test_fp8_fp4.py` covers both routes on
+both kernels, the grouped host-transpose fallback and the FP4 rejection against the dequantized reference at the K-major
+tolerance. `scripts/sm120_mn_major_fp8_check.py` checks the MN-major result against the K-major kernel's (bitwise, or FP32
+rounding when the heuristic picks another tile or stream-K split) and a dequantized reference over 432 cases.
+
+**Found while testing, not fixed.** The K-major 16x32 stream-K tile of the packed-UE8M0 FP8 kernel
+(`sm120_fp8_fp4_gemm_1d1d`, N = 576, K = 1024, M = 16, g32 and g128, 15 stages) spills registers (g128: 4 B of spill stores, 20 B
+of loads) under `DG_JIT_CHECK_NO_SPILLS=1`. It does at the previous commit too, with no MN-major operand involved; the existing
+tests don't reach that tile. `test_mn_major_fp8_sm120` skips those small shapes for the UE8M0 kernels.
