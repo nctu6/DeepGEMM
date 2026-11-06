@@ -34,7 +34,8 @@ hardware.
     block-FP8 kernel.
   - End to end on a block-FP8 27B model, TPOT is 1.18-1.55x better.
 - **FP4 vs FlashInfer's MXFP4** (the faster of its `cudnn` and `b12x`
-  backends, the two that run MXFP4 on SM120): after the cost-model refit
+  backends, the two that run MXFP4 on SM120), DeepGEMM kernel against
+  FlashInfer kernel: after the cost-model refit
   (`1b065a2`) DeepGEMM wins 59 of 63 shapes, 1.33x geomean; the other four are
   ties at 0.96-0.99x. See section 7.5.
 - **Also on SM120** (`eff4cea`..`38ef2a2`): NVFP4 (UE4M3 16-element scales);
@@ -614,7 +615,8 @@ Speedup = best FlashInfer time / DeepGEMM time:
 | dense down 7168x2304 | 1.35 | 1.49 | 1.24 | 1.11 | 1.01 | 1.53 | 1.71 | 1.43 | 1.32 |
 
 The table is the run before the cost-model refit, with DeepGEMM winning 60 of
-63 points. After the refit (`1b065a2`, 63 DeepSeek-V3 TP8 points, GPU idle) the
+63 points. After the refit (`1b065a2`, 63 DeepSeek-V3 TP8 points, GPU idle, DeepGEMM kernel
+against FlashInfer MXFP4) the
 geomean speedup rises from 1.315x to 1.33x at 59 of 63 wins. The four ties are
 q_b M=256, o_proj M=128, dense gate_up M=256 and dense down M=128 (0.96-0.99x
 vs b12x). Before the refit the first three were within 0.6 us of b12x (q_b
@@ -709,7 +711,9 @@ reference.
   `deep_gemm.set_pdl(pdl_enabled())` before each call, as the DSA / MoE
   leaves do. DeepGEMM's PDL setting is process-wide, so without this dense
   GEMMs could break the engine's PDL chain. The TokenSpeed kernel suite on
-  SM120 is 7091 passed, 0 failed.
+  SM120 is 7099 passed, 0 failed (2863 skipped). The runtime tests had 0
+  failed in all 10 directories (cache, diffusion, distributed, entrypoints,
+  execution, layers, models, moe, sampling, top), with no hangs.
 
 **MXFP4 leaves** (`f798e68b4`, `f07f3cc54`, `8222224b8`, `63aaaf957`). TokenSpeed
 had no NVIDIA MXFP4 `mm` leaf (the Triton one is AMD-only), so dense MXFP4
@@ -737,7 +741,8 @@ auto-selected; they match the reference to ~1e-6.
   rejects shapes the GEMM can't tile.
 - Whole-op CUDA-graph benchmark (activation quantization included) against
   FlashInfer's quantize plus best `mm_fp4` backend, DeepSeek-V3 TP8 dense
-  linears: the first version (per-call quantize and repack) lost on every
+  linears (this is TokenSpeed's `deepgemm_sm120_mxfp4_linear` leaf measured end
+  to end, not the kernel-only comparison in section 7.5): the first version (per-call quantize and repack) lost on every
   shape (0.10-0.67x). Packed scales: faster on 52 of 63, ~1.15x geomean. With
   the PDL quantizer: **60 of 63, 1.23x geomean**. The three losses are `q_b`
   M=256 (0.90x, the GEMM itself is slower there) and M=1 of `o_proj` and
@@ -868,8 +873,8 @@ MXFP4 (the `deepgemm_sm120_mm_mxfp4`, `_mxfp4_linear` and `_mxfp4_swiglu_linear`
 leaves) and `tf32_hc_prenorm_gemm` (mHC) are used, see section 8.
 
 Other notes:
-- FP4 beats FlashInfer's MXFP4 backends on 59 of 63 points; the other four
-  are ties at 0.96-0.99x (section 7.5).
+- The DeepGEMM FP4 kernel beats FlashInfer's MXFP4 backends on 59 of 63
+  points; the other four are ties at 0.96-0.99x (section 7.5).
 - The V3.2 sparse indexer on SM120 is blocked upstream of DeepGEMM. Its
   kernels work, but TokenSpeed's native DSV4.1 indexer gates on
   `platform.is_blackwell` (arch major 10 only), and the top-k DeepSelect half
@@ -894,12 +899,10 @@ Other notes:
    scope.
 3. DeepSeek-V3/V3.2 TP8 end-to-end run. It needs GPUs 0-7, and only GPU 7 was
    available.
-4. Push the DeepGEMM and TokenSpeed commits, then bump the `DeepGEMM`
-   submodule pointer from `de8cef7` to include `74e1f61`..`9f19e0a`.
-5. Deferred, low value here: k-grouped FP8 / Wgrad and MN-major FP8 operands
+4. Deferred, low value here: k-grouped FP8 / Wgrad and MN-major FP8 operands
    and einsum (`ldmatrix.b8` doesn't exist on sm_120; section 9), and mega
    MoE/gate (NVLink or TMEM/TF32-pipeline rewrites).
-6. Optional: publish a `tokenspeed-deepgemm` wheel from this fork. No longer
+5. Optional: publish a `tokenspeed-deepgemm` wheel from this fork. No longer
    required, since the source build replaces the wheel.
 
 ## 11. Reproducing
