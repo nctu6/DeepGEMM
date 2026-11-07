@@ -216,8 +216,8 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
     print()
 
 
-# MN-major FP8 operands: SM100 only (SM90 and SM120 reject these expressions)
-@test_filter(lambda: get_arch_major() == 10)
+# MN-major FP8 operands: SM100 in-kernel, SM120 one GEMM per head (`ldmatrix.trans.b8`). SM90 still rejects it
+@test_filter(lambda: get_arch_major() in (10, 12))
 def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
     deep_gemm.use_deterministic_algorithms(False)
     print('Testing FP8 "bhd, hdr -> bhr":')
@@ -236,18 +236,22 @@ def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
             z = torch.empty((b, h, r), device='cuda', dtype=torch.bfloat16)
 
             deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z)
+            # SM120's own `mma.sync` accumulation order differs from the SM100 kernel, but the FP8 quantization error
+            # (~1e-3) dominates it, so the `1e-3` tolerance is the same on both
             assert calc_diff(z, ref_z) < 1e-3
 
-            def launch_accumulated(out, acc):
-                assert out is acc
-                tmp = torch.zeros((h, b, r), device='cuda', dtype=torch.float).permute(1, 0, 2)
-                deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, tmp, c=tmp)
-                out.copy_(tmp)
-            z_sr = torch.empty_like(z)
-            deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z_sr,
-                                 epilogue=deep_gemm.epilogue.BF16StochasticRounding())
-            assert_stochastic_bf16_matches_fp32_accumulation(
-                z_sr, launch_accumulated, f'{b=}, {h=}, {r=}, {d=}')
+            # FP32 accumulation into `c` and the BF16 stochastic-rounding epilogue are SM100-only kernel features
+            if get_arch_major() == 10:
+                def launch_accumulated(out, acc):
+                    assert out is acc
+                    tmp = torch.zeros((h, b, r), device='cuda', dtype=torch.float).permute(1, 0, 2)
+                    deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, tmp, c=tmp)
+                    out.copy_(tmp)
+                z_sr = torch.empty_like(z)
+                deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z_sr,
+                                     epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                assert_stochastic_bf16_matches_fp32_accumulation(
+                    z_sr, launch_accumulated, f'{b=}, {h=}, {r=}, {d=}')
 
             t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z), 'gemm_', suppress_kineto_output=True, per_call_total=is_sm120_loop())
             t_cublaslt = bench_cublaslt(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z), 'nvjet', suppress_kineto_output=True)
@@ -259,7 +263,9 @@ def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
     print()
 
 
-@test_filter(lambda: get_arch_major() == 10)
+# MN-major FP8 Wgrad-style einsum with per-channel (1x128) scales: SM100 in one batched launch, SM120 one block-scaled
+# 1D1D GEMM per head (MN-major operands via `ldmatrix.trans.b8`, FP32 D accumulating in-kernel). SM90 still rejects it
+@test_filter(lambda: get_arch_major() in (10, 12))
 def test_fp8_bhd_bhr_hdr(use_ue8m0: bool = True):
     print('Testing FP8 "bhd, bhr -> hdr":')
     for h, r, d in [(8, 4096, 1024)]:
@@ -275,7 +281,13 @@ def test_fp8_bhd_bhr_hdr(use_ue8m0: bool = True):
             y_fp8 = (y_fp8[0].view(b, h, r), y_fp8[1].view(ceil_div(b, 128), h, r))
             z = z_0.clone()
             deep_gemm.fp8_einsum('bhd,bhr->hdr', x_fp8, y_fp8, z, c=z, recipe=(1, 1, 128))
+            # Against the BF16 inputs the error is the FP8 quantization (~7e-4 here), the same on both architectures
             assert calc_diff(z, ref_z) < 1e-3
+            if get_arch_major() == 12:
+                # Against the dequantized FP8 operands only accumulation order differs (measured ~1e-13)
+                xd = x_fp8[0].float() * x_fp8[1].repeat_interleave(128, 0)[:b]
+                yd = y_fp8[0].float() * y_fp8[1].repeat_interleave(128, 0)[:b]
+                assert calc_diff(z, z_0 + torch.einsum('bhd,bhr->hdr', xd, yd)) < 1e-10
 
             t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhd,bhr->hdr', x_fp8, y_fp8, z, c=z, recipe=(1, 1, 128)), 'gemm_', suppress_kineto_output=True, per_call_total=is_sm120_loop())
             print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',

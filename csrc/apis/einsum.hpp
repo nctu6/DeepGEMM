@@ -284,6 +284,46 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     }
 }
 
+// SM120 `fp8_einsum bhd,bhr->hdr`: `D[i] = C[i] + A[:, i].T @ B[:, i]` per head, contracting over `b`. Both operands are
+// MN-major FP8 (read in-kernel with the 8-bit transposing `ldmatrix`), D is FP32 and accumulates onto C in-kernel.
+// The scales are per-channel (1 x 128, one per row and K block of each operand), which the FP32 1D2D kernel cannot take
+// (it reads SFB as 128 x 128 blocks), so this runs on the block-scaled 1D1D kernel with packed UE8M0 scales, packed the
+// way SM100 does (exact for power-of-two scales)
+static void sm120_fp8_bhd_bhr_hdr(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                  const std::pair<torch::Tensor, torch::Tensor>& b,
+                                  const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
+                                  const std::optional<torch::Tensor>& c,
+                                  const std::tuple<int, int, int>& recipe) {
+    DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
+    const auto& D = std::get<torch::Tensor>(d);
+    DG_HOST_ASSERT(D.scalar_type() == torch::kFloat and D.stride(-1) == 1);
+    DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 128) and "SM120 `bhd,bhr->hdr` takes per-channel 1x128 scales");
+
+    // (batch_size, m, n, k): (h, d, r, b)
+    const auto perm_a = a.first.permute({1, 2, 0});
+    const auto perm_sfa = a.second.permute({1, 2, 0});
+    const auto perm_b = b.first.permute({1, 2, 0});
+    const auto perm_sfb = b.second.permute({1, 2, 0});
+
+    const auto [h , m , k ] = get_shape<3>(perm_a);
+    const auto [h_, n , k_] = get_shape<3>(perm_b);
+    const auto [h__, m_, n_] = get_shape<3>(D);
+    DG_HOST_ASSERT(h == h_ and h == h__ and m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(perm_a.scalar_type() == torch::kFloat8_e4m3fn and perm_b.scalar_type() == torch::kFloat8_e4m3fn);
+
+    // Early return for trivial cases; otherwise D holds C (the kernel adds to it) or is overwritten
+    if (h == 0 or gemm::early_return(m, n, k, D, c))
+        return;
+
+    const auto sfa = get_mn_major_tma_aligned_packed_ue8m0_tensor(perm_sfa);
+    const auto sfb = get_mn_major_tma_aligned_packed_ue8m0_tensor(perm_sfb);
+    check_sf_layout(sfa, m, k, 1, 128, h, true, false, torch::kInt);
+    check_sf_layout(sfb, n, k, 1, 128, h, true, false, torch::kInt);
+    for (int i = 0; i < h; ++ i)
+        sm120_fp8_fp4_gemm_1d1d(perm_a[i], sfa[i], perm_b[i], sfb[i], c.has_value() ? std::make_optional(D[i]) : std::nullopt,
+                                D[i], m, n, k, 128, 128, cute::UMMA::Major::MN, cute::UMMA::Major::MN, "mn", 1.0f);
+}
+
 static void fp8_einsum(const std::string& expr,
                        const std::pair<torch::Tensor, torch::Tensor>& a,
                        const std::pair<torch::Tensor, torch::Tensor>& b,
@@ -310,8 +350,9 @@ static void fp8_einsum(const std::string& expr,
             std::get<torch::Tensor>(perm_d) = std::get<torch::Tensor>(perm_d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", epilogue_class);
-    } else if (expr == "bhd,hdr->bhr" and arch_major == 10) {
-        // (batch_size, m, n, k): (h, b, r, d)
+    } else if (expr == "bhd,hdr->bhr" and (arch_major == 10 or arch_major == 12)) {
+        // (batch_size, m, n, k): (h, b, r, d). K-major A and MN-major B: SM100 in one batched launch, SM120 one GEMM per
+        // head on strided views (the 8-bit transposing `ldmatrix` reads the MN-major B). Plain BF16 D, no accumulation
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
         const auto perm_a = a.first.permute({1, 0, 2});
         const auto perm_sfa = a.second.permute({1, 0, 2});
@@ -328,8 +369,11 @@ static void fp8_einsum(const std::string& expr,
         const auto perm_b = b.first.permute({1, 2, 0});
         const auto perm_sfb = b.second.permute({1, 2, 0});
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn", epilogue_class);
+    } else if (expr == "bhd,bhr->hdr" and arch_major == 12) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        sm120_fp8_bhd_bhr_hdr(a, b, d, c, recipe);
     } else if (expr == "bhd,hdr->bhr" or expr == "bhd,bhr->hdr") {
-        DG_HOST_UNREACHABLE(std::format("fp8_einsum `{}` needs MN-major FP8 operands, supported on SM100 only", expr));
+        DG_HOST_UNREACHABLE(std::format("fp8_einsum `{}` has no kernel on this architecture", expr));
     } else {
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
     }
