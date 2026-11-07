@@ -625,6 +625,30 @@ runs each.
 - Greedy outputs match the baseline (similarity 0.92-1.00, with only late
   divergence).
 
+#### DSA model (task 13.3)
+
+No DeepSeek-V3.2, GLM-5.x or dots3-note checkpoint exists on the box, so the
+check runs a 4-layer `DeepseekV32ForCausalLM` with real dimensions (128 heads,
+kv 512+64, indexer 64x128, top-k 2048) and random weights through the real
+model class and the in-process `Engine` (GPU 6/7, CUDA graphs). The DeepGEMM
+indexer leaves and `triton_dsa_mma_*` are selected, and the old path is forced
+with `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_{DECODE,PREFILL}=triton_dsa_*`.
+
+| context x batch | prefill tok/s (new / old) | TPOT ms (new / old) |
+|---|---|---|
+| 1024 x 32 | 71558 / 753 (95x) | 3.85 / 55.3 (14.4x) |
+| 4096 x 1 | 41032 / 499 (82x) | 2.63 / 5.40 (2.05x) |
+| 4096 x 8 | 44081 / 496 (89x) | 3.33 / 22.8 (6.9x) |
+| 16384 x 1 | 37137 / 405 (92x) | 2.65 / 5.56 (2.10x) |
+| 32768 x 1 | 35178 / 393 (90x) | 2.66 / 5.77 (2.17x) |
+
+Prompt logprobs differ from the old path by a mean 0.14-0.32 nats (about one
+BF16 logit ulp, and less than the difference between two chunkings of the old
+path); the last-position top-1 token is identical in 4 of 4 contexts. Decode
+over 2048 tokens is not bit-reproducible on either path, so greedy
+continuations are only comparable for a few steps. No SM120 failure was found.
+Details: `deepgemm-analysis.md` section 9.18.
+
 ### 7.5 Block-scaled GEMMs (FP4 and UE8M0 FP8)
 
 Same method as 7.2 (CUDA graph, cold weights, TP8 DeepSeek-V3 linears). Times
@@ -922,6 +946,12 @@ that none is offered to an SM120 platform and Triton still is. The DeepGEMM DSA
 top-k leaves also use a stable-sort fallback for batch-invariant selection
 where flashinfer's FilteredTopK can't run (99 KiB shared memory; `a6d0f1682`).
 
+**DSA end to end** (task 13.3, `analysis` section 9.18). A 4-layer V3.2 with
+real dimensions and random weights runs through `DeepseekV32ForCausalLM` and
+`Engine` on SM120 with the DeepGEMM indexer leaves and `triton_dsa_mma_*`
+selected: prefill 82-95x and TPOT 2.0-14.4x better than forced `triton_dsa_*`,
+no SM120 failure (section 7.4).
+
 **DSA sparse attention** (task 13.2, `analysis` section 9.17). SM120 served
 `dsa_decode` / `dsa_prefill` with `triton_dsa_*`, one CUDA-core program per
 (token, head). The new `triton_dsa_mma_decode` / `triton_dsa_mma_prefill`
@@ -1074,8 +1104,9 @@ Other notes:
    speedup. A Reindex scorer for FP8 rows that reads only the candidate pool
    (DeepGEMM's sparse MQA kernel) or a paged FP4 MQA kernel would remove that
    trade. Out of DeepGEMM scope unless one of those kernels is added.
-3. DeepSeek-V3/V3.2 TP8 end-to-end run. It needs GPUs 0-7, and only GPU 7 was
-   available.
+3. DeepSeek-V3/V3.2 TP8 end-to-end run with a real checkpoint. It needs GPUs
+   0-7, and only GPU 7 was available. A reduced-layer V3.2 with random weights
+   ran on one GPU (section 7.4, task 13.3).
 4. Deferred, low value here: mega MoE/gate (NVLink or TMEM/TF32-pipeline
    rewrites). Closed since the last report: MN-major FP8 operands, k-grouped
    FP8, the MN-major `fp8_einsum` expressions (all heads in one launch), paged
