@@ -1095,3 +1095,41 @@ strided-batched launch, while this path launches `h` GEMMs (about 1.5 us each, w
 `bhd,bhr->hdr` many-head, small-tile case is worst because its per-head GEMM is also launch- and tile-bound (M = d = 128). A
 single batched launch would need 3D TMA descriptors in the SM120 kernels (the same reason `fp8_bmm` loops). `fp8_einsum` is an
 explicit API with no default to switch, so callers with many small heads should keep the BF16 cuBLASLt einsum.
+
+## Paged MQA logits with head dim 32 and 64 on SM120 (task 11.4)
+
+Source check: the SM90 paged kernel accepts head dim 32, 64 and 128 with H in {32, 64} and next_n in {1, 2}
+(`sm90_fp8_mqa_logits.hpp`, `attention.hpp`). The SM100 paged kernel is varlen-only (next_n 1, `indices` required) and takes
+H multiples of 4 up to 128 with head dim 32/64/128 (64/128 for MXFP4); that is a different API, which SM120 does not expose
+(`DG_HOST_ASSERT(is_varlen == (arch_major == 10))`). So the SM120 target is the SM90 set, and it is now met: head dim 32, 64, 128
+x H {32, 64} x next_n {1, 2}. The host rejection is replaced by an assert that names the supported dims.
+
+Design (one kernel path, head dim a template parameter):
+- `warp_mma_16xNxHd_ss<N, kHeadDim>` already looped over `kHeadDim / 32` K steps; the paged kernel was just passing 128. Head dim 32
+  needs a third TMA swizzle mode in `get_swizzle_offset`: 32B rows use `Swizzle<1, 4, 3>` (address bit 7 into bit 4), i.e.
+  `chunk ^= (row / 4) % 2`.
+- Tile bases must be 1024B-aligned for the manual swizzle, but SM90 uses `kHeadDim * 8` as the alignment (256 B for head dim 32,
+  512 B for 64). Kernel and host now use `max(kHeadDim * 8, 1024)`, so the smem layout is identical in both.
+- Stage selection is unchanged ((3,3), (2,3), (2,2), (2,1) with at least 2 Q stages, the deadlock rule above). Smaller head dims need
+  less smem, so they get deeper pipelines than head dim 128. Proxy-fence placement is untouched.
+
+Validation (GPU 7, fresh JIT cache, `DG_JIT_CHECK_NO_SPILLS=1`, timeouts on every run): `scripts/sm120_mqa_check.py` runs 13 paged cases per
+head dim (128, 64, 32): B 3-128, next_n 1/2, H 32/64, contexts up to 20K, including the B>=32 and next_n=2 pipeline-wrapping cases. All 39
+match the dequantized reference with diff <= 4.1e-14 (the paged assert is now 1e-12). `tests/test_attention.py` passes on SM120 with
+the new head dims enabled (paged only; the contiguous kernel stays at 64/128), no spills.
+
+Performance (`scripts/sm120_paged_mqa_bench.py`, cold L2, best of 3 x 30 calls; "KV GB/s" = bytes of KV read / time):
+
+| B | next_n | H | ctx | D=128 (c5a9656 -> new) | D=64 | D=32 |
+|---|---|---|---|---|---|---|
+| 32 | 1 | 64 | 8192 | 43.9 -> 43.8 us | 29.1 us | 23.0 us |
+| 32 | 2 | 64 | 8192 | 45.8 -> 45.8 us | 29.7 us | 23.4 us |
+| 64 | 1 | 32 | 8192 | 76.7 -> 76.9 us | 45.7 us | 33.5 us |
+| 128 | 1 | 64 | 4096 | 77.8 -> 77.6 us | 46.0 us | 33.7 us |
+| 8 | 1 | 64 | 32768 | 43.9 -> 44.2 us | 28.7 us | 23.1 us |
+| 64 | 2 | 32 | 4096 | 44.5 -> 44.4 us | 29.5 us | 23.5 us |
+
+Head dim 128 is unchanged within noise (two interleaved runs each, baseline built from c5a9656). The new dims run at 400-780 GB/s of KV
+traffic against 750-900 GB/s for head dim 128; the short cases are bounded by the fixed launch and tail cost (about 20 us), not by
+bandwidth, and the 64-wide cases with enough work (B=64 H=32, B=128) reach 775 GB/s. The TokenSpeed Triton op
+(`triton_dsa_decode_topk_fp8`) only registers `head_dim=128`, so there is no Triton number to compare at 32 or 64.
