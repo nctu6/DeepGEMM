@@ -89,6 +89,16 @@ struct SM120ArchSpec {
         return (warp_m / 16) * (warp_n / 8) * 4 <= kNumMaxAccumPerThread;
     }
 
+    // PDL trigger point of the block-scaled FP4 kernel (see the kernel's producer). Triggering as soon as the last load is
+    // issued lets the next kernel's launch and weight pre-issue overlap with our last K blocks. On the 63-point DeepSeek-V3
+    // TP8 sweep (`scripts/sm120_fp4_vs_flashinfer.py`) that wins 4-20% when the grid leaves the SMs mostly free (<= 60% of
+    // them: q_b M = 128-512, o_proj / dense down M = 32-256, decode GEMMs), and loses 4-11% on grids that fill 68-77% of
+    // them (q_a M = 128-512, shared gate_up M = 512 / 2048, dense gate_up M = 256), where the next kernel's early weight
+    // loads compete with our last stages for DRAM
+    static bool use_early_pdl_trigger(const GemmDesc& desc, const int& num_ctas) {
+        return desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.gemm_type == GemmType::Normal and
+               num_ctas * 10 <= desc.num_sms * 6;
+    }
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         // 1D2D: FP32 scales promoted on CUDA cores; 1D1D: packed UE8M0 scales applied by the block-scaled MMA
         // NoSF: BF16 operands on the 1D1D kernel

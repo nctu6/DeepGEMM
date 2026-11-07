@@ -259,7 +259,8 @@ def main():
                           f'acc={int(accumulate)} in_place={int(in_place)}  diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
     if args.repeat:
         for mode in modes:
-            for (m, n, k) in [(128, 7168, 2048), (64, 4608, 7168), (1, 2112, 7168), (4096, 4096, 7168), (256, 3072, 1536)]:
+            for (m, n, k) in [(128, 7168, 2048), (64, 4608, 7168), (1, 2112, 7168), (4096, 4096, 7168), (256, 3072, 1536),
+                              (128, 7168, 2304)]:  # grids on <= 60% of the SMs trigger PDL early, see `use_early_pdl_trigger`
                 bad = run_repeat(mode, m, n, k, args.repeat)
                 failed |= bad > 0
                 print(f'[{mode:7s}] determinism m={m:5d} n={n:5d} k={k:5d}  {bad}/{args.repeat} runs differ  {"ok" if bad == 0 else "FAIL"}', flush=True)

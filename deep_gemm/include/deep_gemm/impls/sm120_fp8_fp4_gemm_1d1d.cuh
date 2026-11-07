@@ -62,7 +62,7 @@ template <bool kIsFP4, bool kIsBF16, uint32_t kGranK,
           uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumSMs, GemmType kGemmType,
-          bool kUseStreamK, bool kWithAccumulation,
+          bool kUseStreamK, bool kWithAccumulation, bool kEarlyPdlTrigger,
           typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, uint64_t d_stride_g, float alpha,
@@ -366,12 +366,17 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                 is_first_task = false;
             }
             // PDL: let the next kernel launch (it still waits for this grid to complete and flush before reading anything
-            // it produced), once its early weight loads no longer compete with ours for DRAM:
-            //  - short K (all K blocks fit in the pipeline): every load is issued now, so trigger here
-            //  - otherwise the math warps trigger when their mainloop ends (below)
-            // Measured (FP4 64x128, graph replay): triggering at kernel start was slower at every K; after the last load
-            // vs. at the end of the mainloop: K = 512 4.40 vs 4.78 us, K = 7168 21.0 vs 19.5 us
-            if (num_k_blocks <= kNumStages)
+            // it produced). Its launch, barrier setup and early weight loads then overlap with our last K blocks. When to
+            // trigger depends on how much of the GPU our grid leaves free:
+            //  - `kEarlyPdlTrigger` (host rule: the grid fills at most 60% of the SMs): as soon as our last load is
+            //    issued. The next kernel's CTAs have idle SMs to start on, and its early weight loads hide a launch that
+            //    would otherwise sit on the critical path (FP4 q_b M = 256: 5.8 -> 5.2 us, o_proj M = 128: 7.9 -> 7.0 us)
+            //  - otherwise, short K (all K blocks fit in the pipeline): every load is issued now, so trigger here
+            //  - otherwise the math warps trigger when their mainloop ends (below). On a grid that fills most of the SMs
+            //    the next kernel's early weight loads compete with our last stages for DRAM and slow the mainloop
+            //    (FP4 dense gate_up M = 256: 19.3 -> 21.3 us when triggered at the last load)
+            // Measured (FP4 64x128, graph replay): triggering at kernel start was slower at every K
+            if (kEarlyPdlTrigger or num_k_blocks <= kNumStages)
                 cudaTriggerProgrammaticLaunchCompletion();
         }
     } else {
@@ -632,7 +637,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
             }
 
             // PDL (long K, see the producer): the mainloop of this CTA is done
-            if (num_k_blocks > kNumStages)
+            if (not kEarlyPdlTrigger and num_k_blocks > kNumStages)
                 cudaTriggerProgrammaticLaunchCompletion();
 
             // Write back results directly from registers: D = alpha * accum (+ D)

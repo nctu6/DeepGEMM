@@ -33,6 +33,7 @@ public:
         bool is_fp4, is_bf16;
         int gran_k;
         bool use_stream_k;
+        bool early_pdl_trigger;
         void *grouped_layout, *d;
         int ld_d;
         int64_t d_stride_g;   // Batched: elements between the D of consecutive batches
@@ -61,7 +62,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {}, {},
+        {}, {}, {},
         {}
     >);
 }};
@@ -78,6 +79,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
         args.use_stream_k ? "true" : "false", args.gemm_desc.with_accumulation ? "true" : "false",
+        args.early_pdl_trigger ? "true" : "false",
         to_string(args.gemm_desc.cd_dtype)));
 
         jit->launch(
@@ -175,18 +177,20 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
                                                  config.storage_config.load_block_n, gran_k, num_groups_sfb, 0, 0, false,
                                                  num_sf_words_per_block, static_cast<int>(sfb.stride(-1)));
 
+    // Data-parallel normal GEMMs launch one CTA per tile when there are fewer tiles than SMs: idle persistent CTAs still
+    // pay for dispatch and their prologue, and under PDL they sit between this kernel and the next. The scheduler strides
+    // by the compile-time SM count, so each launched CTA still gets exactly its own tile
+    const int num_ctas = stream_k.num_ctas > 0 ? stream_k.num_ctas :
+                         (desc.gemm_type == GemmType::Normal or is_batched ?
+                              std::min(config.launch_config.num_sms, SM120ArchSpec::get_num_tiles(desc, config.layout)) :
+                              config.launch_config.num_sms);
+    const bool early_pdl_trigger = SM120ArchSpec::use_early_pdl_trigger(desc, num_ctas);
     SM120FP8FP4Gemm1D1DRuntime::compile_and_launch(tag, {
         .gemm_desc = desc,
         .gemm_config = config,
         .options = {
             .num_smem_bytes = config.pipeline_config.smem_size,
-            // Data-parallel normal GEMMs launch one CTA per tile when there are fewer tiles than SMs: idle persistent CTAs
-            // still pay for dispatch and their prologue, and under PDL they sit between this kernel and the next. The
-            // scheduler strides by the compile-time SM count, so each launched CTA still gets exactly its own tile
-            .grid_dim = dim3(stream_k.num_ctas > 0 ? stream_k.num_ctas :
-                             (desc.gemm_type == GemmType::Normal or is_batched ?
-                                  std::min(config.launch_config.num_sms, SM120ArchSpec::get_num_tiles(desc, config.layout)) :
-                                  config.launch_config.num_sms), 1, 1),
+            .grid_dim = dim3(num_ctas, 1, 1),
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(1, 1, 1),
         },
@@ -194,6 +198,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
         .is_bf16 = is_bf16,
         .gran_k = gran_k,
         .use_stream_k = stream_k.num_ctas > 0,
+        .early_pdl_trigger = early_pdl_trigger,
         .grouped_layout = grouped_layout,
         .d = d.data_ptr(),
         .ld_d = static_cast<int>(d.stride(-2)),
