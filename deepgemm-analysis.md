@@ -17,9 +17,9 @@ new work so we don't drift into one of the known dead ends.
   - **Block-scaled GEMMs** (`fp8_fp4_gemm_nt` and the m-grouped contiguous / masked variants): **MXFP4** (E2M1, 32-element UE8M0 scales), **NVFP4** (E2M1, 16-element UE4M3 scales, `scale_vec::4X`), and FP8 with 32- or 128-element UE8M0 scales. The tensor core applies the scales (`kind::mxf4nvf4` m16n8k64, `kind::mxf8f6f4` m16n8k32). BF16 or FP32 output, optional `alpha` and C accumulation. Includes the PSUM layout, BLOCK_N = 32 tiles, 64-byte FP4 K blocks, PDL weight pre-issue, and stream-K for few-tile decode. The cost model is fitted jointly on all three modes. See section 5.6 and the status log.
   - **BF16 GEMMs** on the same kernel: `bf16_gemm_nt` (cuBLASLt stays the default unless deterministic mode; `alpha` and C accumulation supported), `m_grouped_bf16_gemm_nt_contiguous` (incl. PSUM), `m_grouped_bf16_gemm_nt_masked`. **MN-major BF16 operands** (`bf16_gemm_nn/tn/tt`, a grouped MN-major B) and **`k_grouped_bf16_gemm_tn_contiguous`** also run, see section 9.9.
   - **`tf32_hc_prenorm_gemm`** (TF32 `m16n8k8`): `d = a @ b.T` and the row squared-norm, with K-split.
-  - **`einsum`**: `bmk,bnk->mn` (BF16), and native BF16 `bhr,hdr->bhd` and `bhd,hdr->bhr` (one GEMM per head). **`fp8_einsum`** `bhr,hdr->bhd` (via a per-batch FP32-scale GEMM).
+  - **`einsum`**: `bmk,bnk->mn` (BF16), and native BF16 `bhr,hdr->bhd` and `bhd,hdr->bhr` (one GEMM per head). **`fp8_einsum`** `bhr,hdr->bhd` (via a per-batch FP32-scale GEMM), and the MN-major `bhd,hdr->bhr` and `bhd,bhr->hdr` (one GEMM per head, section 9.12).
 - **Done since this section was first written (2026-11-05/06):** sparse MQA logits (`fp8_fp4_sparse_mqa_logits` + paged + the two metadata entry points) and **block-scaled MXFP8/MXFP4 dense MQA logits** (`fp8_fp4_mqa_logits` MX path for arch 12). Both validated against a dequantized reference (`scripts/sm120_sparse_mqa_check.py`, `sm120_sparse_paged_check.py`, `sm120_mqa_blockscale_check.py`), diff ~1e-6.
-- **Still not implemented on sm120** (rejected at the host): paged MQA with head dim != 128 (section 11.4); **MN-major `fp8_einsum`** `bhd,hdr->bhr` and `bhd,bhr->hdr` (section 11.3 — no hardware blocker now that `ldmatrix.trans.b8` is used, section 9.10, just not yet wired); mega MoE/gate/mHC (NVLink symmetric memory or TMEM/UMMA). MN-major FP8 GEMM operands (9.10) and k-grouped FP8 GEMMs (9.11) are now done. See sections 8, 9.9, 9.10 and 9.11.
+- **Still not implemented on sm120** (rejected at the host): paged MQA with head dim != 128 (section 11.4); mega MoE/gate/mHC (NVLink symmetric memory or TMEM/UMMA). MN-major FP8 GEMM operands (9.10), k-grouped FP8 GEMMs (9.11) and the MN-major `fp8_einsum` expressions (9.12) are now done. See sections 8, 9.9, 9.10, 9.11 and 9.12.
 - **Implemented on sm120 but unused by TokenSpeed on this box:** the m-grouped contiguous (incl. psum) and masked FP8 GEMMs have real `arch_major == 12` branches (`gemm.hpp`) and pass `test_fp8_fp4.py`. TokenSpeed only reaches them through DeepEP MoE, which needs NVLink/RDMA (this box is PCIe-only), so nothing calls them here.
 - **Tests (GPU 7):** `tests/test_fp8_fp4.py` passes (k-grouped FP8 now enabled, section 9.11); `tests/test_bf16.py` and `tests/test_einsum.py` run on SM120 (section 9.9). `scripts/sm120_mqa_check.py` passes. The TokenSpeed tests pass (17).
 - **Performance vs the TokenSpeed sm120 fallbacks:**
@@ -511,11 +511,9 @@ host still rejects them, so there is no silent wrong path):
 - **Sparse MQA logits** and **block-scaled MXFP8/MXFP4 dense MQA logits**: DONE
   (2026-11-06, section 9.6). Both ship for arch 12 and are validated against a
   dequantized reference. No longer deferred.
-- **MN-major `fp8_einsum`** (`fp8_einsum` `bhd,hdr->bhr` / `bhd,bhr->hdr`): training only, no inference caller. The host
-  still rejects these with "needs MN-major FP8 operands, supported on SM100 only" (section 11.3, not yet done). The reason
+- **MN-major `fp8_einsum`** (`fp8_einsum` `bhd,hdr->bhr` / `bhd,bhr->hdr`): no longer here, done in section 9.12. The reason
   given here earlier, that MN-major FP8 needs a byte-granular transpose and `ldmatrix.b8` doesn't exist on sm_120, was
-  wrong: `ldmatrix.m16n16.x{1,2}.trans.b8` exists on sm_120a/f (section 9.10), so MN-major FP8 GEMM operands are now
-  supported and the einsum is no longer blocked on hardware. **k-grouped FP8 GEMMs / Wgrad** are no longer here:
+  wrong: `ldmatrix.m16n16.x{1,2}.trans.b8` exists on sm_120a/f (section 9.10). **k-grouped FP8 GEMMs / Wgrad** are no longer here:
   `k_grouped_fp8_gemm_tn_contiguous` / `_nt_contiguous` ship for arch 12 (section 9.11), running one MN-major block-scaled
   GEMM per group. FP4 dense MQA is no longer here either: it is done, section 9.6.
 - **Mega MoE**: its point is NVLink symmetric-memory dispatch/combine across
@@ -878,7 +876,7 @@ Commits on `nctu6` after `df1bb16`, not pushed.
   kept now; the offsets are recomputed at each load. 0 B. Masked FP8 sweep: within
   +-0.4% on 20 of 26 configs, 0.8-2.5% faster on 6, none slower beyond noise.
 
-Limits that remain on SM120: k-grouped FP8 and MN-major FP8 einsum (section 8; MN-major FP8 GEMM operands are in section 9.10).
+Limits that remained on SM120 at that point: k-grouped FP8 and MN-major FP8 einsum. MN-major FP8 GEMM operands are in section 9.10, k-grouped FP8 in 9.11, the einsum in 9.12.
 
 ## 9.10 MN-major FP8 operands (2026-11-06)
 
@@ -976,7 +974,7 @@ tests don't reach that tile. `test_mn_major_fp8_sm120` skips those small shapes 
 ## 9.11 K-grouped FP8 GEMM (weight gradients) (2026-11-07)
 
 `k_grouped_fp8_gemm_tn_contiguous` and `k_grouped_fp8_gemm_nt_contiguous` now run on SM120, closing one of the two
-remaining FP8 limits from section 8 (MN-major FP8 einsum, section 11.3, is the other). This is the Wgrad shape of MoE
+remaining FP8 limits from section 8 (the other, MN-major FP8 einsum, is done in section 9.12). This is the Wgrad shape of MoE
 training: a batch of GEMMs that share M and N but have a different K per group, laid end to end along K, with the group
 sizes known on the host.
 
@@ -1028,3 +1026,72 @@ Verified with `DG_JIT_CHECK_NO_SPILLS=1` and a fresh cache: `test_fp8_fp4.py`, `
 (the 16×32 stream-K UE8M0 spill from 9.10 stays skipped). K-major shapes do not regress: `scripts/sm120_bench_kmajor.py`
 1D1D timings are unchanged (the shared K-major kernel code is untouched; only the host k-grouped dispatch and the arch
 gating in the scale-layout helpers changed).
+
+## 9.12 MN-major `fp8_einsum` (2026-11-07)
+`fp8_einsum` `bhd,hdr->bhr` and `bhd,bhr->hdr` now run on SM120 (task 11.3), closing the last FP8 limit from section 8. Like the
+native BF16 einsum (74e1f61), each runs one GEMM per head on strided views; the MN-major operands are read in-kernel with the
+8-bit transposing `ldmatrix` (9.10).
+- **`bhd,hdr->bhr`** (`(batch, m, n, k) = (h, b, r, d)`): K-major A, MN-major B, 128x128 FP32 scales, BF16 D. It is just the
+  existing per-batch SM120 branch of `fp8_bmm` (`sm120_fp8_gemm_1d2d`, which derives the majors from the strides); the only
+  change is that the arch-10-only gate in `fp8_einsum` is gone.
+- **`bhd,bhr->hdr`** (`(h, d, r, b)`): both operands MN-major, per-channel 1x128 scales (`recipe=(1,1,128)`), FP32 D that
+  accumulates onto C. This does *not* fit `fp8_bmm`'s SM120 branch, for two reasons: the 1D2D kernel writes only BF16 with no
+  accumulation, and it reads SFB as 128x128 blocks. So it runs on the block-scaled `sm120_fp8_fp4_gemm_1d1d` (FP32 D,
+  in-kernel accumulation, `gran_k` 128) per head, with both scale tensors packed to UE8M0 the way SM100 packs them (exact for
+  power-of-two scales, as `per_channel_cast_to_fp8(use_ue8m0=True)` produces).
+- **A false start worth recording.** The first version sent `bhd,bhr->hdr` through the 1D2D kernel with a BF16 scratch and a
+  host FP32 add. It built and ran, and the test failed at `calc_diff` 0.030. Comparing against a dequantized reference showed
+  the *product* was wrong (0.030) while the quantization error alone was 7e-4: the per-channel SFB was read as block scales.
+  `fp8_bmm`'s SM120 branch asserts only the SF dtype and `gran_k`, not the N granularity, so it accepts a per-channel SFB
+  silently. That is a latent hole for any caller passing `(1, 1, 128)` through `fp8_bmm` on SM120; it is not reachable from
+  `fp8_einsum` any more, but is not closed in `fp8_bmm` itself.
+- **Tolerance.** Against the BF16 inputs the error is FP8 quantization, ~7e-4 for `bhd,bhr->hdr` (b = 4096 and 8192), the same
+  as SM100, so the existing `calc_diff < 1e-3` is kept. That is only ~30% above pure quantization error, so on SM120 the test
+  also compares to the dequantized FP8 operands at 1e-10 (measured 1e-13 for `bhd,bhr->hdr`, 1.4e-6 for `bhd,hdr->bhr`, which
+  is BF16 output rounding). Unlike the BF16 einsum (1e-7 against cuBLAS), no loosening is needed: the FP8 quantization error
+  swamps the `mma.sync` accumulation-order difference.
+- **Still rejected, with clear errors.** Accumulation (`c`) and custom epilogues / the FP8 output pair for `bhd,hdr->bhr` on SM120
+  ("Custom epilogues require SM100", "SM120 FP8 bmm does not support accumulation"); `bhd,bhr->hdr` accepts `c` and only
+  `recipe=(1,1,128)`. SM90 gets "has no kernel on this architecture".
+
+Verified with `DG_JIT_CHECK_NO_SPILLS=1` and fresh caches: `test_einsum.py`, `test_fp8_fp4.py` and `test_bf16.py` pass. Edge shapes
+(unaligned `d`/`r` that take the host-transpose fallback, `b` not a multiple of 16, a single token, `c` aliased / separate /
+absent) match the dequantized reference.
+
+**Benchmark** (GPU 7, CUDA graph, best of 3 interleaved rounds, us per call, e4m3 + UE8M0 scales). "BF16 DG" is the
+deterministic native per-head BF16 kernel (74e1f61); "cuBLASLt" is `deep_gemm.einsum` with deterministic mode off; "loop" is a
+per-head `torch.matmul` on BF16 (for `bhd,bhr->hdr` plus an FP32 add per head).
+
+`bhd,hdr->bhr`:
+
+| h, r, d | b | FP8 | BF16 DG | cuBLASLt | torch loop | FP8 vs BF16 DG | vs loop |
+|---|---|---|---|---|---|---|---|
+| 8, 4096, 1024 | 4 | 33.9 | 41.8 | 18.4 | 59.3 | 1.24x | 1.75x |
+| 8, 4096, 1024 | 32 | 36.7 | 44.9 | 18.8 | 72.1 | 1.22x | 1.97x |
+| 8, 4096, 1024 | 128 | 48.8 | 62.1 | 33.4 | 58.8 | 1.27x | 1.21x |
+| 8, 4096, 1024 | 4096 | 517 | 793 | 753 | 801 | 1.53x | 1.55x |
+| 8, 4096, 1024 | 8192 | 969 | 1486 | 1500 | 1599 | 1.53x | 1.65x |
+| 128, 512, 128 | 4 | 191 | 225 | 8.7 | 321 | 1.18x | 1.68x |
+| 128, 512, 128 | 32 | 193 | 227 | 9.2 | 275 | 1.17x | 1.42x |
+| 128, 512, 128 | 128 | 194 | 233 | 16.6 | 283 | 1.20x | 1.46x |
+| 128, 512, 128 | 4096 | 613 | 757 | 483 | 818 | 1.24x | 1.33x |
+| 128, 512, 128 | 8192 | 1049 | 1081 | 979 | 1372 | 1.03x | 1.31x |
+
+`bhd,bhr->hdr` (FP32 D accumulate; BF16 baseline is the cuBLASLt path, which is the only BF16 path for this expression):
+
+| h, r, d | b | FP8 | cuBLASLt | torch loop | FP8 vs cuBLASLt | vs loop |
+|---|---|---|---|---|---|---|
+| 8, 4096, 1024 | 128 | 337 | 180 | 235 | 0.54x | 0.70x |
+| 8, 4096, 1024 | 4096 | 660 | 796 | 1006 | 1.21x | 1.53x |
+| 8, 4096, 1024 | 8192 | 1164 | 1512 | 1689 | 1.30x | 1.45x |
+| 128, 512, 128 | 128 | 435 | 23 | 588 | 0.05x | 1.35x |
+| 128, 512, 128 | 4096 | 1345 | 489 | 1408 | 0.36x | 1.05x |
+| 128, 512, 128 | 8192 | 2030 | 930 | 1874 | 0.46x | 0.92x |
+
+Reading it: the FP8 einsum beats DeepGEMM's own per-head BF16 kernel everywhere (1.03-1.53x) and the per-head torch loop almost
+everywhere, and beats cuBLASLt only at large `b` with few big heads (1.2-1.5x at h = 8, b >= 4096 for both expressions). It
+loses badly to cuBLASLt when `b` is small or there are many small heads (h = 128: 8.7 us vs 191 us): cuBLASLt issues one
+strided-batched launch, while this path launches `h` GEMMs (about 1.5 us each, which is what the 190 us at h = 128 is). The
+`bhd,bhr->hdr` many-head, small-tile case is worst because its per-head GEMM is also launch- and tile-bound (M = d = 128). A
+single batched launch would need 3D TMA descriptors in the SM120 kernels (the same reason `fp8_bmm` loops). `fp8_einsum` is an
+explicit API with no default to switch, so callers with many small heads should keep the BF16 cuBLASLt einsum.
