@@ -19,9 +19,9 @@ new work so we don't drift into one of the known dead ends.
   - **`tf32_hc_prenorm_gemm`** (TF32 `m16n8k8`): `d = a @ b.T` and the row squared-norm, with K-split.
   - **`einsum`**: `bmk,bnk->mn` (BF16), and native BF16 `bhr,hdr->bhd` and `bhd,hdr->bhr` (one GEMM per head). **`fp8_einsum`** `bhr,hdr->bhd` (via a per-batch FP32-scale GEMM).
 - **Done since this section was first written (2026-11-05/06):** sparse MQA logits (`fp8_fp4_sparse_mqa_logits` + paged + the two metadata entry points) and **block-scaled MXFP8/MXFP4 dense MQA logits** (`fp8_fp4_mqa_logits` MX path for arch 12). Both validated against a dequantized reference (`scripts/sm120_sparse_mqa_check.py`, `sm120_sparse_paged_check.py`, `sm120_mqa_blockscale_check.py`), diff ~1e-6.
-- **Still not implemented on sm120** (rejected at the host, genuinely blocked on this SKU): paged MQA with head dim != 128; **k-grouped FP8 GEMMs** and **MN-major FP8/FP4 operands**, including `fp8_einsum` `bhd,hdr->bhr` and `bhd,bhr->hdr` (an MN-major FP8 operand needs a byte-granular transpose-on-load, and `ldmatrix.b8` doesn't exist on sm_120); mega MoE/gate/mHC (NVLink symmetric memory or TMEM/UMMA). See sections 8 and 9.9.
+- **Still not implemented on sm120** (rejected at the host): paged MQA with head dim != 128 (section 11.4); **MN-major `fp8_einsum`** `bhd,hdr->bhr` and `bhd,bhr->hdr` (section 11.3 — no hardware blocker now that `ldmatrix.trans.b8` is used, section 9.10, just not yet wired); mega MoE/gate/mHC (NVLink symmetric memory or TMEM/UMMA). MN-major FP8 GEMM operands (9.10) and k-grouped FP8 GEMMs (9.11) are now done. See sections 8, 9.9, 9.10 and 9.11.
 - **Implemented on sm120 but unused by TokenSpeed on this box:** the m-grouped contiguous (incl. psum) and masked FP8 GEMMs have real `arch_major == 12` branches (`gemm.hpp`) and pass `test_fp8_fp4.py`. TokenSpeed only reaches them through DeepEP MoE, which needs NVLink/RDMA (this box is PCIe-only), so nothing calls them here.
-- **Tests (GPU 7):** `tests/test_fp8_fp4.py` passes (k-grouped FP8 skipped); `tests/test_bf16.py` and `tests/test_einsum.py` run on SM120 (section 9.9). `scripts/sm120_mqa_check.py` passes. The TokenSpeed tests pass (17).
+- **Tests (GPU 7):** `tests/test_fp8_fp4.py` passes (k-grouped FP8 now enabled, section 9.11); `tests/test_bf16.py` and `tests/test_einsum.py` run on SM120 (section 9.9). `scripts/sm120_mqa_check.py` passes. The TokenSpeed tests pass (17).
 - **Performance vs the TokenSpeed sm120 fallbacks:**
   - Dense decode is 1.2-4x faster at TP8 shapes; dense prefill is on par with FlashInfer.
   - The DSA indexer is 3-19x faster for decode and 8-52x faster for prefill.
@@ -511,13 +511,13 @@ host still rejects them, so there is no silent wrong path):
 - **Sparse MQA logits** and **block-scaled MXFP8/MXFP4 dense MQA logits**: DONE
   (2026-11-06, section 9.6). Both ship for arch 12 and are validated against a
   dequantized reference. No longer deferred.
-- **k-grouped FP8 GEMMs / Wgrad and MN-major `fp8_einsum`** (`k_grouped_fp8_gemm_tn_contiguous`,
-  `fp8_einsum` `bhd,hdr->bhr` / `bhd,bhr->hdr`): training only, no inference caller. The host still rejects
-  them (`Unsupported architecture` for k-grouped, "needs MN-major FP8 operands, supported on SM100 only" for the
-  einsum). The reason given here earlier, that MN-major FP8 needs a byte-granular transpose and
-  `ldmatrix.b8` doesn't exist on sm_120, was wrong: `ldmatrix.m16n16.x{1,2}.trans.b8` exists on sm_120a/f
-  (section 9.10), and MN-major FP8 GEMM operands are now supported. FP4 dense MQA is no longer here: it is
-  done, section 9.6.
+- **MN-major `fp8_einsum`** (`fp8_einsum` `bhd,hdr->bhr` / `bhd,bhr->hdr`): training only, no inference caller. The host
+  still rejects these with "needs MN-major FP8 operands, supported on SM100 only" (section 11.3, not yet done). The reason
+  given here earlier, that MN-major FP8 needs a byte-granular transpose and `ldmatrix.b8` doesn't exist on sm_120, was
+  wrong: `ldmatrix.m16n16.x{1,2}.trans.b8` exists on sm_120a/f (section 9.10), so MN-major FP8 GEMM operands are now
+  supported and the einsum is no longer blocked on hardware. **k-grouped FP8 GEMMs / Wgrad** are no longer here:
+  `k_grouped_fp8_gemm_tn_contiguous` / `_nt_contiguous` ship for arch 12 (section 9.11), running one MN-major block-scaled
+  GEMM per group. FP4 dense MQA is no longer here either: it is done, section 9.6.
 - **Mega MoE**: its point is NVLink symmetric-memory dispatch/combine across
   ranks; on a single PCIe GPU it degenerates to a local grouped-GEMM chain that
   `m_grouped_*` already covers, and a port is effectively a UMMA/TMEM -> mma.sync
@@ -972,3 +972,59 @@ rounding when the heuristic picks another tile or stream-K split) and a dequanti
 (`sm120_fp8_fp4_gemm_1d1d`, N = 576, K = 1024, M = 16, g32 and g128, 15 stages) spills registers (g128: 4 B of spill stores, 20 B
 of loads) under `DG_JIT_CHECK_NO_SPILLS=1`. It does at the previous commit too, with no MN-major operand involved; the existing
 tests don't reach that tile. `test_mn_major_fp8_sm120` skips those small shapes for the UE8M0 kernels.
+
+## 9.11 K-grouped FP8 GEMM (weight gradients) (2026-11-07)
+
+`k_grouped_fp8_gemm_tn_contiguous` and `k_grouped_fp8_gemm_nt_contiguous` now run on SM120, closing one of the two
+remaining FP8 limits from section 8 (MN-major FP8 einsum, section 11.3, is the other). This is the Wgrad shape of MoE
+training: a batch of GEMMs that share M and N but have a different K per group, laid end to end along K, with the group
+sizes known on the host.
+
+**Design: one GEMM per group, like SM90 and the SM120 k-grouped BF16 path (74e1f61).** There is no k-grouped scheduler on
+SM120. The host loops over `ks`, and for a nonzero group runs `sm120_fp8_fp4_gemm_1d1d` over that group's K slice:
+`D[g] = A[K_g]^T @ B[K_g]` (+ C[g], which `early_return` has already copied into D, giving the accumulate-into-D semantics
+the SM90/SM100 contract requires). The operand slices are MN-major (`[sum_k, M]` / `[sum_k, N]`, narrowed along K then
+transposed to a `[MN, K_g]` view for the TN API; the NT API takes K-major `[MN, K_g]` blocks laid end to end), so they are
+read in-kernel with the 8-bit transposing `ldmatrix` from 9.10 — no explicit transpose. A group with `k == 0` zeroes its D
+slice (or is left for the accumulate copy). Per-group launch overhead is not a concern: even at `num_groups = 32` the eager
+and CUDA-graph times are within 0.5% (section measurements below), because each launch is a full-size M×N GEMM, and the
+MoE Wgrad groups are large-K, not the many-small-group case that would favour a fused scheduler. A single fused k-grouped
+launch was therefore not built; it would only help a regime these shapes do not hit.
+
+**Scales.** `transform_k_grouped_sf_into_required_layout` and `get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor`
+(in `smxx_layout.hpp`) now accept arch 12. They pack the per-group FP32 (or already-UE8M0) scales into the contiguous
+`[sum(ceil(K_g / (gran_k·4))), MN]` layout, where a group's packed rows, transposed, are exactly the `[MN, packed_k]`
+MN-major packed scales a normal SM120 block-scaled GEMM reads. The FP32 side of a 128-element recipe is cast to packed
+UE8M0 (exact only for power-of-two scales), as on SM100. gran_k 32 and 128 both work.
+
+**Numbers** (`scripts/sm120_bench_k_grouped_fp8.py`; RTX PRO 6000, GPU 7; 256 MB L2 flush before every call, so operands
+are cold; eager time includes host launch cost, CUDA-graph time is GPU only; min of 3 rounds; accumulate into FP32 D,
+gran_k 128). Shapes are the test-file set plus MoE Wgrad: `num_groups` in {4, 8, 16, 32}, DeepSeek-V3 expert dims
+(M/N 4096×7168 and 7168×2048, hidden 7168 / intermediate 2048, gate_up 4096 wide), K per group in {256, 1024, 4096}.
+Baselines: a host loop that explicitly transposes each MN-major operand slice to K-major and runs the K-major FP8 kernel
+per group (the route the kernel replaces), DeepGEMM's own k-grouped BF16 GEMM, and a torch (cuBLAS) BF16 loop. Correctness
+is checked bitwise against the per-group loop on the same packed scales inside the script.
+
+| MN-major FP8 vs. | eager | CUDA graph |
+|---|---|---|
+| host loop + explicit transpose, K-major kernel | 1.12-2.06x faster | 1.11-2.03x faster |
+| DeepGEMM k-grouped BF16 | 1.01-1.44x faster | similar |
+| torch BF16 loop | 0.76-1.00x (torch wins the small-K 4096×7168 groups) | — |
+
+The win over the explicit-transpose loop grows with K per group (more transpose work avoided): ~1.1x at K ≈ 320/group up
+to ~2.0x at K ≈ 4000/group on the 7168×2048 shapes. Eager and graph times match to within ~1%, confirming the per-group
+launch overhead is negligible at these sizes.
+
+**Tests.** `test_k_grouped_gemm_contiguous` in `tests/test_fp8_fp4.py` no longer early-returns on SM120. It runs with
+packed UE8M0 scales on both operands (`use_ue8m0` is forced on arch 12), checks the accumulate result against the FP32
+reference and bitwise self-consistency over 20 repeats and the empty/single-group `ks` variants, and times the per-group
+kernels with `per_call_total` so the summed group time is reported. Stochastic rounding and the pre-packed INT32 strided-SF
+checks stay SM100-only (they use the SM100 epilogue / SF-K-padding path). Because `enumerate_k_grouped_contiguous` mutates
+the contiguous-layout MK alignment and leaves it at its last value (384), and the test now actually runs on SM120, the
+k-grouped test restores the 128 default at the end so the later m-grouped `test_mixed_ue8m0_and_fp32_scale_pair` sees a
+block_m its heuristics can tile — this ordering bug was latent while the test early-returned.
+
+Verified with `DG_JIT_CHECK_NO_SPILLS=1` and a fresh cache: `test_fp8_fp4.py`, `test_bf16.py` and `test_einsum.py` all pass
+(the 16×32 stream-K UE8M0 spill from 9.10 stays skipped). K-major shapes do not regress: `scripts/sm120_bench_kmajor.py`
+1D1D timings are unchanged (the shared K-major kernel code is untouched; only the host k-grouped dispatch and the arch
+gating in the scale-layout helpers changed).
