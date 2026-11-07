@@ -256,6 +256,21 @@ CUTLASS_DEVICE void st_global_low_bf16(nv_bfloat16* ptr, const nv_bfloat162& val
     asm volatile("st.global.b16 [%0], %1;" :: "l"(ptr), "r"(*reinterpret_cast<const uint32_t*>(&value)));
 }
 
+// Global load that asks L2 to fetch the whole `kNumL2PrefetchBytes` (128 or 256) around the sector. A warp loading 8 rows of
+// 32 bytes at a time otherwise reads DRAM sector by sector (0.75 TB/s of the 1.8 TB/s at best), where the four loads that
+// follow of the same lines would have been served by one fetch
+template <uint32_t kNumL2PrefetchBytes = 128>
+CUTLASS_DEVICE float2 ld_global_l2_prefetch(const float2* ptr) {
+    DG_STATIC_ASSERT(kNumL2PrefetchBytes == 128 or kNumL2PrefetchBytes == 256, "Invalid L2 prefetch size");
+    float2 value;
+    if constexpr (kNumL2PrefetchBytes == 128) {
+        asm volatile("ld.global.L2::128B.v2.f32 {%0, %1}, [%2];" : "=f"(value.x), "=f"(value.y) : "l"(ptr) : "memory");
+    } else {
+        asm volatile("ld.global.L2::256B.v2.f32 {%0, %1}, [%2];" : "=f"(value.x), "=f"(value.y) : "l"(ptr) : "memory");
+    }
+    return value;
+}
+
 CUTLASS_DEVICE uint32_t ld_global_cg(const uint32_t* ptr) {
     uint32_t ret;
     asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));

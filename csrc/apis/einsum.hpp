@@ -264,15 +264,21 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                       gran_k_a, gran_k_b, major_a, major_b, compiled_dims,
                       resolve_epilogue_class(merged_epilogue_class, c, d_tensor));
     } else if (arch_major == 12) {
-        // SM120: one FP32-scale GEMM per batch, on 2D views of each batch (any row strides; the kernel reads SFA at any
-        // strides). A single batched launch would need 3D TMA descriptors in `sm120_fp8_gemm_1d2d`
+        // SM120: one launch for all batches through 3D tensor maps when they can describe the views (the heads of an
+        // einsum are strided views, which they do), otherwise one FP32-scale GEMM per batch on the 2D view of each
         DG_HOST_ASSERT(merged_epilogue_class == nullptr and "Custom epilogues require SM100");
         DG_HOST_ASSERT(not c.has_value() and "SM120 FP8 bmm does not support accumulation");
         DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128 and transformed_sfa.scalar_type() == torch::kFloat);
-        for (int i = 0; i < batch_size; ++ i) {
-            const auto sfb_i = transformed_sfb[i];
-            sm120_fp8_gemm_1d2d(a[i], transformed_sfa[i], b[i], sfb_i, std::nullopt, d_tensor[i], m, n, k,
-                                major_a, major_b, get_major_type_ab(sfb_i), compiled_dims);
+        const auto major_sfb = get_major_type_ab(transformed_sfb[0]);
+        if (sm120_fp8_bmm_1d2d_supported(a, transformed_sfa, b, transformed_sfb, d_tensor, major_a, major_b)) {
+            sm120_fp8_bmm_1d2d(a, transformed_sfa, b, transformed_sfb, d_tensor, batch_size, m, n, k,
+                               major_a, major_b, major_sfb, compiled_dims);
+        } else {
+            for (int i = 0; i < batch_size; ++ i) {
+                const auto sfb_i = transformed_sfb[i];
+                sm120_fp8_gemm_1d2d(a[i], transformed_sfa[i], b[i], sfb_i, std::nullopt, d_tensor[i], m, n, k,
+                                    major_a, major_b, get_major_type_ab(sfb_i), compiled_dims);
+            }
         }
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(merged_epilogue_class == nullptr and "Custom epilogues require SM100");
@@ -288,7 +294,8 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
 // MN-major FP8 (read in-kernel with the 8-bit transposing `ldmatrix`), D is FP32 and accumulates onto C in-kernel.
 // The scales are per-channel (1 x 128, one per row and K block of each operand), which the FP32 1D2D kernel cannot take
 // (it reads SFB as 128 x 128 blocks), so this runs on the block-scaled 1D1D kernel with packed UE8M0 scales, packed the
-// way SM100 does (exact for power-of-two scales)
+// way SM100 does (exact for power-of-two scales). All heads run in one batched launch (a GEMM per head only if the views
+// are not TMA-describable, or with `DG_SM120_BATCHED_LAUNCH=0`)
 static void sm120_fp8_bhd_bhr_hdr(const std::pair<torch::Tensor, torch::Tensor>& a,
                                   const std::pair<torch::Tensor, torch::Tensor>& b,
                                   const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
@@ -319,9 +326,15 @@ static void sm120_fp8_bhd_bhr_hdr(const std::pair<torch::Tensor, torch::Tensor>&
     const auto sfb = get_mn_major_tma_aligned_packed_ue8m0_tensor(perm_sfb);
     check_sf_layout(sfa, m, k, 1, 128, h, true, false, torch::kInt);
     check_sf_layout(sfb, n, k, 1, 128, h, true, false, torch::kInt);
-    for (int i = 0; i < h; ++ i)
-        sm120_fp8_fp4_gemm_1d1d(perm_a[i], sfa[i], perm_b[i], sfb[i], c.has_value() ? std::make_optional(D[i]) : std::nullopt,
-                                D[i], m, n, k, 128, 128, cute::UMMA::Major::MN, cute::UMMA::Major::MN, "mn", 1.0f);
+    // One launch for all heads through 3D tensor maps when they can describe the views, otherwise a GEMM per head
+    if (sm120_fp8_bmm_1d1d_supported(perm_a, sfa, perm_b, sfb, D, k, cute::UMMA::Major::MN, cute::UMMA::Major::MN)) {
+        sm120_fp8_bmm_1d1d(perm_a, sfa, perm_b, sfb, c.has_value(), D, h, m, n, k, 128,
+                           cute::UMMA::Major::MN, cute::UMMA::Major::MN, "mn");
+    } else {
+        for (int i = 0; i < h; ++ i)
+            sm120_fp8_fp4_gemm_1d1d(perm_a[i], sfa[i], perm_b[i], sfb[i], c.has_value() ? std::make_optional(D[i]) : std::nullopt,
+                                    D[i], m, n, k, 128, 128, cute::UMMA::Major::MN, cute::UMMA::Major::MN, "mn", 1.0f);
+    }
 }
 
 static void fp8_einsum(const std::string& expr,
@@ -351,8 +364,8 @@ static void fp8_einsum(const std::string& expr,
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", epilogue_class);
     } else if (expr == "bhd,hdr->bhr" and (arch_major == 10 or arch_major == 12)) {
-        // (batch_size, m, n, k): (h, b, r, d). K-major A and MN-major B: SM100 in one batched launch, SM120 one GEMM per
-        // head on strided views (the 8-bit transposing `ldmatrix` reads the MN-major B). Plain BF16 D, no accumulation
+        // (batch_size, m, n, k): (h, b, r, d). K-major A and MN-major B (the 8-bit transposing `ldmatrix` reads it on SM120);
+        // both architectures run all heads in one batched launch over strided views. Plain BF16 D, no accumulation
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
         const auto perm_a = a.first.permute({1, 0, 2});
         const auto perm_sfa = a.second.permute({1, 0, 2});

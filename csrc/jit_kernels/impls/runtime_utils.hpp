@@ -374,6 +374,32 @@ static CUtensorMap make_tma_b_desc(const cute::UMMA::Major& major,
                             allow_tf32, fp4_unpacked_smem);
 }
 
+// Tensor map of a batched operand `[G, MN, K]` (either dimension contiguous, any strides otherwise) for the SM120 batched
+// kernels: dimensions (inner, outer, batch), loading `block_mn x block_k` boxes of one batch at a time
+static bool is_tma_batched_operand(const cute::UMMA::Major& major, const torch::Tensor& t) {
+    if (t.dim() != 3 or t.stride(major == cute::UMMA::Major::K ? 2 : 1) != 1)
+        return false;
+    const auto elem_size = static_cast<int64_t>(t.element_size());
+    return reinterpret_cast<std::uintptr_t>(t.data_ptr()) % 16 == 0 and
+           (t.stride(major == cute::UMMA::Major::K ? 1 : 2) * elem_size) % 16 == 0 and (t.stride(0) * elem_size) % 16 == 0;
+}
+
+static CUtensorMap make_tma_batched_desc(const cute::UMMA::Major& major,
+                                         const torch::Tensor& t,
+                                         const int& shape_mn, const int& shape_k,
+                                         const int& block_mn, const int& block_k,
+                                         const int& swizzle_mode,
+                                         const bool& fp4_unpacked_smem = true) {
+    DG_HOST_ASSERT(is_tma_batched_operand(major, t));
+    const auto [gmem_inner_dim, gmem_outer_dim] = get_inner_outer_dims(major, shape_k, shape_mn);
+    const auto [smem_inner_dim, smem_outer_dim] = get_inner_outer_dims(major, block_k, block_mn);
+    return make_tma_3d_desc(t,
+                            gmem_inner_dim, gmem_outer_dim, static_cast<int>(t.size(0)),
+                            smem_inner_dim, smem_outer_dim, 1,
+                            static_cast<int>(t.stride(major == cute::UMMA::Major::K ? 1 : 2)), static_cast<int>(t.stride(0)),
+                            swizzle_mode, 0, false, fp4_unpacked_smem);
+}
+
 static CUtensorMap make_tma_cd_desc(const torch::Tensor& t,
                                     const int& shape_m, const int& shape_n,
                                     const int& block_m, const int& block_n,

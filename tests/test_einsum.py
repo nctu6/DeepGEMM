@@ -1,3 +1,4 @@
+import os
 import random
 import torch
 
@@ -26,6 +27,9 @@ def get_bf16_einsum_tolerance(use_cublaslt: bool) -> float:
     return 1e-7 if get_arch_major() == 12 and not use_cublaslt else 1e-10
 
 
+def get_fp8_einsum_shapes():
+    # `(h, r, d)`. The many-head shape is what the SM120 batched launch is for (a launch per head costs ~1.5 us each there)
+    return [(8, 4096, 1024)] + ([(128, 512, 128)] if get_arch_major() == 12 else [])
 def test_bmk_bnk_mn() -> None:
     print('Testing "bmk, bnk -> mn":')
     for s in (129, 4096, 8192):
@@ -140,7 +144,7 @@ def test_bhd_bhr_hdr():
 def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
     print('Testing FP8 "bhr, hdr -> bhd":')
     deep_gemm.use_deterministic_algorithms(False)
-    for h, r, d in [(8, 4096, 1024)]:
+    for h, r, d in get_fp8_einsum_shapes():
         for b in (4, 32, 128, 4096, 8192):
             x = torch.randn((b, h, r), device='cuda', dtype=torch.bfloat16)
             y = torch.randn((h, d, r), device='cuda', dtype=torch.bfloat16)
@@ -221,7 +225,7 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
 def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
     deep_gemm.use_deterministic_algorithms(False)
     print('Testing FP8 "bhd, hdr -> bhr":')
-    for h, r, d in [(8, 4096, 1024)]:
+    for h, r, d in get_fp8_einsum_shapes():
         for b in (4, 32, 128, 4096, 8192):
             x = torch.randn((b, h, d), device='cuda', dtype=torch.bfloat16)
             y = torch.randn((h, d, r), device='cuda', dtype=torch.bfloat16)
@@ -268,8 +272,8 @@ def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
 @test_filter(lambda: get_arch_major() in (10, 12))
 def test_fp8_bhd_bhr_hdr(use_ue8m0: bool = True):
     print('Testing FP8 "bhd, bhr -> hdr":')
-    for h, r, d in [(8, 4096, 1024)]:
-        for b in (4096, 8192):
+    for h, r, d in get_fp8_einsum_shapes():
+        for b in (128, 4096, 8192):
             x = torch.randn((b, h, d), device='cuda', dtype=torch.bfloat16)
             y = torch.randn((b, h, r), device='cuda', dtype=torch.bfloat16)
             z_0 = torch.randn((h, d, r), device='cuda', dtype=torch.float32) * 10
@@ -297,6 +301,60 @@ def test_fp8_bhd_bhr_hdr(use_ue8m0: bool = True):
     print()
 
 
+def quantize_fp8_einsum_operands(expr: str, b: int, h: int, r: int, d: int):
+    # Quantized `(a, b, c)` of `expr`, in the layouts `fp8_einsum` takes
+    if expr == 'bhd,bhr->hdr':
+        x = torch.randn((b, h, d), device='cuda', dtype=torch.bfloat16)
+        y = torch.randn((b, h, r), device='cuda', dtype=torch.bfloat16)
+        x_fp8 = per_channel_cast_to_fp8(x.view(b, -1), use_ue8m0=True)
+        y_fp8 = per_channel_cast_to_fp8(y.view(b, -1), use_ue8m0=True)
+        return ((x_fp8[0].view(b, h, d), x_fp8[1].view(ceil_div(b, 128), h, d)),
+                (y_fp8[0].view(b, h, r), y_fp8[1].view(ceil_div(b, 128), h, r)),
+                torch.randn((h, d, r), device='cuda', dtype=torch.float32) * 10)
+    k = d if expr == 'bhd,hdr->bhr' else r
+    n = r if expr == 'bhd,hdr->bhr' else d
+    x = torch.randn((b, h, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((h, k, n) if expr == 'bhd,hdr->bhr' else (h, n, k), device='cuda', dtype=torch.bfloat16)
+    x_fp8 = per_token_cast_to_fp8(x.view(-1, k), use_ue8m0=True)
+    y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn),
+             torch.empty((h, ceil_div(y.size(1), 128), ceil_div(y.size(2), 128)), device='cuda', dtype=torch.float))
+    for i in range(h):
+        y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i], use_ue8m0=True)
+    return (x_fp8[0].view(b, h, k), x_fp8[1].view(b, h, ceil_div(k, 128))), y_fp8, None
+# SM120 runs the heads of an `fp8_einsum` as one batched launch (3D tensor maps over the strided head views), or with
+# `DG_SM120_BATCHED_LAUNCH=0` as a GEMM per head. Both run the same MMAs in the same K order, so they must agree bit for bit
+@test_filter(lambda: get_arch_major() == 12)
+def test_fp8_einsum_batched_launch():
+    print('Testing the SM120 batched launch of FP8 einsum against a launch per head:')
+    deep_gemm.use_deterministic_algorithms(False)
+    cases = [('bhd,hdr->bhr', 8, 4096, 1024, 4), ('bhd,hdr->bhr', 128, 512, 128, 33), ('bhd,hdr->bhr', 16, 384, 256, 200),
+             ('bhr,hdr->bhd', 8, 4096, 1024, 5), ('bhr,hdr->bhd', 128, 512, 128, 130),
+             ('bhd,bhr->hdr', 128, 512, 128, 128), ('bhd,bhr->hdr', 8, 4096, 1024, 256), ('bhd,bhr->hdr', 16, 384, 256, 384)]
+    for expr, h, r, d, b in cases:
+        a_fp8, b_fp8, c = quantize_fp8_einsum_operands(expr, b, h, r, d)
+        outputs = []
+        for batched in ('1', '0'):
+            os.environ['DG_SM120_BATCHED_LAUNCH'] = batched
+            if expr == 'bhd,bhr->hdr':
+                out = c.clone()
+                deep_gemm.fp8_einsum(expr, a_fp8, b_fp8, out, c=out, recipe=(1, 1, 128))
+            else:
+                out = torch.empty((b, h, r if expr == 'bhd,hdr->bhr' else d), device='cuda', dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(expr, a_fp8, b_fp8, out)
+            outputs.append(out)
+        del os.environ['DG_SM120_BATCHED_LAUNCH']
+        assert torch.equal(outputs[0], outputs[1]), f'{expr=}, {h=}, {r=}, {d=}, {b=}: batched != per-head'
+        # Not just equal to each other: right (against the dequantized operands, which isolates the kernel from the FP8 error)
+        if expr == 'bhd,bhr->hdr':
+            xd = a_fp8[0].float() * a_fp8[1].repeat_interleave(128, 0)[:b]
+            yd = b_fp8[0].float() * b_fp8[1].repeat_interleave(128, 0)[:b]
+            ref = c + torch.einsum('bhd,bhr->hdr', xd, yd)
+        else:
+            xd = a_fp8[0].float() * a_fp8[1].repeat_interleave(128, -1)[..., :a_fp8[0].size(-1)]
+            yd = b_fp8[0].float() * b_fp8[1].repeat_interleave(128, 1).repeat_interleave(128, 2)[:, :b_fp8[0].size(1), :b_fp8[0].size(2)]
+            ref = torch.einsum(expr, xd, yd)
+        assert calc_diff(outputs[0], ref) < 1e-5, f'{expr=}, {h=}, {r=}, {d=}, {b=}: {calc_diff(outputs[0], ref)}'
+    print(' > OK\n')
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -312,3 +370,4 @@ if __name__ == '__main__':
     test_fp8_bhr_hdr_bhd()
     test_fp8_bhd_hdr_bhr()
     test_fp8_bhd_bhr_hdr()
+    test_fp8_einsum_batched_launch()

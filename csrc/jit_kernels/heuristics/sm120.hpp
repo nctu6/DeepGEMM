@@ -332,7 +332,8 @@ struct SM120ArchSpec {
 
     static double get_1d1d_cost(const GemmDesc& desc, const Layout& layout) {
         const double m = desc.get_expected_m(), n = desc.get_expected_n();
-        const double num_groups_a = desc.gemm_type == GemmType::MGroupedMasked ? desc.get_expected_num_groups() : 1;
+        const double num_groups_a = desc.gemm_type == GemmType::MGroupedMasked or desc.gemm_type == GemmType::Batched ?
+                                    desc.get_expected_num_groups() : 1;
         const double num_groups_b = desc.gemm_type == GemmType::Normal ? 1 : desc.num_groups;
         const double k_bytes = get_k_bytes(desc, desc.get_expected_k());
         const int64_t num_tiles = get_num_tiles(desc, layout);
@@ -377,7 +378,8 @@ struct SM120ArchSpec {
         //  - the time one CTA needs for its tile (`get_relative_wave_cost`), plus a fixed overhead,
         // in units of one 128x128 K block of a full wave
         const double m = desc.get_expected_m(), n = desc.get_expected_n();
-        const double num_groups_a = desc.gemm_type == GemmType::MGroupedMasked ? desc.get_expected_num_groups() : 1;
+        const double num_groups_a = desc.gemm_type == GemmType::MGroupedMasked or desc.gemm_type == GemmType::Batched ?
+                                    desc.get_expected_num_groups() : 1;
         const double num_groups_b = desc.gemm_type == GemmType::Normal ? 1 : desc.num_groups;
         const double k_bytes = get_k_bytes(desc, desc.get_expected_k());
         const double num_k_blocks = ceil_div(static_cast<int>(k_bytes), layout.block_k);

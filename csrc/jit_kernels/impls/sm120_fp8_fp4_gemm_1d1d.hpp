@@ -35,6 +35,7 @@ public:
         bool use_stream_k;
         void *grouped_layout, *d;
         int ld_d;
+        int64_t d_stride_g;   // Batched: elements between the D of consecutive batches
         float alpha;
         void *workspace, *counters;
         CUtensorMap tensor_map_a;
@@ -81,7 +82,7 @@ static void __instantiate_kernel() {{
 
         jit->launch(
             kernel, args.options,
-            args.grouped_layout, args.d, static_cast<uint32_t>(args.ld_d), args.alpha,
+            args.grouped_layout, args.d, static_cast<uint32_t>(args.ld_d), static_cast<uint64_t>(args.d_stride_g), args.alpha,
             args.workspace, args.counters,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b, args.tensor_map_sfa, args.tensor_map_sfb
@@ -133,24 +134,32 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
     // Requires no TMA splits: a K-major tile row is exactly one swizzle atom of `block_k` bytes (for packed FP4 the TMA
     // descriptor converts it into elements itself; BF16 rows hold `block_k / 2` elements). An MN-major atom is 64 or 128
     // MN bytes
+    const bool is_batched = desc.gemm_type == GemmType::Batched;
     const int elem_bytes = is_bf16 ? 2 : 1;
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == (desc.major_a == cute::UMMA::Major::K ? config.layout.block_k :
                                                             std::min(128, config.layout.block_m * elem_bytes)));
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == (desc.major_b == cute::UMMA::Major::K ? config.layout.block_k :
                                                             std::min(128, config.layout.block_n * elem_bytes)));
     const int tma_block_k = is_bf16 ? config.layout.block_k / 2 : config.layout.block_k;
-    const auto tensor_map_a = make_tma_a_desc(desc.major_a, a, desc.m, desc.k,
-                                              config.storage_config.load_block_m,
-                                              tma_block_k,
-                                              static_cast<int>(a.stride(get_non_contiguous_dim(desc.major_a))), num_groups_a,
-                                              config.storage_config.swizzle_a_mode, 0, false,
-                                              /* fp4_unpacked_smem */ false);
-    const auto tensor_map_b = make_tma_b_desc(desc.major_b, b, desc.n, desc.k,
-                                              config.storage_config.load_block_n,
-                                              tma_block_k,
-                                              static_cast<int>(b.stride(get_non_contiguous_dim(desc.major_b))), num_groups_b,
-                                              config.storage_config.swizzle_b_mode, 0, false,
-                                              /* fp4_unpacked_smem */ false);
+    // Batched: 3D maps (inner, outer, batch) over `[G, MN, K]` views, instead of groups stacked along the outer dimension
+    const auto tensor_map_a = is_batched ?
+        make_tma_batched_desc(desc.major_a, a, desc.m, desc.k, config.storage_config.load_block_m, tma_block_k,
+                              config.storage_config.swizzle_a_mode, /* fp4_unpacked_smem */ false) :
+        make_tma_a_desc(desc.major_a, a, desc.m, desc.k,
+                        config.storage_config.load_block_m,
+                        tma_block_k,
+                        static_cast<int>(a.stride(get_non_contiguous_dim(desc.major_a))), num_groups_a,
+                        config.storage_config.swizzle_a_mode, 0, false,
+                        /* fp4_unpacked_smem */ false);
+    const auto tensor_map_b = is_batched ?
+        make_tma_batched_desc(desc.major_b, b, desc.n, desc.k, config.storage_config.load_block_n, tma_block_k,
+                              config.storage_config.swizzle_b_mode, /* fp4_unpacked_smem */ false) :
+        make_tma_b_desc(desc.major_b, b, desc.n, desc.k,
+                        config.storage_config.load_block_n,
+                        tma_block_k,
+                        static_cast<int>(b.stride(get_non_contiguous_dim(desc.major_b))), num_groups_b,
+                        config.storage_config.swizzle_b_mode, 0, false,
+                        /* fp4_unpacked_smem */ false);
 
     // Scales are TMA-loaded with each stage: `[(G,) MN, ceil(K / (gran_k * 4))]` int32, MN-major (TMA-aligned). An FP4
     // K block of `block_k` bytes holds `block_k * 2` elements, i.e. `block_k * 2 / (gran_k * 4)` words (MXFP4: 2 for 128
@@ -175,7 +184,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
             // still pay for dispatch and their prologue, and under PDL they sit between this kernel and the next. The
             // scheduler strides by the compile-time SM count, so each launched CTA still gets exactly its own tile
             .grid_dim = dim3(stream_k.num_ctas > 0 ? stream_k.num_ctas :
-                             (desc.gemm_type == GemmType::Normal ?
+                             (desc.gemm_type == GemmType::Normal or is_batched ?
                                   std::min(config.launch_config.num_sms, SM120ArchSpec::get_num_tiles(desc, config.layout)) :
                                   config.launch_config.num_sms), 1, 1),
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
@@ -188,6 +197,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
         .grouped_layout = grouped_layout,
         .d = d.data_ptr(),
         .ld_d = static_cast<int>(d.stride(-2)),
+        .d_stride_g = is_batched ? d.stride(0) : 0,
         .alpha = alpha,
         .workspace = workspace,
         .counters = counters,
@@ -305,7 +315,8 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                        "SM120 FP4 operands must be K-major (there is no sub-byte transposing load)");
     auto desc = desc_in;
     auto a = a_in, b = b_in;
-    if (not is_bf16 and not is_fp4)
+    const bool is_batched = desc.gemm_type == GemmType::Batched;
+    if (not is_bf16 and not is_fp4 and not is_batched)
         sm120_resolve_mn_major_fp8(desc, a, b);
     DG_HOST_ASSERT(is_bf16 == (desc.kernel_type == KernelType::KernelNoSF));
     DG_HOST_ASSERT(gran_k_a == gran_k_b);
@@ -317,8 +328,8 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
     DG_HOST_ASSERT(is_bf16 or desc.sf_gran_k == gran_k_a);
     DG_HOST_ASSERT(d.scalar_type() == desc.cd_dtype and (d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat));
     if (desc.major_a == cute::UMMA::Major::MN)
-        DG_HOST_ASSERT(desc.gemm_type == GemmType::Normal);
-    if (desc.major_b == cute::UMMA::Major::MN and desc.gemm_type != GemmType::Normal)
+        DG_HOST_ASSERT(desc.gemm_type == GemmType::Normal or is_batched);
+    if (desc.major_b == cute::UMMA::Major::MN and desc.gemm_type != GemmType::Normal and not is_batched)
         DG_HOST_ASSERT(desc.k % 64 == 0 and "Grouped MN-major B needs K to be a multiple of 64");
     // K is whole scale groups (the packed scale tensors are padded, and TMA zero-fills the tail K block), and the
     // epilogue stores 8 bytes at a time (4 BF16 or 2 FP32 columns)
@@ -359,6 +370,48 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .sf_gran_k = gran_k_a
     };
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_fp8_fp4_gemm_1d1d", desc, a, sfa, b, sfb, d, nullptr, 1, 1, 1, 1, gran_k_a, gran_k_b, alpha);
+}
+
+// Batched block-scaled GEMM `D[g] (+)= A[g] @ B[g]^T` in one launch (`a`: `[G, M, K]`, `b`: `[G, N, K]`, `d`: `[G, M, N]`;
+// `sfa` / `sfb`: the packed UE8M0 scales of each batch stacked like a grouped GEMM's, `[G, packed_k, MN]` MN-major and
+// TMA-aligned), on strided views of any layout the 3D tensor maps can describe. With `accumulate`, D already holds C.
+// Callers check `sm120_fp8_bmm_1d1d_supported` and run a GEMM per batch when the views are not supported
+static bool sm120_fp8_bmm_1d1d_supported(const torch::Tensor& a, const torch::Tensor& sfa,
+                                         const torch::Tensor& b, const torch::Tensor& sfb,
+                                         const torch::Tensor& d, const int& k,
+                                         const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b) {
+    // `[G, MN, words]` with MN contiguous: the batches follow each other as `words` rows of `stride(2)` elements
+    const auto stacked = [](const torch::Tensor& sf) {
+        return sf.dim() == 3 and sf.stride(1) == 1 and sf.stride(0) == sf.size(2) * sf.stride(2);
+    };
+    return sm120_batched_launch_enabled() and is_tma_batched_operand(major_a, a) and is_tma_batched_operand(major_b, b) and
+           stacked(sfa) and stacked(sfb) and
+           d.dim() == 3 and d.stride(-1) == 1 and d.stride(-2) % 4 == 0 and d.stride(0) % 4 == 0 and
+           d.size(-1) % 8 == 0 and reinterpret_cast<uintptr_t>(d.data_ptr()) % 8 == 0 and k % 128 == 0;
+}
+
+static void sm120_fp8_bmm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                               const torch::Tensor& b, const torch::Tensor& sfb,
+                               const bool& accumulate, const torch::Tensor& d,
+                               const int& batch_size, const int& m, const int& n, const int& k,
+                               const int& gran_k, const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                               const std::string& compiled_dims) {
+    DG_HOST_ASSERT(sm120_fp8_bmm_1d1d_supported(a, sfa, b, sfb, d, k, major_a, major_b));
+    const auto desc = GemmDesc {
+        .gemm_type = GemmType::Batched,
+        .kernel_type = KernelType::Kernel1D1D,
+        .m = m, .n = n, .k = k, .num_groups = batch_size,
+        .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = major_a, .major_b = major_b,
+        .with_accumulation = accumulate,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
+        .sf_gran_k = gran_k
+    };
+    sm120_fp8_fp4_gemm_1d1d_launch("sm120_fp8_bmm_1d1d", desc, a, sfa, b, sfb, d, nullptr, 1, 1, batch_size, batch_size,
+                                   gran_k, gran_k, 1.0f);
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,

@@ -34,6 +34,10 @@ namespace deep_gemm {
 //  - `WARP_N` divides 128, so a warp always sees a single SFB value per K block
 //  - Results are stored straight from registers (no D staging buffer), which leaves the ~99 KB of
 //    shared memory to the pipeline
+//  - `GemmType::Batched` runs `kNumGroups` independent GEMMs `D[g] = A[g] @ B[g]^T` in one launch (the tiles of all batches
+//    share the persistent CTAs): A/B are loaded through 3D tensor maps with the batch as the outer dimension, and D, SFA and
+//    SFB are offset by their per-batch strides (`d_stride_g`, `sfa_stride_g`, `sfb_stride_g`), so batches may be strided
+//    views (e.g. the heads of a `[b, h, d]` tensor). It replaces a launch per batch, which costs ~1.5 us each
 //  - With `kUseStreamK` (normal GEMMs whose tiles fill the GPU poorly, e.g. decoding), the `num_tiles x num_k_blocks`
 //    iteration space is split evenly into `gridDim.x` contiguous ranges, one per CTA. A tile covered by several
 //    CTAs is reduced through `workspace`: each contributor writes an FP32 partial into its slot, and the last one
@@ -49,7 +53,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB, cute::UMMA::Majo
           bool kUseStreamK,
           typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+sm120_fp8_gemm_1d2d_impl(float* sfb, uint32_t sfb_stride_g, int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, uint64_t d_stride_g,
                          float* workspace, int* counters,
                          const float* sfa, uint32_t sfa_stride_g, uint32_t sfa_stride_m, uint32_t sfa_stride_k,
                          uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -68,10 +72,12 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
     static constexpr uint32_t kMNAtomBytesB = BLOCK_N >= 128 ? 128 : 64;
     DG_STATIC_ASSERT(kSwizzleAMode == (kIsMNMajorA ? kMNAtomBytesA : 128) and kSwizzleBMode == (kIsMNMajorB ? kMNAtomBytesB : 128),
                      "Only 128B swizzling (one atom per K block) or the MN atom of an MN-major operand is supported");
-    DG_STATIC_ASSERT(not kIsMNMajorA or (BLOCK_M % 64 == 0 and kGemmType == GemmType::Normal), "MN-major A needs whole 64-row atoms and no groups");
+    DG_STATIC_ASSERT(not kIsMNMajorA or (BLOCK_M % 64 == 0 and (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched)),
+                     "MN-major A needs whole 64-row atoms and no groups");
     DG_STATIC_ASSERT(not kIsMNMajorB or BLOCK_N % 64 == 0, "MN-major B needs whole 64-column atoms");
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
-    DG_STATIC_ASSERT(kGemmType != GemmType::Batched and not is_k_grouped_contiguous(kGemmType), "Unsupported GEMM type");
+    DG_STATIC_ASSERT(not is_k_grouped_contiguous(kGemmType), "Unsupported GEMM type");
+    static constexpr bool kIsBatchedMM = kGemmType == GemmType::Batched;
     DG_STATIC_ASSERT(not kUseStreamK or kGemmType == GemmType::Normal, "Stream-K is only for normal GEMMs");
 
     // Warp tiling
@@ -230,25 +236,29 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
 
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
+                    const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
                     if constexpr (kIsMNMajorA) {
-                        tma::copy<BLOCK_M, BLOCK_K, kSwizzleAMode, __nv_fp8_e4m3>(&tensor_map_a, &full_barrier,
-                                 smem_a[stage_idx], scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx), k_idx);
+                        tma::copy<BLOCK_M, BLOCK_K, kSwizzleAMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_a, &full_barrier,
+                                 smem_a[stage_idx], scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx), k_idx, 1, batch_idx);
                     } else {
-                        tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3>(&tensor_map_a, &full_barrier,
-                                 smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx));
+                        tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_a, &full_barrier,
+                                 smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx), 1, batch_idx);
                     }
                     // B of the first stages of the first task was issued before the wait
                     if (is_first_task and k_block_idx < num_preissued_k_blocks) {
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
                     } else {
                         if constexpr (kIsMNMajorB) {
-                            // A grouped MN-major B is `[G, K, N]`: the group offset goes to the outer dimension, K
-                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
+                            // A grouped MN-major B is `[G, K, N]`: the group offset goes to the outer dimension, K (a
+                            // batched one has its own TMA dimension for the batch)
+                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
                                      smem_b[stage_idx], scheduler.get_global_idx<false>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                                     scheduler.template get_global_idx<true, sched::IndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx));
+                                     scheduler.template get_global_idx<true, sched::IndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx),
+                                     1, batch_idx);
                         } else {
-                            tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3>(&tensor_map_b, &full_barrier,
-                                     smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
+                            tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
+                                     smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                                     1, batch_idx);
                         }
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
                     }
@@ -284,14 +294,16 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
 
         while (get_next_task(m_block_idx, n_block_idx)) {
             // SFB of this warp: `WARP_N` divides 128, so a single row (or column) of SFB per K block
-            const auto group_sfb_offset = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_n_sfb * shape_k_scales, 0, 0, m_block_idx);
+            // (a batch's SFB starts `sfb_stride_g` floats after the previous one's, which need not be contiguous)
+            const auto group_sfb_offset = kIsBatchedMM ? scheduler.current_group_idx * sfb_stride_g :
+                scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_n_sfb * shape_k_scales, 0, 0, m_block_idx);
             const uint32_t stride_n_sfb = kMajorSFB == cute::UMMA::Major::MN ? 1 : shape_k_scales;
             const uint32_t stride_k_sfb = kMajorSFB == cute::UMMA::Major::MN ? shape_n_sfb : 1;
             const uint32_t n_sfb_idx = cute::min((n_block_idx * BLOCK_N + warp_n_idx * WARP_N) / BLOCK_K, shape_n_sfb - 1);
             const float* local_sfb = sfb + group_sfb_offset + n_sfb_idx * stride_n_sfb;
 
             // SFA rows of this thread (clamped, as out-of-bound rows are never stored)
-            const float* local_sfa = sfa + (kGemmType == GemmType::MGroupedMasked ? scheduler.current_group_idx * sfa_stride_g : 0);
+            const float* local_sfa = sfa + (kGemmType == GemmType::MGroupedMasked or kIsBatchedMM ? scheduler.current_group_idx * sfa_stride_g : 0);
             // NOTES: only the first row is kept live across the mainloop: the 2 * `kNumMTiles` clamped offsets are
             // recomputed at each load (a few integer ops per K block), as the masked scheduler leaves too few of the
             // math warps' registers for them
@@ -493,7 +505,8 @@ sm120_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, cd_dtype_t* d, uint32_
                 for (uint32_t half = 0; half < 2; ++ half) {
                     const uint32_t row = warp_m_idx * WARP_M + i * MMA::M + group_row + half * 8;
                     const bool is_row_valid = m_local_base + row < shape_m;
-                    auto d_row = reinterpret_cast<__nv_bfloat16*>(d) + static_cast<uint64_t>(m_global_base + row) * ld_d;
+                    auto d_row = reinterpret_cast<__nv_bfloat16*>(d) + (kIsBatchedMM ? scheduler.current_group_idx * d_stride_g : 0) +
+                                 static_cast<uint64_t>(m_global_base + row) * ld_d;
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumNTiles; j += 2) {
                         const uint32_t idx_lo = (i * kNumNTiles + j) * 4 + half * 2;

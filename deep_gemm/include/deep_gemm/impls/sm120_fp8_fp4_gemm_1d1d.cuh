@@ -46,6 +46,9 @@ namespace deep_gemm {
 // MN-major operands (`kMajorA` / `kMajorB`): BF16 is read with the 16-bit `ldmatrix.trans`, FP8 with the native 8-bit
 // transposing `ldmatrix.m16n16.trans.b8`; both give the same fragments as a K-major operand. FP4 stays K-major (there is no
 // sub-byte transposing load)
+// `GemmType::Batched` runs `kNumGroups` independent GEMMs `D[g] = A[g] @ B[g]^T` in one launch: A/B are loaded through 3D tensor
+// maps with the batch as the outer dimension (so batches may be strided views, e.g. the heads of a `[b, h, d]` tensor), the
+// scales are stacked along their outer dimension like grouped GEMMs', and D is offset by `d_stride_g` per batch
 // The TMA pipeline, scheduler, warp tiling, stream-K and epilogue are shared with `sm120_fp8_gemm_1d2d_impl`: with
 // `kUseStreamK` (normal GEMMs whose tiles fill the GPU poorly, e.g. decoding with a long K), the
 // `num_tiles x num_k_blocks` iteration space is split evenly over the CTAs, and a tile covered by several CTAs is
@@ -62,7 +65,7 @@ template <bool kIsFP4, bool kIsBF16, uint32_t kGranK,
           bool kUseStreamK, bool kWithAccumulation,
           typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, float alpha,
+sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, uint64_t d_stride_g, float alpha,
                              float* workspace, int* counters,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
@@ -86,8 +89,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     static constexpr uint32_t kMNAtomBytesA = BLOCK_M * kElemBytes >= 128 ? 128 : 64;
     static constexpr uint32_t kMNAtomBytesB = BLOCK_N * kElemBytes >= 128 ? 128 : 64;
     DG_STATIC_ASSERT(not kIsFP4 or (not kIsMNMajorA and not kIsMNMajorB), "FP4 operands must be K-major");
-    DG_STATIC_ASSERT(not kIsMNMajorA or (BLOCK_M % 64 == 0 and kGemmType == GemmType::Normal),
+    DG_STATIC_ASSERT(not kIsMNMajorA or (BLOCK_M % 64 == 0 and (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched)),
                      "MN-major A needs whole 64-row atoms and no groups");
+    static constexpr bool kIsBatchedMM = kGemmType == GemmType::Batched;
     DG_STATIC_ASSERT(not kIsMNMajorB or BLOCK_N % 64 == 0, "MN-major B needs whole 64-column atoms");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -100,7 +104,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     // D = alpha * (A @ B^T) (+ D when accumulating; the host copies a distinct C into D first), BF16 or FP32
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> or cute::is_same_v<cd_dtype_t, float>,
                      "Invalid C/D data dtype");
-    DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedContiguous or
+    DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::Batched or kGemmType == GemmType::MGroupedContiguous or
                      kGemmType == GemmType::MGroupedContiguousWithPsumLayout or
                      kGemmType == GemmType::MGroupedMasked, "Unsupported GEMM type");
     DG_STATIC_ASSERT(not kUseStreamK or kGemmType == GemmType::Normal, "Stream-K is only for normal GEMMs");
@@ -319,18 +323,19 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                     const uint32_t k_idx = k_block_idx * kElemsPerBlock;
                     const uint32_t sf_block_idx = get_sf_block_idx(k_block_idx);
                     const uint32_t m_idx = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
+                    const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
                     if constexpr (kIsMNMajorA) {
-                        tma::copy<BLOCK_M, kElemsPerBlock, kSwizzleAMode, ab_dtype_t>(&tensor_map_a, &full_barrier,
-                                 reinterpret_cast<ab_dtype_t*>(smem_a[stage_idx]), m_idx, k_idx);
+                        tma::copy<BLOCK_M, kElemsPerBlock, kSwizzleAMode, ab_dtype_t, kIsBatchedMM>(&tensor_map_a, &full_barrier,
+                                 reinterpret_cast<ab_dtype_t*>(smem_a[stage_idx]), m_idx, k_idx, 1, batch_idx);
                     } else {
-                        tma::copy<kElemsPerBlock, BLOCK_M, kSwizzleAMode, ab_dtype_t>(&tensor_map_a, &full_barrier,
-                                 reinterpret_cast<ab_dtype_t*>(smem_a[stage_idx]), k_idx, m_idx);
+                        tma::copy<kElemsPerBlock, BLOCK_M, kSwizzleAMode, ab_dtype_t, kIsBatchedMM>(&tensor_map_a, &full_barrier,
+                                 reinterpret_cast<ab_dtype_t*>(smem_a[stage_idx]), k_idx, m_idx, 1, batch_idx);
                     }
                     // Scales: inner coordinate is the row/column, outer is the packed word (plus the group offset)
                     if constexpr (not kIsBF16) {
                         tma::copy<BLOCK_M, kNumSFRegs, 0, uint32_t>(&tensor_map_sfa, &full_barrier, smem_sfa[stage_idx],
                                  m_block_idx * BLOCK_M,
-                                 scheduler.get_global_idx<kWithGroupOffsetA>(num_sf_words, kNumSFWords, sf_block_idx));
+                                 scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(num_sf_words, kNumSFWords, sf_block_idx));
                     }
                     // B / SFB of the first stages of the first task were issued before the wait
                     if (is_first_task and k_block_idx < num_preissued_k_blocks) {
@@ -339,19 +344,21 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                         // A grouped B is `[G, N, K]` (K-major) or `[G, K, N]` (MN-major): the group offset goes to the outer
                         // dimension, N or K respectively (as in the SM90 BF16 kernel)
                         if constexpr (kIsMNMajorB) {
-                            tma::copy<BLOCK_N, kElemsPerBlock, kSwizzleBMode, ab_dtype_t>(&tensor_map_b, &full_barrier,
+                            tma::copy<BLOCK_N, kElemsPerBlock, kSwizzleBMode, ab_dtype_t, kIsBatchedMM>(&tensor_map_b, &full_barrier,
                                      reinterpret_cast<ab_dtype_t*>(smem_b[stage_idx]),
                                      scheduler.get_global_idx<false>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                                     scheduler.template get_global_idx<true, sched::IndexType::K>(shape_k, kElemsPerBlock, k_block_idx, m_block_idx));
+                                     scheduler.template get_global_idx<true, sched::IndexType::K>(shape_k, kElemsPerBlock, k_block_idx, m_block_idx),
+                                     1, batch_idx);
                         } else {
-                            tma::copy<kElemsPerBlock, BLOCK_N, kSwizzleBMode, ab_dtype_t>(&tensor_map_b, &full_barrier,
+                            tma::copy<kElemsPerBlock, BLOCK_N, kSwizzleBMode, ab_dtype_t, kIsBatchedMM>(&tensor_map_b, &full_barrier,
                                      reinterpret_cast<ab_dtype_t*>(smem_b[stage_idx]), k_idx,
-                                     scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx));
+                                     scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                                     1, batch_idx);
                         }
                         if constexpr (not kIsBF16) {
                             tma::copy<BLOCK_N, kNumSFRegs, 0, uint32_t>(&tensor_map_sfb, &full_barrier, smem_sfb[stage_idx],
                                      n_block_idx * BLOCK_N,
-                                     scheduler.get_global_idx<true>(num_sf_words, kNumSFWords, sf_block_idx, m_block_idx));
+                                     scheduler.template get_global_idx<true, sched::IndexType::SF_K>(num_sf_words, kNumSFWords, sf_block_idx, m_block_idx));
                         }
                         full_barrier.arrive_and_expect_tx(kNumATMABytes + kNumBTMABytes);
                     }
@@ -632,15 +639,41 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
             constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
             DG_STATIC_ASSERT(kNumNTiles % 2 == 0, "Paired stores need an even number of N tiles");
             const uint32_t m_global_base = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
+            // (a batched D starts `d_stride_g` elements after the previous batch's)
+            const uint64_t d_batch_offset = kIsBatchedMM ? scheduler.current_group_idx * d_stride_g : 0;
             const uint32_t m_local_base = m_block_idx * BLOCK_M;
             const bool is_odd_lane = group_col & 1;
+            // FP32 accumulation: read every old D value of this thread before the first store. Interleaved with the
+            // stores (the compiler cannot hoist a load over a store to the same buffer), each load waits out a DRAM round
+            // trip behind the previous one, which dominated tiles with a single K block (`bhd,bhr->hdr` at b = 128). The
+            // loads also ask L2 for the whole 128-byte line (`ld_global_l2_prefetch`): this thread reads 32 bytes of a row at a
+            // time, and fetching sector by sector halved the DRAM bandwidth (282 -> 197 us for h = 8, b = 128, r = 4096, d = 1024)
+            constexpr bool kLoadOldFirst = kWithAccumulation and cute::is_same_v<cd_dtype_t, float>;
+            float2 old_d[kLoadOldFirst ? kNumMTiles * 2 * kNumNTiles : 1];
+            if constexpr (kLoadOldFirst) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumMTiles; ++ i) {
+                    #pragma unroll
+                    for (uint32_t half = 0; half < 2; ++ half) {
+                        const uint32_t row = warp_m_idx * WARP_M + i * 16 + group_row + half * 8;
+                        const bool is_row_valid = is_storing_warp and m_local_base + row < shape_m;
+                        auto d_row = reinterpret_cast<const float*>(d) + d_batch_offset + static_cast<uint64_t>(m_global_base + row) * ld_d;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumNTiles; ++ j) {
+                            const uint32_t col = n_block_idx * BLOCK_N + warp_n_idx * WARP_N + j * 8 + group_col * 2;
+                            old_d[(i * 2 + half) * kNumNTiles + j] = (is_row_valid and col < shape_n) ?
+                                ptx::ld_global_l2_prefetch<128>(reinterpret_cast<const float2*>(d_row + col)) : make_float2(0, 0);
+                        }
+                    }
+                }
+            }
             #pragma unroll
             for (uint32_t i = 0; i < kNumMTiles; ++ i) {
                 #pragma unroll
                 for (uint32_t half = 0; half < 2; ++ half) {
                     const uint32_t row = warp_m_idx * WARP_M + i * 16 + group_row + half * 8;
                     const bool is_row_valid = is_storing_warp and m_local_base + row < shape_m;
-                    const uint64_t row_offset = static_cast<uint64_t>(m_global_base + row) * ld_d;
+                    const uint64_t row_offset = d_batch_offset + static_cast<uint64_t>(m_global_base + row) * ld_d;
                     if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                         // FP32: each lane stores its 2 columns of every N tile (the 4 lanes of a row write 32 bytes)
                         auto d_row = reinterpret_cast<float*>(d) + row_offset;
@@ -651,8 +684,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                             if (not is_row_valid or col >= shape_n)
                                 continue;
                             float2 value = make_float2(alpha * accum[idx], alpha * accum[idx + 1]);
-                            if constexpr (kWithAccumulation) {
-                                const float2 old = *reinterpret_cast<const float2*>(d_row + col);
+                            if constexpr (kLoadOldFirst) {
+                                const float2 old = old_d[(i * 2 + half) * kNumNTiles + j];
                                 value.x += old.x, value.y += old.y;
                             }
                             *reinterpret_cast<float2*>(d_row + col) = value;
