@@ -200,7 +200,7 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
     const int num_math_warp_groups = split_kv / mma_m;
     const int num_math_threads = num_math_warp_groups * 128;
     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
-    DG_HOST_ASSERT(head_dim == 128 and "SM120 paged MQA logits only support head dim 128");
+    DG_HOST_ASSERT((head_dim == 128 or head_dim == 64 or head_dim == 32) and "SM120 paged MQA logits support head dim 32, 64 or 128");
     DG_HOST_ASSERT(block_kv == 64 and split_kv == kSM120PagedMQALogitsSplitKV);
     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
     DG_HOST_ASSERT(next_n == 1 or next_n == 2);
@@ -226,7 +226,8 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
     // Same layout as the kernel: a Q pipeline, then one KV pipeline per math warp-group
     // NOTES: pick the deepest pipelines (at most 3 stages) that fit in shared memory; at least 2 Q stages are
     // required, as the TMA warp prefetches the next Q (blocking its KV loads) while the current one is in use
-    const int swizzle_alignment = head_dim * 8;
+    // The kernel needs 1024-byte aligned tiles for every head dim (see `kSwizzleAlignment` there)
+    const int swizzle_alignment = std::max(head_dim * 8, 1024);
     const int smem_q_size_per_stage = next_n * num_heads * head_dim * static_cast<int>(q.element_size());
     const int aligned_smem_weight_size_per_stage = align(next_n * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
     const int smem_kv_size_per_stage = block_kv * head_dim * static_cast<int>(kv_cache.element_size());

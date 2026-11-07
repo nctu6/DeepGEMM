@@ -48,14 +48,14 @@ def mqa_logits_formats():
     return [('fp8', torch.float)]
 
 
-def mqa_logits_heads(is_mxfp4: bool):
+def mqa_logits_heads(is_mxfp4: bool, is_paged: bool):
     if get_arch_major() == 10:
         heads = (8, 12, 16, 20, 32, 64)
         head_dims = (64, 128) if is_mxfp4 else (32, 64, 128)
         return heads, head_dims
-    # SM120 kernels (`mma.sync` with 128B-swizzled tiles) only support head dim 128
+    # SM120 `mma.sync` kernels: the paged kernel takes head dim 32, 64 and 128 like SM90, the contiguous one 64 and 128
     if get_arch_major() == 12:
-        return (32, 64), (128, )
+        return (32, 64), ((32, 64, 128) if is_paged else (64, 128))
     return (32, 64), (32, 64, 128)
 
 
@@ -125,7 +125,7 @@ def test_mqa_logits():
 
     def enumerate_mqa_logits():
         for fmt, dtype in mqa_logits_formats():
-            heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
+            heads, head_dims = mqa_logits_heads(fmt == 'mxfp4', is_paged=False)
             for seq_len in (2048, 8192):
                 for seq_len_kv in (8192, 65536):
                     for num_heads in heads:
@@ -308,7 +308,7 @@ def test_paged_mqa_logits():
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_q_tokens = 16 * 1024
         for fmt, dtype in mqa_logits_formats():
-            heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
+            heads, head_dims = mqa_logits_heads(fmt == 'mxfp4', is_paged=True)
             for block_kv in ((64, 128, 32) if is_varlen else (64, )):
                 for num_sequences in (64, 256, ):
                     for max_tokens_per_batch in ((6, 8) if is_varlen else (1, 2)):

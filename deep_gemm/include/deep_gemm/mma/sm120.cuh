@@ -56,16 +56,19 @@ CUTLASS_DEVICE uint32_t get_swizzle_128b_offset(const uint32_t& row, const uint3
     return row * 128 + ((chunk ^ (row & 7)) << 4);
 }
 
-/// Same for a tile whose rows are `kRowBytes` = 64 or 128 bytes, TMA-swizzled with the matching mode
+/// Same for a tile whose rows are `kRowBytes` = 32, 64 or 128 bytes, TMA-swizzled with the matching mode
 ///  - 128B (`Swizzle<3, 4, 3>`): chunk ^= row % 8
 ///  - 64B (`Swizzle<2, 4, 3>`, address bits [7, 8] into [4, 5]): chunk ^= (row / 2) % 4
+///  - 32B (`Swizzle<1, 4, 3>`, address bit 7 into bit 4): chunk ^= (row / 4) % 2
 template <uint32_t kRowBytes>
 CUTLASS_DEVICE uint32_t get_swizzle_offset(const uint32_t& row, const uint32_t& chunk) {
-    DG_STATIC_ASSERT(kRowBytes == 64 or kRowBytes == 128, "Unsupported swizzle");
+    DG_STATIC_ASSERT(kRowBytes == 32 or kRowBytes == 64 or kRowBytes == 128, "Unsupported swizzle");
     if constexpr (kRowBytes == 128)
         return row * 128 + ((chunk ^ (row & 7)) << 4);
-    else
+    else if constexpr (kRowBytes == 64)
         return row * 64 + ((chunk ^ ((row >> 1) & 3)) << 4);
+    else
+        return row * 32 + ((chunk ^ ((row >> 2) & 1)) << 4);
 }
 
 /// Byte offset inside a stage of MN-major FP8 atoms (`kAtomBytes` = 64 or 128 MN bytes per atom row, `kNumKRows` K rows
@@ -193,7 +196,7 @@ struct BF16MMA {
 };
 
 /// One warp computes `accum[16, N] = A[16, kHeadDim] @ B[N, kHeadDim]^T` with FP8 operands in TMA-swizzled shared memory
-/// (both K-major; rows are `kHeadDim` bytes, swizzled with the matching mode: 128B for 128, 64B for 64)
+/// (both K-major; rows are `kHeadDim` bytes, swizzled with the matching mode: 128B for 128, 64B for 64, 32B for 32)
 ///  - `a_base`/`b_base`: shared memory addresses of the 1024B-aligned tiles, `a_row`: the first of the 16 A rows
 ///  - `accum` follows the SM90 WGMMA `m64nN` per-warp layout: `accum[j * 4 + {0, 1, 2, 3}]` holds
 ///    `(row g, col 8j + 2t + {0, 1})` and `(row g + 8, col 8j + 2t + {0, 1})`, with `g = lane / 4`, `t = lane % 4`
@@ -202,7 +205,7 @@ template <uint32_t N, uint32_t kHeadDim = 128>
 CUTLASS_DEVICE void warp_mma_16xNxHd_ss(const uint32_t& a_base, const uint32_t& a_row,
                                          const uint32_t& b_base, float* accum) {
     DG_STATIC_ASSERT(N % 16 == 0, "Invalid N");
-    DG_STATIC_ASSERT(kHeadDim == 128 or kHeadDim == 64, "Unsupported head dim");
+    DG_STATIC_ASSERT(kHeadDim == 128 or kHeadDim == 64 or kHeadDim == 32, "Unsupported head dim");
     const uint32_t lane_idx = threadIdx.x % 32;
     const uint32_t a_ld_row = a_row + ((lane_idx >> 3) & 1) * 8 + (lane_idx & 7);
     const uint32_t a_ld_chunk = lane_idx >> 4;
