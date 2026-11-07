@@ -8,20 +8,20 @@ This file is the single source of truth for the effort. Update the status log
 (section 9) after every step. Re-read sections 2, 5 and 8 before starting any
 new work so we don't drift into one of the known dead ends.
 
-## Current state (2026-11-06)
+## Current state (2026-11-07)
 
 - **Supported on sm120:**
   - `fp8_gemm_nt`, m-grouped contiguous (incl. psum) and masked FP8 GEMMs, with FP32 1x128 / 128x128 scales.
-  - `fp8_mqa_logits` and `fp8_paged_mqa_logits` (H 32/64, next_n 1/2; head dim 128 or 64 for the contiguous/prefill kernel, 128 for the paged one), plus `get_paged_mqa_logits_metadata`.
+  - `fp8_mqa_logits` and `fp8_paged_mqa_logits` (H 32/64, next_n 1/2; head dim 128/64 for the contiguous/prefill kernel, 128/64/32 for the paged one, section 9.13), plus `get_paged_mqa_logits_metadata`.
   - Legacy aliases `fp8_mqa_logits` / `fp8_paged_mqa_logits` and the probe `get_supported_arch_majors()`.
   - **Block-scaled GEMMs** (`fp8_fp4_gemm_nt` and the m-grouped contiguous / masked variants): **MXFP4** (E2M1, 32-element UE8M0 scales), **NVFP4** (E2M1, 16-element UE4M3 scales, `scale_vec::4X`), and FP8 with 32- or 128-element UE8M0 scales. The tensor core applies the scales (`kind::mxf4nvf4` m16n8k64, `kind::mxf8f6f4` m16n8k32). BF16 or FP32 output, optional `alpha` and C accumulation. Includes the PSUM layout, BLOCK_N = 32 tiles, 64-byte FP4 K blocks, PDL weight pre-issue, and stream-K for few-tile decode. The cost model is fitted jointly on all three modes. See section 5.6 and the status log.
   - **BF16 GEMMs** on the same kernel: `bf16_gemm_nt` (cuBLASLt stays the default unless deterministic mode; `alpha` and C accumulation supported), `m_grouped_bf16_gemm_nt_contiguous` (incl. PSUM), `m_grouped_bf16_gemm_nt_masked`. **MN-major BF16 operands** (`bf16_gemm_nn/tn/tt`, a grouped MN-major B) and **`k_grouped_bf16_gemm_tn_contiguous`** also run, see section 9.9.
   - **`tf32_hc_prenorm_gemm`** (TF32 `m16n8k8`): `d = a @ b.T` and the row squared-norm, with K-split.
-  - **`einsum`**: `bmk,bnk->mn` (BF16), and native BF16 `bhr,hdr->bhd` and `bhd,hdr->bhr` (one GEMM per head). **`fp8_einsum`** `bhr,hdr->bhd` (via a per-batch FP32-scale GEMM), and the MN-major `bhd,hdr->bhr` and `bhd,bhr->hdr` (one GEMM per head, section 9.12).
+  - **`einsum`**: `bmk,bnk->mn` (BF16), and native BF16 `bhr,hdr->bhd` and `bhd,hdr->bhr` (deterministic mode only; one GEMM per head). **`fp8_einsum`** `bhr,hdr->bhd` (K-major operands) and the MN-major `bhd,hdr->bhr` and `bhd,bhr->hdr` run all heads as one batched GEMM launch (3D tensor maps over the strided head views), which closed the per-head-launch gap of section 9.12; see section 9.14.
 - **Done since this section was first written (2026-11-05/06):** sparse MQA logits (`fp8_fp4_sparse_mqa_logits` + paged + the two metadata entry points) and **block-scaled MXFP8/MXFP4 dense MQA logits** (`fp8_fp4_mqa_logits` MX path for arch 12). Both validated against a dequantized reference (`scripts/sm120_sparse_mqa_check.py`, `sm120_sparse_paged_check.py`, `sm120_mqa_blockscale_check.py`), diff ~1e-6.
-- **Still not implemented on sm120** (rejected at the host): paged MQA with head dim != 128 (section 11.4); mega MoE/gate/mHC (NVLink symmetric memory or TMEM/UMMA). MN-major FP8 GEMM operands (9.10), k-grouped FP8 GEMMs (9.11) and the MN-major `fp8_einsum` expressions (9.12) are now done. See sections 8, 9.9, 9.10, 9.11 and 9.12.
+- **Still not implemented on sm120** (rejected at the host): mega MoE/gate/mHC (NVLink symmetric memory or TMEM/UMMA). MN-major FP8 GEMM operands (9.10), k-grouped FP8 GEMMs (9.11), the MN-major `fp8_einsum` expressions (9.12), paged MQA head dim 32/64 (9.13) and the batched `fp8_einsum` launch (9.14) are now done. See sections 8 and 9.9 to 9.14.
 - **Implemented on sm120 but unused by TokenSpeed on this box:** the m-grouped contiguous (incl. psum) and masked FP8 GEMMs have real `arch_major == 12` branches (`gemm.hpp`) and pass `test_fp8_fp4.py`. TokenSpeed only reaches them through DeepEP MoE, which needs NVLink/RDMA (this box is PCIe-only), so nothing calls them here.
-- **Tests (GPU 7):** `tests/test_fp8_fp4.py` passes (k-grouped FP8 now enabled, section 9.11); `tests/test_bf16.py` and `tests/test_einsum.py` run on SM120 (section 9.9). `scripts/sm120_mqa_check.py` passes. The TokenSpeed tests pass (17).
+- **Tests (GPU 7):** the whole SM120 surface (`test_fp8_fp4`, `test_bf16`, `test_einsum`, `test_layout`, `test_hyperconnection`, `test_attention`, `sm120_mqa_check.py`, `sm120_blockscale_check.py --mode all --grouped`, `test_lazy_init` on 2 GPUs, the sanitizer) passes with `DG_JIT_CHECK_NO_SPILLS=1` and a fresh JIT cache (section 9.14). The TokenSpeed tests pass (17).
 - **Performance vs the TokenSpeed sm120 fallbacks:**
   - Dense decode is 1.2-4x faster at TP8 shapes; dense prefill is on par with FlashInfer.
   - The DSA indexer is 3-19x faster for decode and 8-52x faster for prefill.
@@ -505,6 +505,9 @@ for that op on sm120**. Keep the TokenSpeed fallback, cap the registration's
 - Timing-based autotuning on first call as the default: CUDA events resolve ~2 us
   here and eager launches can't see the PDL overlap; it mispicks as often as the
   model. Opt-in only (`DG_SM120_AUTOTUNE=1`).
+- Routing the small or many-head `fp8_einsum` shapes to BF16 cuBLASLt inside `fp8_einsum`: its inputs are FP8, so the route has
+  to dequantize first. Dequantize + cuBLASLt measured 53-211 us against 8-30 us for the batched FP8 launch (section 9.14), so
+  the batched launch is the only way to meet cuBLASLt's launch count.
 
 Deferred features (feasible but out of scope for inference on this box; the
 host still rejects them, so there is no silent wrong path):
@@ -841,7 +844,7 @@ Commits on `nctu6` after `df1bb16`, not pushed.
   kernel takes `kMajorA`/`kMajorB`. An MN-major operand is TMA-loaded as
   128B-swizzled atoms (64 MN elements x 64 K rows) and read with `ldmatrix.x4.trans`
   into the same fragments as the K-major path. The heuristic only gives MN-major
-  operands tiles whose MN dimension is a multiple of 64. Host limits: MN-major is
+  operands tiles whose MN dimension is a multiple of 64. Host limits (at this commit; FP8 followed in 9.10): MN-major is
   BF16 only, MN-major A has no groups, a grouped MN-major B needs `K % 64 == 0`
   (TMA bounds only the stacked `G*K` rows). With this, `bf16_gemm_nn/tn/tt` and
   MN-major grouped B work in deterministic mode (which skips cuBLASLt). `einsum`
@@ -966,10 +969,10 @@ both kernels, the grouped host-transpose fallback and the FP4 rejection against 
 tolerance. `scripts/sm120_mn_major_fp8_check.py` checks the MN-major result against the K-major kernel's (bitwise, or FP32
 rounding when the heuristic picks another tile or stream-K split) and a dequantized reference over 432 cases.
 
-**Found while testing, not fixed.** The K-major 16x32 stream-K tile of the packed-UE8M0 FP8 kernel
-(`sm120_fp8_fp4_gemm_1d1d`, N = 576, K = 1024, M = 16, g32 and g128, 15 stages) spills registers (g128: 4 B of spill stores, 20 B
-of loads) under `DG_JIT_CHECK_NO_SPILLS=1`. It does at the previous commit too, with no MN-major operand involved; the existing
-tests don't reach that tile. `test_mn_major_fp8_sm120` skips those small shapes for the UE8M0 kernels.
+**Found while testing; fixed in 9.14.** The K-major 16x32 stream-K tile of the packed-UE8M0 FP8 kernel
+(`sm120_fp8_fp4_gemm_1d1d`, N = 576, K = 1024, M = 16, g32 and g128, 15 stages) spilled registers (g128: 4 B of spill stores, 20 B
+of loads) under `DG_JIT_CHECK_NO_SPILLS=1`. It did at the previous commit too, with no MN-major operand involved; the existing
+tests didn't reach that tile, and `test_mn_major_fp8_sm120` skipped those small shapes for the UE8M0 kernels until the fix.
 
 ## 9.11 K-grouped FP8 GEMM (weight gradients) (2026-11-07)
 
@@ -1023,14 +1026,14 @@ k-grouped test restores the 128 default at the end so the later m-grouped `test_
 block_m its heuristics can tile — this ordering bug was latent while the test early-returned.
 
 Verified with `DG_JIT_CHECK_NO_SPILLS=1` and a fresh cache: `test_fp8_fp4.py`, `test_bf16.py` and `test_einsum.py` all pass
-(the 16×32 stream-K UE8M0 spill from 9.10 stays skipped). K-major shapes do not regress: `scripts/sm120_bench_kmajor.py`
+(the 16×32 stream-K UE8M0 spill from 9.10 was still open then; fixed in 9.14). K-major shapes do not regress: `scripts/sm120_bench_kmajor.py`
 1D1D timings are unchanged (the shared K-major kernel code is untouched; only the host k-grouped dispatch and the arch
 gating in the scale-layout helpers changed).
 
 ## 9.12 MN-major `fp8_einsum` (2026-11-07)
 `fp8_einsum` `bhd,hdr->bhr` and `bhd,bhr->hdr` now run on SM120 (task 11.3), closing the last FP8 limit from section 8. Like the
-native BF16 einsum (74e1f61), each runs one GEMM per head on strided views; the MN-major operands are read in-kernel with the
-8-bit transposing `ldmatrix` (9.10).
+native BF16 einsum (74e1f61), each ran one GEMM per head on strided views (the commit this section describes; section 9.14 batches
+the heads into one launch); the MN-major operands are read in-kernel with the 8-bit transposing `ldmatrix` (9.10).
 - **`bhd,hdr->bhr`** (`(batch, m, n, k) = (h, b, r, d)`): K-major A, MN-major B, 128x128 FP32 scales, BF16 D. It is just the
   existing per-batch SM120 branch of `fp8_bmm` (`sm120_fp8_gemm_1d2d`, which derives the majors from the strides); the only
   change is that the arch-10-only gate in `fp8_einsum` is gone.
@@ -1092,11 +1095,11 @@ Reading it: the FP8 einsum beats DeepGEMM's own per-head BF16 kernel everywhere 
 everywhere, and beats cuBLASLt only at large `b` with few big heads (1.2-1.5x at h = 8, b >= 4096 for both expressions). It
 loses badly to cuBLASLt when `b` is small or there are many small heads (h = 128: 8.7 us vs 191 us): cuBLASLt issues one
 strided-batched launch, while this path launches `h` GEMMs (about 1.5 us each, which is what the 190 us at h = 128 is). The
-`bhd,bhr->hdr` many-head, small-tile case is worst because its per-head GEMM is also launch- and tile-bound (M = d = 128). A
-single batched launch would need 3D TMA descriptors in the SM120 kernels (the same reason `fp8_bmm` loops). `fp8_einsum` is an
-explicit API with no default to switch, so callers with many small heads should keep the BF16 cuBLASLt einsum.
+`bhd,bhr->hdr` many-head, small-tile case is worst because its per-head GEMM is also launch- and tile-bound (M = d = 128).
+This gap, and the advice to keep the BF16 cuBLASLt einsum for many small heads, are superseded by the batched launch of
+section 9.14.
 
-## Paged MQA logits with head dim 32 and 64 on SM120 (task 11.4)
+## 9.13 Paged MQA logits with head dim 32 and 64 on SM120 (task 11.4)
 
 Source check: the SM90 paged kernel accepts head dim 32, 64 and 128 with H in {32, 64} and next_n in {1, 2}
 (`sm90_fp8_mqa_logits.hpp`, `attention.hpp`). The SM100 paged kernel is varlen-only (next_n 1, `indices` required) and takes
@@ -1133,3 +1136,137 @@ Head dim 128 is unchanged within noise (two interleaved runs each, baseline buil
 traffic against 750-900 GB/s for head dim 128; the short cases are bounded by the fixed launch and tail cost (about 20 us), not by
 bandwidth, and the 64-wide cases with enough work (B=64 H=32, B=128) reach 775 GB/s. The TokenSpeed Triton op
 (`triton_dsa_decode_topk_fp8`) only registers `head_dim=128`, so there is no Triton number to compare at 32 or 64.
+
+## 9.14 Batched `fp8_einsum`, the 16x32 spill, and the full SM120 verification (task 11.5, 2026-11-07)
+
+**The gap.** After 9.12, `fp8_einsum` `bhd,hdr->bhr` / `bhd,bhr->hdr` (and `bhr,hdr->bhd`, through `fp8_bmm`) ran one GEMM per
+head. Against the best of cuBLASLt on BF16 inputs, the per-head torch loop and `torch.einsum`, with a new benchmark that times cold
+operands in one CUDA graph (`scripts/sm120_bench_fp8_einsum.py`, min of 3 interleaved rounds), the worst case was 22x slower
+(h = 128, small b) and 1.2-1.9x slower at h = 8 with b <= 128. Where the time went (profiled kernel lists of one call):
+- `bhd,hdr->bhr`, h = 128: 128 GEMMs of 1.57 us each (201 us of kernel time; the graph does not overlap them).
+- `bhd,bhr->hdr`, h = 128, b = 128: 128 GEMMs of 2.0 us **plus 128 `sm120_transpose_fp8` kernels** of 1.4 us. The auto host policy
+  of 9.10 transposes an MN-major A below M = 256, and here M = d = 128. At b = 4096 the 128 GEMMs are 8.5 us each.
+- `bhd,bhr->hdr`, h = 8, b = 128: 8 GEMMs of 36 us. Not launch-bound: each moves 33.5 MB of FP32 D (read and write) and runs two
+  partial waves of 256 tiles on 188 SMs.
+
+**Options.** (1) Route these shapes to cuBLASLt inside `fp8_einsum`: it needs BF16 operands, so the FP8 inputs must be
+dequantized first. Measured (`bhd,hdr->bhr`, dequantize + cuBLASLt vs the batched launch below): 53 vs 8.2 us (h = 128, b = 4),
+73 vs 13.7 (h = 128, b = 128), 189 vs 27.9 (h = 8, b = 4), 211 vs 29.7 (h = 8, b = 128). No. (2) One batched launch in the
+SM120 FP8 kernels: chosen, since it also removes the host transposes and the partial waves.
+
+**Design.** `GemmType::Batched` (the scheduler already has it, for SM90/SM100) in `sm120_fp8_gemm_1d2d` and
+`sm120_fp8_fp4_gemm_1d1d`, so it stays one kernel path with a template parameter:
+- A and B are loaded through 3D tensor maps (inner, outer, batch; `make_tma_batched_desc`), so each batch can be a strided view:
+  the heads of `[b, h, d]` are batches `d` elements apart. K- or MN-major, always read in-kernel (the host transpose and the
+  M >= 256 rule of 9.10 do not apply, which is what removes the 128 transposes).
+- D is offset by `d_stride_g` per batch, SFA by `sfa_stride_g`, SFB (1D2D) by `sfb_stride_g`; the 1D1D scales are stacked along
+  their outer dimension like a grouped GEMM's, selected by the `SF_K` index type of the scheduler (which only Batched honors).
+- The grid is `min(SMs, tiles)` CTAs over all batches' tiles (m fastest, then n, then batch); no stream-K, no PDL weight
+  pre-issue (both are Normal-only). The cost model counts A and D bytes per batch.
+- The host checks `sm120_fp8_bmm_1d2d_supported` / `sm120_fp8_bmm_1d1d_supported` (16-byte-aligned strides, compact SFB, D alignment)
+  and otherwise launches one GEMM per batch as before. `DG_SM120_BATCHED_LAUNCH=0` forces that route (developer override, also
+  used to A/B).
+- The 1D1D FP32 epilogue with accumulation, which `bhd,bhr->hdr` stresses (K = b = 128 is a single K block per tile, so the
+  epilogue is most of the tile): the old D values were loaded one float2 at a time, interleaved with the stores, and the compiler
+  does not hoist a load over a store to the same buffer. A thread now loads all its old values first, with
+  `ld.global.L2::128B` (a 256B hint is the same), because 32 bytes of 8 rows per load instruction otherwise fetch DRAM sector by
+  sector. Kernel time of `bhd,bhr->hdr` (`bench_kineto` over the `gemm_` kernels, D cold; the first column is the per-head loop
+  of b01788a from the 9.12 table, the others are this commit's steps):
+
+| h, r, d, b | store only (no C) | per-head loop | batched | + loads first | + `L2::128B` |
+|---|---|---|---|---|---|
+| 8, 4096, 1024, 128 | 104 us (1.29 TB/s of D) | 337 us | 326 us | 282 us (0.95 TB/s) | 197 us (1.37 TB/s) |
+| 128, 512, 128, 128 | 33 us | 435 us | 99 us | 87 us | 59 us |
+
+  Accumulating reads and writes D, so 197 us for 268 MB is 1.37 TB/s against 1.29 TB/s for the store-only kernel (peak 1.79).
+
+  The same epilogue serves the BF16 `bmk,bnk->mn` einsum (FP32 D accumulating): `test_einsum`'s perf print goes from 362/402/497 to
+  293/358/409 us for the three shapes at b = 129.
+
+**Numbers** (GPU 7, e4m3 + UE8M0 scales, us per call including the scale packing kernels, cold operands, CUDA graph, min of 3
+interleaved rounds; baseline b01788a vs the batched launch; cuBLASLt is `deep_gemm.einsum` with deterministic mode off, "torch loop"
+a per-head `torch.matmul`, with an FP32 add per head for `bhd,bhr->hdr`; "best" is the fastest of the three BF16 alternatives).
+Targets: after / best <= 1.03.
+
+`bhd,hdr->bhr`:
+
+| h, r, d | b | FP8 before | FP8 after | cuBLASLt | torch loop | torch einsum | before / best | after / best |
+|---|---|---|---|---|---|---|---|---|
+| 128, 512, 128 | 4 | 263.9 | 9.0 | 14.6 | 511.4 | 13.9 | 18.85 | 0.65 |
+| 128, 512, 128 | 32 | 279.7 | 11.7 | 17.3 | 404.3 | 14.4 | 19.42 | 0.81 |
+| 128, 512, 128 | 128 | 286.4 | 18.8 | 30.5 | 397.9 | 23.7 | 12.08 | 0.79 |
+| 128, 512, 128 | 4096 | 678.5 | 457.3 | 485.4 | 867.2 | 484.0 | 1.40 | 0.94 |
+| 128, 512, 128 | 8192 | 1123.8 | 926.3 | 972.2 | 1421.7 | 956.6 | 1.17 | 0.97 |
+| 8, 4096, 1024 | 4 | 58.9 | 27.9 | 48.3 | 86.6 | 47.6 | 1.23 | 0.59 |
+| 8, 4096, 1024 | 32 | 65.4 | 30.8 | 50.6 | 94.4 | 48.9 | 1.34 | 0.63 |
+| 8, 4096, 1024 | 128 | 70.2 | 34.9 | 58.4 | 87.4 | 52.1 | 1.35 | 0.67 |
+| 8, 4096, 1024 | 4096 | 531.1 | 467.0 | 748.5 | 800.4 | 751.8 | 0.71 | 0.62 |
+| 8, 4096, 1024 | 8192 | 949.1 | 891.2 | 1454.4 | 1605.5 | 1457.8 | 0.65 | 0.61 |
+
+`bhd,bhr->hdr`:
+
+| h, r, d | b | FP8 before | FP8 after | cuBLASLt | torch loop | torch einsum | before / best | after / best |
+|---|---|---|---|---|---|---|---|---|
+| 128, 512, 128 | 128 | 639.0 | 55.1 | 61.1 | 783.7 | 69.7 | 10.44 | 0.90 |
+| 128, 512, 128 | 4096 | 1376.6 | 312.9 | 490.3 | 1458.6 | 515.3 | 2.81 | 0.64 |
+| 128, 512, 128 | 8192 | 2086.1 | 565.5 | 928.9 | 1914.5 | 953.3 | 2.24 | 0.61 |
+| 8, 4096, 1024 | 128 | 355.4 | 193.1 | 191.7 | 237.4 | 263.5 | 1.85 | 1.01 |
+| 8, 4096, 1024 | 4096 | 670.9 | 503.8 | 793.3 | 1010.5 | 910.4 | 0.82 | 0.64 |
+| 8, 4096, 1024 | 8192 | 1152.5 | 882.3 | 1454.2 | 1661.8 | 1588.0 | 0.79 | 0.61 |
+
+`bhr,hdr->bhd`:
+
+| h, r, d | b | FP8 before | FP8 after | cuBLASLt | torch loop | torch einsum | before / best | after / best |
+|---|---|---|---|---|---|---|---|---|
+| 128, 512, 128 | 4 | 315.7 | 7.8 | 14.5 | 530.6 | 14.2 | 22.23 | 0.55 |
+| 128, 512, 128 | 32 | 322.7 | 9.5 | 17.7 | 539.9 | 16.8 | 19.21 | 0.57 |
+| 128, 512, 128 | 128 | 327.8 | 16.6 | 29.5 | 551.6 | 26.2 | 12.46 | 0.63 |
+| 128, 512, 128 | 4096 | 713.5 | 288.4 | 469.2 | 859.5 | 467.7 | 1.53 | 0.62 |
+| 128, 512, 128 | 8192 | 1112.6 | 570.6 | 920.9 | 1394.8 | 915.6 | 1.22 | 0.62 |
+| 8, 4096, 1024 | 4 | 63.3 | 24.6 | 47.6 | 75.7 | 47.5 | 1.34 | 0.52 |
+| 8, 4096, 1024 | 32 | 66.3 | 26.7 | 49.9 | 80.4 | 49.1 | 1.35 | 0.54 |
+| 8, 4096, 1024 | 128 | 79.6 | 30.8 | 55.4 | 102.5 | 53.5 | 1.49 | 0.58 |
+| 8, 4096, 1024 | 4096 | 526.6 | 390.0 | 721.5 | 861.1 | 729.9 | 0.73 | 0.54 |
+| 8, 4096, 1024 | 8192 | 858.0 | 797.5 | 1329.4 | 1525.8 | 1361.6 | 0.64 | 0.60 |
+
+Worst after / best: `bhd,hdr->bhr` 0.97, `bhd,bhr->hdr` 1.007, `bhr,hdr->bhd` 0.63. Over the 26 points the geomean of FP8 / best went
+from 2.40 to 0.66 and the worst from 22.2 to 1.007. `bhd,bhr->hdr` at h = 8, b = 128 is the one point at parity (192.2 vs 191.5 us in
+three more runs); it moves 268 MB of FP32 D for 4 MFLOP of work per head, and cuBLASLt is at the same DRAM bound. The b = 4096 / 8192
+points at h = 128 (0.94-0.97, `bhd,hdr->bhr`) are compute-bound.
+These cold-operand numbers differ from 9.12's table, which left the weights warm (cuBLASLt at h = 8, b = 4: 18 us there, 48 us
+here); cold is the serving condition. BF16 weights are twice the bytes of FP8, so part of FP8's lead at h = 8 is bandwidth.
+
+**Tests.** `test_fp8_bhd_hdr_bhr`, `test_fp8_bhd_bhr_hdr` and `test_fp8_bhr_hdr_bhd` also run (128, 512, 128) on SM120, with the same
+tolerances as 9.12 (1e-3 against the BF16 inputs, 1e-10 against the dequantized operands for `bhd,bhr->hdr`), and
+`bhd,bhr->hdr` now also at b = 128. `test_fp8_einsum_batched_launch` runs eight shapes (unaligned b, a d of 256 and an r of 384 that
+are not whole 512-wide tiles, h of 8/16/128) with and without `DG_SM120_BATCHED_LAUNCH` and requires the outputs to be bit-identical
+(same MMAs in the same K order), then compares with the dequantized operands (1e-5; the BF16 output rounding alone is ~1.4e-6).
+
+**The 16x32 stream-K spill (open since 9.10), fixed.** Reproduced with M = 16, N = 576, K = 1024, g128 (`DG_JIT_CHECK_NO_SPILLS=1`):
+8 B of stack, 4 B of spill stores, 20 B of loads. The same family as the stream-K range of `4a95a00`: the TMA warps get 40
+registers after `setmaxnreg.dealloc`, and this tile has 15 stages and the extra scale-TMA state. A 128-thread math group leaves
+register-file room (128 x 248 + 128 x 56 is well under 64K registers), so its TMA warps now keep 56; 256-thread configs keep 40.
+0 B of spills, no timing change (K-major spot check below). `test_mn_major_fp8_sm120` no longer skips the small shapes, so it
+guards the fix when `DG_JIT_CHECK_NO_SPILLS=1` is set (the sanitizer sets it).
+
+**Verification** (GPU 7, `DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT caches, at the tree of the two commits above):
+- `test_fp8_fp4` (6 test functions), `test_bf16` (7), `test_einsum` (8, with the new batched-launch check), `test_layout` (3),
+  `test_hyperconnection` (1) and `test_attention` (2) pass. `scripts/sm120_mqa_check.py`: 46 cases, max diff 4.1e-14.
+  `scripts/sm120_blockscale_check.py --mode all --grouped`: 170 cases, ALL OK. `test_lazy_init --num-processes 2` on GPUs 6 and 7
+  (the one run that used GPU 6): 3 tests OK.
+- `test_sanitizer.py` (memcheck and synccheck, `DG_JIT_CHECK_NO_SPILLS=1`, venv python on PATH), run per function because the script
+  stops at the first failure: 0 errors on 22 functions (`test_einsum` all 8, `test_layout` 3, `test_hyperconnection`,
+  `test_mn_major_fp8_sm120`, `test_fp8_fp4.test_gemm`, `test_m_grouped_gemm_contiguous`, the mixed-scale test, `test_bf16`
+  `test_gemm` / `test_m_grouped_gemm_contiguous` / `test_m_grouped_gemm_masked` / `test_k_grouped_gemm_contiguous`,
+  `test_paged_mqa_logits`, `test_sparse_mqa_logits`). The FP8 `test_k_grouped_gemm_contiguous` (2400 s), FP8
+  `test_m_grouped_gemm_masked` (900 s) and `test_mqa_logits` (900 s) did not finish under the sanitizer, with no error before the
+  limit; a reduced k-grouped FP8 run (the test's own enumeration, first 8 distinct (groups, m, n, accumulate, psum) combinations x 2 K
+  variants = 16 cases, one launch each) under memcheck and synccheck has 0 errors. The `test_legacy` entry fails as before: the venv has no triton. `test_mega_gate`, `test_mega_mhc` and the cuBLASLt
+  BF16 tests were not rerun (nothing they use changed). `test_locality_domain` (MLOPart) and `test_mega_moe` (NVLink) are the known
+  environment failures and were not run.
+
+**K-major shapes do not regress** (baseline: a build of b01788a; `sm120_bench_kmajor.py` 1D2D and 1D1D g128, 7 shapes x M in {1, 16, 64,
+256, 1024, 4096}; `sm120_bench_blockscale.py` q_a/kv_a, o_proj and shared down at M in {1, 16, 64, 512, 4096} for g128, g32 and
+FP4; deterministic `bf16_gemm_nt` on 3 shapes x M in {1, 64, 512, 4096}; CUDA graph, cold weights, min of 2 alternating rounds per
+build). New / baseline: 1D2D 42 points geomean 0.994, worst 1.004; 1D1D 42 points 0.996, worst 1.001; block-scaled 30 points
+0.991 (g128 0.992, g32 0.990, FP4 0.989), worst 1.001; BF16 12 points 0.995, worst 1.001. Nothing is slower than noise.
