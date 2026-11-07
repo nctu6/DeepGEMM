@@ -26,10 +26,10 @@ new work so we don't drift into one of the known dead ends.
   - Dense decode is 1.2-4x faster at TP8 shapes; dense prefill is on par with FlashInfer.
   - The DSA indexer is 3-19x faster for decode and 8-52x faster for prefill.
   - End to end on a block-FP8 27B model: TPOT is 1.18-1.55x better.
-  - **FP4 vs the best FP8 kernel** (DeepSeek-V3 TP8 dense linears, graph + cold weights): 1.6-2.0x at nearly every shape (decode 1.3-1.8x, prefill 1.7-2.0x), and 1.1-10.2x over the best Triton/FlashInfer block-FP8 kernel (smallest on K = 256 `shared down` large M, largest on N = 512 `shared gate_up` decode). **FP4 vs FlashInfer MXFP4** (`cudnn` and `b12x`, the backends that run MXFP4 on sm120): DeepGEMM wins 60 of 63 points (1.03-2.2x); the other three are ties within 0.4 us (q_b M=256, o_proj M=128, dense gate_up M=256). See the 2026-11-04 rows.
+  - **FP4 vs the best FP8 kernel** (DeepSeek-V3 TP8 dense linears, graph + cold weights): 1.6-2.0x at nearly every shape (decode 1.3-1.8x, prefill 1.7-2.0x), and 1.1-10.2x over the best Triton/FlashInfer block-FP8 kernel (smallest on K = 256 `shared down` large M, largest on N = 512 `shared gate_up` decode). **FP4 vs FlashInfer MXFP4** (`cudnn` and `b12x`, the backends that run MXFP4 on sm120): DeepGEMM wins 62 of 63 points, 1.40x geomean, worst point 0.979x (early PDL trigger `76dc545`, section 9.15; it was 59 of 63 and 1.34x after the cost-model refit). The one tie left is dense gate_up M=256.
 - **Commits:** DeepGEMM `970b868` (kernels) and `3070f4c` (setup.py fallback headers), both pushed to `origin/nctu6`; then `e350464`, `49f3fe1`, `b5adf0e`, `f6bd900` (block-scaled FP4 / UE8M0 FP8 GEMMs), local on `nctu6`, not pushed. TokenSpeed `1c7a96a73` (integration) and `9617cda2c` (DeepGEMM submodule + install.sh + Docker), local on `nctu6`, not pushed.
 - **Install:** TokenSpeed carries DeepGEMM as a submodule (`DeepGEMM/`, branch `nctu6`). `scripts/install.sh` and `docker/Dockerfile.nvidia.unieai` build it from source and replace the published `tokenspeed-deepgemm` wheel. Both are tested on aws-raichu. See the "Submodule + install" rows in section 9.
-- **Open:** (0) **UE8M0 FP8 regression at mid/large M from the FP4-only cost-model refit** (status log 2026-11-04; committed in `b419c02`, fix pending). (1) The three FP4 ties with b12x at mid M (kernel-level work; tile choice is exhausted). (2) NVFP4 (UE4M3 / 16-element scales, `scale_vec::4X`). (3) TokenSpeed has no NVIDIA MXFP4 `mm` leaf at all (its MXFP4 leaves are AMD-only), so a `deepgemm_sm120_mm_mxfp4` leaf, with weight scales packed once at load, would be a new capability. (4) A DeepSeek-V3.2 TP8 end-to-end run (needs 8 GPUs). A wheel release and pin bump are optional, since the source build replaces the pin.
+- **Open:** (0) **UE8M0 FP8 regression at mid/large M from the FP4-only cost-model refit** (status log 2026-11-04; committed in `b419c02`, fix pending). (1) The one FP4 tie with b12x, dense gate_up M=256 (0.98x; bound by L2 -> SM traffic, section 9.15). (2) NVFP4 (UE4M3 / 16-element scales, `scale_vec::4X`). (3) TokenSpeed has no NVIDIA MXFP4 `mm` leaf at all (its MXFP4 leaves are AMD-only), so a `deepgemm_sm120_mm_mxfp4` leaf, with weight scales packed once at load, would be a new capability. (4) A DeepSeek-V3.2 TP8 end-to-end run (needs 8 GPUs). A wheel release and pin bump are optional, since the source build replaces the pin.
 
 ## 0. Environments
 
@@ -586,6 +586,7 @@ host still rejects them, so there is no silent wrong path):
 | 2026-11-05 | einsum / fp8_bmm | done | `bmk,bnk->mn` accumulates a BF16 GEMM per batch slice into FP32 D; `fp8_bmm` runs one FP32-scale GEMM per batch (so `fp8_einsum bhr,hdr->bhd` works). Both match the reference (bmk,bnk->mn to ~1e-6 BF16 / 1e-12 FP32; fp8 einsum ~7e-4). The arch-12 `fp8_bmm` else-branch previously fell through to the SM90 WGMMA kernel. The MN-major expressions (`bhd,hdr->bhr`, `bhd,bhr->hdr`) are still unported. |
 | 2026-11-05 | MQA head dim 64 | done | `warp_mma_16xNx128_ss` -> `warp_mma_16xNxHd_ss<N, kHeadDim>` (128 or 64) with the matching TMA swizzle. The contiguous/prefill kernel + launcher accept head dim 64 (`sm120_mqa_check.py` D=64 cases pass, ~1e-14); the paged kernel stays at 128 (its KV gather has its own swizzle assumptions). FP4 MQA is still unported. |
 | 2026-11-05 | Commits | done | DeepGEMM `nctu6`: `eff4cea` (joint refit), `eb61610` (NVFP4 + epilogue + spill fix, kernel), `4659181` (NVFP4/epilogue host), `bfb637c` (tf32 hc), `5dfd734` (einsum), `38ef2a2` (MQA head dim 64). Local, not pushed. |
+| 2026-11-07 | FP4 ties vs b12x (task 12) | **3 of 4 won** | Early PDL trigger for FP4 grids on <= 60% of the SMs (`76dc545`). 63-point sweep, 3 runs per build, best of 3: geomean 1.336x -> 1.399x, wins 59 -> 62 of 63, worst 0.965x -> 0.979x. q_b M=256 1.059x, o_proj M=128 1.116x, dense down M=128 1.107x; dense gate_up M=256 stays 0.98x (L2 -> SM bound). Section 9.15. |
 
 ## 9.5 Sparse MQA logits SM120 port plan (in progress, 2026-11-05)
 
@@ -801,7 +802,8 @@ measures fastest. End to end vs FlashInfer MXFP4 (63 points): geomean speedup
 1.315x -> 1.33x, still 59/63 wins. Committed `1b065a2`.
 
 The 4 remaining ties (q_b M=256, o_proj M=128, dense gate_up M=256, dense down
-M=128; 0.96-0.99x vs b12x) are **not closable with the available tools**: the
+M=128; 0.96-0.99x vs b12x) were **not closable with tile choice, the model or the
+autotuner** (three of them were closed later by the PDL trigger, section 9.15): the
 analytic model cannot pick a per-M tile (its cost table is one value per tile
 shape), and `DG_SM120_AUTOTUNE=1` is *worse* (geomean 1.318, q_b M=256 0.94)
 because eager timing cannot see the graph-mode PDL overlap. Genuine kernel-level
@@ -1270,3 +1272,95 @@ guards the fix when `DG_JIT_CHECK_NO_SPILLS=1` is set (the sanitizer sets it).
 FP4; deterministic `bf16_gemm_nt` on 3 shapes x M in {1, 64, 512, 4096}; CUDA graph, cold weights, min of 2 alternating rounds per
 build). New / baseline: 1D2D 42 points geomean 0.994, worst 1.004; 1D1D 42 points 0.996, worst 1.001; block-scaled 30 points
 0.991 (g128 0.992, g32 0.990, FP4 0.989), worst 1.001; BF16 12 points 0.995, worst 1.001. Nothing is slower than noise.
+
+## 9.15 FP4 ties against FlashInfer's b12x (task 12, 2026-11-07)
+
+Start: after the cost-model refit (`1b065a2`) DeepGEMM's MXFP4 GEMM won 59 of 63 DeepSeek-V3 TP8 dense-linear points against the
+faster of FlashInfer's `cudnn` and `b12x` (1.33x geomean). The four ties: q_b M=256, o_proj M=128, dense gate_up M=256, dense down
+M=128. Method: `scripts/sm120_fp4_vs_flashinfer.py` (CUDA graph over 512 MB of weight copies, PDL on both sides, implementations
+interleaved, best of 5 rounds inside a run), GPU 7 idle, three runs per build, best of 3 per point. Reproduced on the unchanged tree
+(`6aebaf0`), one point per process: q_b M=256 6.2 vs 5.5 us (0.89x), o_proj M=128 8.1 vs 7.8 (0.97x), dense gate_up M=256 19.3 vs 19.5
+(1.01x), dense down M=128 8.7 vs 8.4 (0.97x); in the full sweeps (three runs) q_b 5.7-5.8 vs 5.5, o_proj 7.8-7.9 vs 7.7, dense down
+8.4-8.5 vs 8.4, dense gate_up 19.0-20.1 vs 18.6-19.8 us. The faster FlashInfer backend was `b12x` on all four.
+
+**Profile comparison** (ncu, one launch, flushed caches, no PDL; DeepGEMM 64x128 tile, 8 math warps + 4 TMA warps; b12x
+`DenseGemmKernel`, 8 math warps + 1 load warp):
+
+| shape | DG us | b12x us | grid | block DG / b12x | regs DG / b12x | smem KB DG / b12x | DRAM % DG / b12x | L2 % DG / b12x | issued instr DG / b12x |
+|---|---|---|---|---|---|---|---|---|---|
+| q_b M=256 | 8.03 | 7.17 | 96 | 384 / 288 | 168 / 117 | 91.7 / 97.3 | 21 / 24 | 29 / 31 | 1.04M / 1.00M |
+| o_proj M=128 | 10.62 | 9.41 | 112 | 384 / 288 | 168 / 117 | 91.7 / 97.3 | 47 / 53 | 36 / 36 | 1.44M / 1.49M |
+| dense gate_up M=256 | 21.76 | 22.62 | 144 | 384 / 288 | 168 / 117 | 78.6 / 97.3 | 54 / 51 | 65 / 63 | 4.51M / 5.65M |
+| dense down M=128 | 11.78 | 10.37 | 112 | 384 / 288 | 168 / 117 | 91.7 / 97.3 | 48 / 54 | 36 / 37 | 1.60M / 1.61M |
+
+Same grid and tile on every shape, occupancy 17-19% on both, DRAM and L2 well below saturation on the three short-K shapes, and an
+instruction count within 5% (DeepGEMM's is 20% lower on gate_up). No tensor-pipe, stall or epilogue difference explains a 10-14%
+standalone gap: both are latency chains at this size. ncu metrics are only meaningful for the standalone kernel, and the standalone
+numbers say DeepGEMM is 12-14% *slower* than b12x on the three short-K shapes, yet the graph-mode gap is 0-3%, so the difference had
+to be in what the graph exposes: the launch chain.
+
+**Graph-mode trace** (q_b M=256, 24 launches in one graph, cold weights, PDL; each CTA wrote `clock64` / `globaltimer` stamps next to
+D, read back after the replay; scratch instrumentation, not committed). Period 5.8-6.0 us. A CTA lives 5.9 us: it starts 0.8-0.9 us
+*before* the previous GEMM ends, but its first K block lands only 2.1 us after the CTA started (1.3 us after the previous GEMM
+ended), the 12 K blocks take 3.4 us (670 cycles each) and the epilogue 0.4 us. Ablations in the same setup (period): full 5.8 us; no
+D stores 5.8; no MMA 5.0; no MMA and no `ldmatrix` 5.0; none of the three 4.6 us. So tensor cores and stores are not the limit; the
+time is the launch, the first loads and the pipeline refills. Per-block supply without MMA (eager, warm L2) is about 450-460 cycles
+(12.8 KB per K block = 28 B/cycle/SM), the same at 24, 48 and 96 CTAs, i.e. a per-SM TMA ingest limit at that size, not an L2 or
+DRAM limit.
+
+**What the data pointed at.** A scan over K (n=3072, m=256, graph, PDL): DeepGEMM beats b12x at K <= 512 (1.12-1.13x, where all loads
+fit the pipeline and the old code triggered the next launch right after the last load), then drops to 0.91x at K=1024-1536 where the
+trigger moved to the end of the mainloop, and recovers to 0.97-0.98x at K=3072-6144. A trigger distance sweep (math warp triggers when D
+K blocks remain, D = 99 meaning "after the last load"): q_b M=256 (K=1536): D=0 6.07 us, 2: 6.54, 4: 6.06, 6: 5.71, 7: 5.68, 12 or
+99: 5.28-5.29 (b12x 5.52); dense gate_up M=256 (K=7168): D=0 19.34, 1: 20.08, 2: 21.33, 3: 21.17, 4: 21.25, 6: 21.39, 8: 21.50.
+Short grids want the earliest trigger, the 144-CTA grid wants the latest. The old comment in the kernel ("after the last load was
+slower at K=7168: 21.0 vs 19.5 us") was right for the long-K, near-full-grid shapes and wrong for the rest.
+
+**Change (`76dc545`):** the producer triggers right after its last load when the grid fills at most 60% of the SMs (FP4 normal GEMMs;
+a template parameter chosen in `SM120ArchSpec::use_early_pdl_trigger`). All 63 points, a version that triggered early on
+every FP4 grid vs the old trigger (one run each, DG us): 25 points 3-20% faster (q_a/kv_a M=1-64 8.4 -> 7.3, shared gate_up M=32-64
+5.4 -> 4.3, dense gate_up M=1-32 13.6 -> 12.0, o_proj and dense down M=32-256, q_b M=128-512, plus q_a M=2048 and dense gate_up M=128
+at 4-5%), 8 points 4-11% slower (q_a M=128-512, shared gate_up M=512 / 2048, dense gate_up M=256, o_proj / dense down M=512: grids of
+68% or more of the SMs). The 60% rule keeps those on the old trigger (and gives up the two gains above it). The always-early version
+had geomean 1.386 but a worst point of 0.934 (dense gate_up M=256); the rule fixes that.
+
+| | before (`6aebaf0`) | after (`76dc545`) |
+|---|---|---|
+| geomean vs the faster of cudnn / b12x, run 1 / 2 / 3 | 1.334 / 1.338 / 1.337 | 1.393 / 1.396 / 1.397 |
+| best of 3 per point: geomean, wins, >= 1.03x, worst | 1.336, 59 / 63, 58, 0.965 (q_b M=256) | 1.399, 62 / 63, 61, 0.979 (dense gate_up M=256) |
+| q_b M=256 (DG / b12x us) | 5.7 / 5.5 = 0.965x | 5.1 / 5.4 = 1.059x |
+| o_proj M=128 | 7.8 / 7.7 = 0.987x | 6.9 / 7.7 = 1.116x |
+| dense down M=128 | 8.4 / 8.4 = 1.000x | 7.5 / 8.3 = 1.107x |
+| dense gate_up M=256 | 19.0 / 18.6 = 0.979x | 19.0 / 18.6 = 0.979x |
+
+No point's best DeepGEMM time got more than 3% slower; the DeepGEMM time geomean over the 63 points is 0.955x of before. NVFP4 (same
+rule, `--nvfp4`, vs the best FlashInfer / cuBLASLt NVFP4 backend, one run each): geomean 1.171x -> 1.223x, wins 39 -> 47, worst 0.867x
+-> 0.910x, none slower by more than 4%. FP8 and BF16 are not affected (the rule is FP4-only). Verification at the commit (fresh JIT
+cache, `DG_JIT_CHECK_NO_SPILLS=1`, GPU 7): `scripts/sm120_blockscale_check.py --mode all --grouped --repeat 200` ALL OK (170+ cases, 0 of
+200 runs differ on every determinism shape for fp4, nvfp4, fp8g32, fp8g128 and bf16; a later `--mode fp4 --repeat 200` run adds the dense
+down M=128 shape, also 0 of 200), `tests/test_fp8_fp4.py` passes.
+
+**Dense gate_up M=256 is not won (0.98x, a tie).** Evidence:
+- Standalone it is already faster than b12x (21.8 vs 22.6 us in ncu, with 20% fewer instructions). In the graph the two are within run
+  noise (DeepGEMM 19.0-19.4, b12x 18.6-19.7 us across the runs; a sweep ratio anywhere from 0.95x to 1.02x).
+- 144 CTAs of 64x128 over 28 K blocks (3 stages of 128-byte K). Graph-mode trace with MMA and `ldmatrix` stubbed out: the loop takes
+  36.5K cycles against 39.1K for the full kernel (7% less), and a block's loads take 880 cycles with 36 CTAs, 910 with 72 and 1300-1370
+  with 144. Total tile traffic (99 MB L2 -> SM) at 144 CTAs is about 6 TB/s, so this shape is limited by L2 -> SM bandwidth, which
+  b12x shares (same tile and grid).
+- Every tile shape with at most 188 CTAs reads about the same bytes (A re-read by every N block, B by every M block): 64x128 and 128x64
+  both give 99 MB, 64x112 or 64x96 would give 8-17% less but need 168-192 CTAs (96 would put 4 CTAs in a second wave, 112 needs 7
+  8-column tiles per warp, which the paired `ldmatrix` doesn't do). A BLOCK_N = 96 tile (4 x 2 warps of 16x48) was built and bitwise
+  identical to 64x128, but was worth only 1-3% on q_b / o_proj / dense down in a graph test (kernel support reverted), and the
+  dense gate_up gain would be capped by the same L2 limit.
+- An L2 prefetch of the B tiles ahead of the pipeline (`cp.async.bulk.prefetch.tensor`, distance 4 / 8 / 16 K blocks): 19.6 / 20.9 /
+  22.5 us against 19.4: slower, more requests into a saturated L2.
+- Triggering early (above) costs 1-2 us on this shape; never triggering is no better (19.4 us here, but q_a M=256 13.4 and o_proj
+  M=512 20.1 vs 17.3).
+- TMA multicast across a 2-CTA cluster would halve the B traffic, and clusters launch on SM120 (a bulk-copy multicast probe returned the
+  right data in both CTAs), but the tensor-map multicast is not hardware: CUTLASS disables it for SM120 (`CUTE_ARCH_TMA_SM120_ENABLED`),
+  `ptxas` warns that `.multicast::cluster` on `cp.async.bulk{.tensor}` is expected to be slower on this target, and a launch with the
+  raw instruction trapped into `emulate_tma` (`INVALID_DESCRIPTOR_FORMAT` for our FP4 descriptor). It is software-emulated, so it cannot
+  cut L2 traffic.
+- Tried and dropped earlier (sections 9.7 and the status log): other tile choices, the cost-model refit, two CTAs per SM, stream-K at
+  mid M, `DG_SM120_AUTOTUNE=1`.
+The shape stays at the model's pick. Anyone retrying it should start from the L2 -> SM traffic bound above.

@@ -35,9 +35,10 @@ hardware.
   - End to end on a block-FP8 27B model, TPOT is 1.18-1.55x better.
 - **FP4 vs FlashInfer's MXFP4** (the faster of its `cudnn` and `b12x`
   backends, the two that run MXFP4 on SM120), DeepGEMM kernel against
-  FlashInfer kernel: after the cost-model refit
-  (`1b065a2`) DeepGEMM wins 59 of 63 shapes, 1.33x geomean; the other four are
-  ties at 0.96-0.99x. See section 7.5.
+  FlashInfer kernel: with the early PDL trigger (`76dc545`) DeepGEMM wins 62 of
+  63 shapes, 1.40x geomean, worst point 0.979x (it was 59 of 63, 1.34x and
+  0.965x after the cost-model refit `1b065a2`). The one tie left is dense
+  gate_up M=256. See section 7.5.
 - **Also on SM120** (`eff4cea`..`38ef2a2`): NVFP4 (UE4M3 16-element scales);
   BF16/FP4 `alpha`, C accumulation and FP32 output; `tf32_hc_prenorm_gemm`;
   `einsum bmk,bnk->mn` and `fp8_einsum bhr,hdr->bhd`; MQA logits head dim 64
@@ -73,7 +74,7 @@ hardware.
 
 | Repo | Branch | Commits | State |
 |---|---|---|---|
-| DeepGEMM (`https://github.com/nctu6/DeepGEMM`) | `nctu6` | `970b868` kernels, host code, tests, scripts; `3070f4c` setup.py header fallback; `e350464`, `49f3fe1`, `b5adf0e`, `f6bd900` block-scaled FP4 / UE8M0 FP8 GEMMs; `b419c02` PDL, narrow tiles, 8 warps, stage staging, 64-byte FP4 K, PSUM, BF16; `b19d5e8` sweep / fit / check scripts; `eff4cea` joint-mode refit, `eb61610`+`4659181` NVFP4 + alpha/accumulate/FP32, `bfb637c` tf32 hc, `5dfd734` einsum, `38ef2a2` MQA head dim 64; `1b065a2` cost-model refit; `74e1f61` MN-major BF16, native einsum, k-grouped BF16; `9704db0` BF16 / einsum tests on SM120; `4a95a00` stream-K range after `setmaxnreg`; `a765e73` mixed UE8M0 / FP32 scale pair; `9f19e0a` 1D2D SFA row offsets; `24ff5d4` MN-major FP8; `f3a533a` k-grouped FP8; `bc604f7` MN-major `fp8_einsum`; `0285421` paged MQA head dim 32/64; `6a7d45e` batched `fp8_einsum` launch; `2552171` 1D1D 16x32 stream-K spill | `nctu6` head: the docs commit after `2552171` |
+| DeepGEMM (`https://github.com/nctu6/DeepGEMM`) | `nctu6` | `970b868` kernels, host code, tests, scripts; `3070f4c` setup.py header fallback; `e350464`, `49f3fe1`, `b5adf0e`, `f6bd900` block-scaled FP4 / UE8M0 FP8 GEMMs; `b419c02` PDL, narrow tiles, 8 warps, stage staging, 64-byte FP4 K, PSUM, BF16; `b19d5e8` sweep / fit / check scripts; `eff4cea` joint-mode refit, `eb61610`+`4659181` NVFP4 + alpha/accumulate/FP32, `bfb637c` tf32 hc, `5dfd734` einsum, `38ef2a2` MQA head dim 64; `1b065a2` cost-model refit; `74e1f61` MN-major BF16, native einsum, k-grouped BF16; `9704db0` BF16 / einsum tests on SM120; `4a95a00` stream-K range after `setmaxnreg`; `a765e73` mixed UE8M0 / FP32 scale pair; `9f19e0a` 1D2D SFA row offsets; `24ff5d4` MN-major FP8; `f3a533a` k-grouped FP8; `bc604f7` MN-major `fp8_einsum`; `0285421` paged MQA head dim 32/64; `6a7d45e` batched `fp8_einsum` launch; `2552171` 1D1D 16x32 stream-K spill; `76dc545` early PDL trigger for FP4, `2f4e3e0` its comment fix | `nctu6` head: the docs commit after `2f4e3e0` |
 | TokenSpeed | `nctu6` | `1c7a96a73` kernel integration; `0623d1552` PDL sync; `9617cda2c` submodule + install.sh + Docker; `b4cf963fc` SM120 auto-detect in install; `f798e68b4`, `f07f3cc54`, `8222224b8`, `63aaaf957` MXFP4 leaves; `5a532c016` mHC on SM120; `8a33e3341` SM100-only leaves capped; `019b65c04`, `469fc9c4a` NVFP4 fixes; `24a47e492` DeepGEMM submodule pin to `7804663` | `nctu6` head: `24a47e492` |
 
 Test machine: aws-raichu, 8x RTX PRO 6000 Blackwell Server Edition (96 GB,
@@ -185,8 +186,12 @@ It has the same contract as `sm90_fp8_gemm_1d2d_impl`:
   while the previous kernel finishes starts with a full pipeline of weights.
   Only the activations wait. Normal data-parallel GEMMs only: grouped GEMMs
   must read `grouped_layout` first.
-  - The next kernel is triggered by the producer when all K blocks fit the
-    pipeline, otherwise by the math warps at the end of the mainloop.
+  - The next kernel is triggered by the producer right after its last load when
+    all K blocks fit the pipeline, or (FP4, `76dc545`) when the grid fills at most
+    60% of the SMs (`SM120ArchSpec::use_early_pdl_trigger`); otherwise by the
+    math warps at the end of the mainloop. Early triggering on a grid that
+    fills 68% or more of the SMs lost 4-11%: the next kernel's weight pre-issue then
+    competes with the last stages for DRAM.
   - Rejected: triggering at kernel start (slower everywhere), never
     triggering, and extra L2 prefetch beyond the pre-issued stages (neutral
     to worse; a whole-tile prefetch thrashed L2).
@@ -674,7 +679,7 @@ Speedup = best FlashInfer time / DeepGEMM time:
 The table is the run before the cost-model refit, with DeepGEMM winning 60 of
 63 points. After the refit (`1b065a2`, 63 DeepSeek-V3 TP8 points, GPU idle, DeepGEMM kernel
 against FlashInfer MXFP4) the
-geomean speedup rises from 1.315x to 1.33x at 59 of 63 wins. The four ties are
+geomean speedup rose from 1.315x to 1.33x at 59 of 63 wins. The four ties were
 q_b M=256, o_proj M=128, dense gate_up M=256 and dense down M=128 (0.96-0.99x
 vs b12x). Before the refit the first three were within 0.6 us of b12x (q_b
 M=256: 6.0 vs 5.4 us; o_proj M=128: 7.3 vs 7.1; dense gate_up M=256: 20.0 vs
@@ -682,7 +687,50 @@ M=256: 6.0 vs 5.4 us; o_proj M=128: 7.3 vs 7.1; dense gate_up M=256: 20.0 vs
 6.6-7.0 us) with the same CTA count. The analytic model has one cost per tile
 shape, so it can't pick a tile per M, and `DG_SM120_AUTOTUNE=1` is worse
 (geomean 1.318, q_b M=256 0.94x) because eager timing can't see the graph-mode
-PDL overlap. A real margin needs kernel work.
+PDL overlap. The gap was not in the mainloop but in the launch chain between
+GEMMs; the early PDL trigger (`76dc545`, below) closed it on three of the four.
+**Early PDL trigger.** Graph-mode traces of q_b M=256 (per-CTA clock stamps
+written next to D) showed the kernel's CTAs starting only 0.8 us before the
+previous GEMM ended, with the first K block landing 1.3 us after it, and
+ablations (no MMA, no `ldmatrix`, no D stores) left a 4.6 us floor against 5.8 us
+for the full kernel: the time is in launch, pre-issue and first-load latency,
+not in the tensor cores. Triggering the next launch right after the producer's
+last load, instead of when the mainloop ends, hides that for grids that leave
+SMs free. It is chosen on the host (`num CTAs * 10 <= num SMs * 6`, FP4 normal
+GEMMs) because on grids that fill 68% or more of the SMs it loses 4-11%.
+Three runs of the 63-point sweep per build (DeepGEMM kernel against the faster
+of `cudnn` and `b12x`, best of three per point):
+| | wins | >= 1.03x | geomean | worst point |
+|---|---|---|---|---|
+| before (`6aebaf0`) | 59 / 63 | 58 | 1.336x | 0.965x (q_b M=256) |
+| after (`76dc545`) | 62 / 63 | 61 | 1.399x | 0.979x (dense gate_up M=256) |
+| shape | before: DG / FI us, speedup | after |
+|---|---|---|
+| q_b M=256 | 5.7 / 5.5, 0.965x | 5.1 / 5.4, 1.059x |
+| o_proj M=128 | 7.8 / 7.7, 0.987x | 6.9 / 7.7, 1.116x |
+| dense down M=128 | 8.4 / 8.4, 1.000x | 7.5 / 8.3, 1.107x |
+| dense gate_up M=256 | 19.0 / 18.6, 0.979x | 19.0 / 18.6, 0.979x |
+No point's best time got more than 3% slower (DeepGEMM times over the 63
+points: geomean 0.955x of before). The decode and small-M points gain most
+(q_a/kv_a M=1-64 and dense gate_up M=1-32 -12%, shared gate_up M=32-64 -20%).
+NVFP4 uses the same rule: geomean vs the best FlashInfer NVFP4 backend 1.171x
+-> 1.223x, wins 39 -> 47, worst 0.867x -> 0.910x. Results are bitwise identical
+(200-run determinism check, including the new dense down M=128 case).
+**Dense gate_up M=256 stays a tie** (4608x7168, 144 CTAs of 64x128, 28 K blocks;
+DeepGEMM 19.0-19.4 us, b12x 18.6-19.7 us across runs, so 0.98-1.02x). It is
+bound by L2 -> SM traffic, which no kernel change here reduces: stubbing out the
+mainloop's MMA and `ldmatrix` shortens the loop by only 7% (39.1K -> 36.5K cycles),
+the per-block load time is about 880 cycles with 36-72 CTAs but 1300-1370 with 144
+(about 6 TB/s of tile traffic), and an L2 prefetch of B ahead of the stages made it
+slower (prefetch distance 4/8/16 blocks: 19.6/20.9/22.5 us vs 19.4). Every tile with at most 188 CTAs reads about the same
+bytes, and TMA multicast, the only way to read B once for a pair of CTAs, is
+emulated in software on SM120 (a multicast launch traps into `emulate_tma`, which
+rejected our FP4 descriptor), so it is not an option. An early trigger loses 1-2 us on this shape
+(its next kernel's weight loads then compete with the last stages for DRAM).
+In standalone `ncu` runs (no PDL, flushed caches) DeepGEMM's kernel is 12-14%
+slower than b12x on the other three shapes (q_b 8.0 vs 7.2 us, o_proj 10.6 vs 9.4,
+dense down 11.8 vs 10.4) and faster on this one (21.8 vs 22.6 us); the graph-mode
+wins above come from the launch chain, not from a faster mainloop. Details in `deepgemm-analysis.md` section 9.15.
 
 What closed the earlier gaps (cuDNN used to win q_a/kv_a and shared gate_up
 decode by up to 1.3x):
@@ -697,7 +745,8 @@ decode by up to 1.3x):
 - **PDL weight pre-issue.** Before waiting on the previous kernel, the
   producer issues the weight (B, SFB) loads of the first `kNumStages` K blocks.
   Only the activations wait. The next kernel is triggered at the end of the
-  mainloop, or after the last load when all K blocks fit the pipeline.
+  mainloop, or after the last load when all K blocks fit the pipeline or the
+  grid fills at most 60% of the SMs (early trigger, below).
 - **64-byte FP4 K blocks**: twice the stages, for large M.
 - **Refitted cost model** (`get_1d1d_cost`, `sm120_fit_blockscale.py`), fitted
   on a 63-shape sweep of every layout (refit again in `1b065a2`, section 3.4).
@@ -957,8 +1006,8 @@ MXFP4 (the `deepgemm_sm120_mm_mxfp4`, `_mxfp4_linear` and `_mxfp4_swiglu_linear`
 leaves) and `tf32_hc_prenorm_gemm` (mHC) are used, see section 8.
 
 Other notes:
-- The DeepGEMM FP4 kernel beats FlashInfer's MXFP4 backends on 59 of 63
-  points; the other four are ties at 0.96-0.99x (section 7.5).
+- The DeepGEMM FP4 kernel beats FlashInfer's MXFP4 backends on 62 of 63
+  points; the other is a tie (dense gate_up M=256, 0.98x, section 7.5).
 - The V3.2 sparse indexer on SM120 is blocked upstream of DeepGEMM. Its
   kernels work, but TokenSpeed's native DSV4.1 indexer gates on
   `platform.is_blackwell` (arch major 10 only), and the top-k DeepSelect half
@@ -973,11 +1022,13 @@ Other notes:
 
 ## 10. Open items
 
-1. **Four FP4 ties with FlashInfer's b12x at mid M** (q_b M=256, o_proj M=128,
-   dense gate_up M=256, dense down M=128; 0.96-0.99x). Tile choice and the
-   cost-model refit are exhausted. Also tried and dropped: two CTAs per SM
-   (correct, no gain), stream-K at mid M (slower) and `DG_SM120_AUTOTUNE=1`
-   (worse). Needs kernel-level work.
+1. **One FP4 tie with FlashInfer's b12x: dense gate_up M=256** (0.98x). The
+   other three ties of the refit report (q_b M=256, o_proj M=128, dense down
+   M=128) now win by 1.06-1.12x (early PDL trigger, section 7.5). This one is
+   bound by L2 -> SM traffic. Tried and dropped: tile choice, the cost-model
+   refit, two CTAs per SM, stream-K at mid M, `DG_SM120_AUTOTUNE=1`, an L2
+   prefetch of B, an early or a never PDL trigger, and TMA multicast (emulated
+   in software on SM120).
 2. **V3.2 sparse indexer in TokenSpeed on SM120**: an SM120 smem-reduced
    DeepSelect port and the `is_blackwell` gates (section 9). Out of DeepGEMM
    scope.
