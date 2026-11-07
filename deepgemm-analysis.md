@@ -40,6 +40,13 @@ new work so we don't drift into one of the known dead ends.
 | Test (run here) | `ssh aws-raichu`, `/workspace/nctu6/infra/DeepGEMM`, branch `nctu6` | `/workspace` resolves to `/unieai`. **GPU 7 only**: always `CUDA_VISIBLE_DEVICES=7` |
 | Runtime | `/workspace/nctu6/infra/DeepGEMM/.venv` | Python 3.15.0. Never install outside this venv |
 
+**Scratch files.** All temporary files go in `DeepGEMM/tmp/` or
+`tokenspeed/tmp/`, both locally and on aws-raichu (`/workspace/nctu6/infra/DeepGEMM/tmp/`,
+`/workspace/nctu6/infra/tokenspeed/tmp/`), never in `/tmp`, so no write
+permission prompts appear. The folders are git-excluded. Remote helpers:
+`tokenspeed/tmp/ssh_cm/rssh` and `tx` (persistent SSH master plus tmux session
+`sm120`). The full rule is in `tokenspeed/AGENTS.local.md`.
+
 Both checkouts were at HEAD `5081f85` (DeepGEMM 2.8.2) when this was written.
 
 Facts about the remote machine (verified):
