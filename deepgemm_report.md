@@ -604,7 +604,7 @@ Prefill (DeepGEMM logits + Triton radix top-k vs `triton_dsa_prefill_topk_fp8`):
 |---|---|---|---|---|---|
 | speedup | 7.8 | 32.5 | 35.3 | 30.1 | 52.3 |
 
-Top-k overlap with Triton is 0.97-1.00. The inputs are random, so near-ties
+Top-k overlap with Triton is 0.97-1.00. (Prefill rows above use the Triton radix top-k; with the SM120 DeepSelect of section 8 the prefill leaf is a further 1.3-1.9x faster, and decode is unchanged except 128 rows of 64K-128K, 1.04-1.06x.) The inputs are random, so near-ties
 reorder; DeepGEMM's logits match the dequantized reference to 1e-14.
 
 ### 7.4 End to end
@@ -828,8 +828,9 @@ K-major FP8 / FP4 / BF16 timings against a build of `b01788a` did not move
 - `ops/attention/dsa/deep_gemm.py`, `ops/attention/kpool/deep_gemm.py`,
   `ops/moe/deep_ep.py`: the DeepGEMM leaves are capped at 10.3 unless the
   build supports SM120.
-  - DSA prefill on SM120 uses `triton_topk_from_logits`, because
-    `torch.ops.trtllm.indexer_topk_prefill` has no SM120 kernel image.
+  - DSA prefill on SM120 used `triton_topk_from_logits`, because
+    `torch.ops.trtllm.indexer_topk_prefill` has no SM120 kernel image. It now
+    selects with the in-tree CuTe DSL DeepSelect kernel (below).
 - `ops/moe/_deep_gemm/ue8m0.py`: `deep_gemm_requires_ue8m0()` is now
   SM100-family only (`_UE8M0_MAX_ARCH = 10.9`). SM120 uses FP32 scales.
 - Tests: `test/test_deepgemm_sm120_gating.py` and
@@ -843,6 +844,31 @@ K-major FP8 / FP4 / BF16 timings against a build of `b01788a` did not move
   failed in all 10 directories (cache, diffusion, distributed, entrypoints,
   execution, layers, models, moe, sampling, top), with no hangs.
 
+**Indexer top-k and the V4.1 indexer on SM120** (task 13.1, 2026-11-07; details
+in `deepgemm-analysis.md` section 9.16). The V3.2 DeepGEMM indexer leaves were
+already selected on SM120; what was missing was a selector that fits the 99 KB
+of shared memory and a V4.1 route that does not need FP4 paged MQA.
+- `ops/attention/dsa/_cute_dsl/deep_select.py` gained a compact profile for
+  SM120 (256 threads, 4096-entry rounds, a two-stage ring, a 3072-pair
+  candidate buffer filled in two warp groups): 93 KB instead of 207-232 KB,
+  the same selected entries, clusters of 2 and 4 CTAs. The upstream `deep_select`
+  package asserts on shared memory there and stays SM100/SM103 only.
+- V3.2 prefill selects with it (1.3-1.9x over the Triton radix top-k, 8-81x over
+  the Triton leaf in total); V3.2 decode uses it only from 96 rows of 32K+
+  entries or 48 rows of 64K+, where the TRT-LLM cluster runner falls back to a
+  slower kernel (up to 2.7x on the top-k); elsewhere the TRT-LLM runner is
+  as fast or faster.
+- V4.1 `dsv41_index_topk` on SM120 scores FP8 `index_v4` rows with the SM120
+  MQA kernels and selects with the same kernel (`deep_gemm_sm120_dsv41_*`):
+  2.3-7.2x over the Triton leaf for decode Full passes and 1.4-5.1x for chunked
+  prefill. Reindex passes over histories above 16384 rows stay on Triton when
+  rows x history exceeds 2^19, because the SM120 route scores the whole history.
+  The packed-FP4 leaf stays SM100/SM103: DeepGEMM has no paged FP4 MQA kernel on
+  SM120. The runtime still stores 68-byte V4.1 index rows on SM120, so serving
+  does not reach the FP8 route until it selects the `v4` cache (about 45% fewer
+  tokens per byte).
+- Tests: `test_dsa_indexer_sm120.py`, `test_dsv41_indexer_sm120.py`, the Hopper
+  DeepSelect suite now on SM120 too, and registry tests.
 **MXFP4 leaves** (`f798e68b4`, `f07f3cc54`, `8222224b8`, `63aaaf957`). TokenSpeed
 had no NVIDIA MXFP4 `mm` leaf (the Triton one is AMD-only), so dense MXFP4
 linears had no path on SM120. All leaves are `SPECIALIZED`, SM120-gated and
@@ -1008,13 +1034,12 @@ leaves) and `tf32_hc_prenorm_gemm` (mHC) are used, see section 8.
 Other notes:
 - The DeepGEMM FP4 kernel beats FlashInfer's MXFP4 backends on 62 of 63
   points; the other is a tie (dense gate_up M=256, 0.98x, section 7.5).
-- The V3.2 sparse indexer on SM120 is blocked upstream of DeepGEMM. Its
-  kernels work, but TokenSpeed's native DSV4.1 indexer gates on
-  `platform.is_blackwell` (arch major 10 only), and the top-k DeepSelect half
-  needs ~207 KB of shared memory against SM120's 99 KB (a launch fails with
-  `CUDA_ERROR_INVALID_CONFIG`). Enabling it needs an SM120 smem-reduced
-  DeepSelect port in `tokenspeed-kernel` and flipping those gates to
-  `is_blackwell_plus`.
+- The V4.1 packed-FP4 indexer cannot run on SM120: DeepGEMM has no paged FP4
+  MQA kernel there (only FP8 paged and dense/sparse MX). V4.1 uses FP8
+  `index_v4` rows on SM120 instead, and the runtime does not select that cache
+  format yet (section 8). The earlier "blocked by DeepSelect shared memory"
+  finding is closed: the in-tree DeepSelect runs in 93 KB. The V3.2 DeepGEMM
+  indexer leaves were never blocked.
 - Call each GEMM once before CUDA-graph capture, so its counters are
   allocated. TokenSpeed warmup does this.
 - TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107.
@@ -1029,9 +1054,12 @@ Other notes:
    refit, two CTAs per SM, stream-K at mid M, `DG_SM120_AUTOTUNE=1`, an L2
    prefetch of B, an early or a never PDL trigger, and TMA multicast (emulated
    in software on SM120).
-2. **V3.2 sparse indexer in TokenSpeed on SM120**: an SM120 smem-reduced
-   DeepSelect port and the `is_blackwell` gates (section 9). Out of DeepGEMM
-   scope.
+2. **V4.1 indexer on SM120 in serving**: the kernels and leaves are done
+   (section 8); the runtime config must pick the `v4` index cache on SM120,
+   which costs about 45% of the token capacity, for the 2.3-7.2x index-step
+   speedup. A Reindex scorer for FP8 rows that reads only the candidate pool
+   (DeepGEMM's sparse MQA kernel) or a paged FP4 MQA kernel would remove that
+   trade. Out of DeepGEMM scope unless one of those kernels is added.
 3. DeepSeek-V3/V3.2 TP8 end-to-end run. It needs GPUs 0-7, and only GPU 7 was
    available.
 4. Deferred, low value here: mega MoE/gate (NVLink or TMEM/TF32-pipeline
