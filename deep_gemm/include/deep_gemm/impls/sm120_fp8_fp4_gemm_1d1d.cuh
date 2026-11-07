@@ -214,7 +214,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     __syncthreads();
 
     // Register reconfigurations
-    constexpr uint32_t kNumTMARegisters = 40;
+    constexpr uint32_t kNumTMARegisters = kNumMathThreads == 128 ? 56 : 40;
     constexpr uint32_t kNumMathRegisters = kNumMathThreads == 128 ? 248 : 232;
 
     // Block scheduler

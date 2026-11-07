@@ -455,10 +455,6 @@ def test_mn_major_fp8_sm120() -> None:
         os.environ['DG_SM120_MN_MAJOR_FP8'] = route
         for kind in ('1d2d', 'g32', 'g128'):
             for m, n, k in shapes:
-                if kind != '1d2d' and n < 1024 and m <= 256 and k <= 1152:
-                    # NOTES: the K-major 16x32 stream-K tile of the packed-UE8M0 FP8 kernel spills registers (ptxas, under
-                    # `DG_JIT_CHECK_NO_SPILLS=1`) with or without MN-major operands: kept out of this test
-                    continue
                 a_bf16 = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
                 b_bf16 = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
                 if kind == '1d2d':
