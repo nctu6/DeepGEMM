@@ -914,12 +914,26 @@ portable Triton leaves but declared no upper arch bound, so auto selection
 picked them on SM120 and crashed: flashinfer_trtllm DSA decode/prefill (cap
 10.7), FlashMLA DSA and DSV4 decode/prefill (cap 10.9), `tokenspeed_mla` decode
 (cap 10.7), and `fast_hadamard_transform` (no SM120 cubin; cap 10.3). They are
-capped by arch window, not ported.
+capped by arch window, not ported. The DSA sparse attention they would have
+served on SM120 now has its own tensor-core core (below); `tokenspeed_mla`,
+FlashMLA DSV4/V4.1 and `fast_hadamard_transform` are still capped.
 `test_sm120_excludes_sm100_only_leaves` checks against the real registrations
 that none is offered to an SM120 platform and Triton still is. The DeepGEMM DSA
 top-k leaves also use a stable-sort fallback for batch-invariant selection
 where flashinfer's FilteredTopK can't run (99 KiB shared memory; `a6d0f1682`).
 
+**DSA sparse attention** (task 13.2, `analysis` section 9.17). SM120 served
+`dsa_decode` / `dsa_prefill` with `triton_dsa_*`, one CUDA-core program per
+(token, head). The new `triton_dsa_mma_decode` / `triton_dsa_mma_prefill`
+(`ops/attention/dsa/_triton/sparse_mma.py`, window 12.0-12.9, dense BF16 or
+E4M3 latent cache) tile the heads of a token over one gather of the selected
+rows and run QK and PV on `mma.sync`. They are 27-146x faster at 16-128 heads,
+decode batch 1-128 and prefill chunks 128-8192 (E4M3, 128 heads: decode 13.6
+us at batch 1 and 538 us at 128, prefill 29.5 ms for 8192 tokens), with the
+same error against a float32 reference. They reach 136-158 TFLOP/s, about
+25-30% of the tensor-pipe floor. They use no DeepGEMM code. Not covered: the
+packed FP8 sparse cache, zero-width RoPE and batch-invariant plans keep the
+portable kernels.
 **NVFP4 fixes.** `019b65c04`: a checkpoint with one GEMM1 input scale for all
 experts (Qwen3.5-122B-A10B-NVFP4) loads it with shape `(1,)`, but
 `cutlass_fused_moe` accepts only a 0-d scalar or one value per local expert, so
@@ -1069,7 +1083,13 @@ Other notes:
    The native BF16 einsum (deterministic mode only) still launches a GEMM per
    head; the batched kernel path would serve it, but the default BF16 einsum
    is cuBLASLt, so it was left alone.
-5. Optional: publish a `tokenspeed-deepgemm` wheel from this fork. No longer
+5. **DSA sparse attention is a Triton `mma.sync` kernel, 25-30% of the
+   tensor-pipe floor.** A CuTe DSL kernel (TMA or `cp.async` gathers,
+   `ldmatrix`, warp-specialized softmax) could gain up to about 3x; the
+   Triton variants tried (pipelined loop, register caps, other tile and warp
+   counts) were all slower (section 9.17 of the analysis). It is not
+   batch-invariant (the split count follows the batch).
+6. Optional: publish a `tokenspeed-deepgemm` wheel from this fork. No longer
    required, since the source build replaces the wheel.
 
 ## 11. Reproducing
