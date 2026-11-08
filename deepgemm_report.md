@@ -63,7 +63,8 @@ hardware.
   on other GPUs it keeps the published wheel. TokenSpeed calls the FP8
   block-scaled GEMM, the MXFP4 linear and SwiGLU leaves, and the mHC kernels
   (section 8).
-- **Test status** (GPU 7, `DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache):
+- **Task 15 (final verification, 2026-11-08):** the SM120 DSA sparse attention is now batch-invariant (a token's row no longer depends on the batch; 1.21x slower on geomean, still 22-114x over the portable kernel), the one intermittent runtime test failure did not reproduce, and every suite passes: TokenSpeed kernel suite 7581 passed, runtime suite 8994 passed (0 failed in both), the DeepGEMM SM120 surface below, and four end-to-end models. Section 7.8 has the per-op table (SM120 kernel against the best Triton / FlashInfer kernel, with the worst shape, what is unsupported and why, and what is left for a CuTe DSL rewrite).
+- **Test status** (GPU 7, `DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache; rerun on 2026-11-08 at the final tree, all exit 0):
   `test_fp8_fp4` (6 test functions), `test_bf16` (7), `test_einsum` (8),
   `test_layout` (3), `test_hyperconnection` (1) and `test_attention` (2) pass;
   `sm120_mqa_check.py` 46 cases and `sm120_blockscale_check.py --mode all
@@ -75,7 +76,7 @@ hardware.
 | Repo | Branch | Commits | State |
 |---|---|---|---|
 | DeepGEMM (`https://github.com/nctu6/DeepGEMM`) | `nctu6` | `970b868` kernels, host code, tests, scripts; `3070f4c` setup.py header fallback; `e350464`, `49f3fe1`, `b5adf0e`, `f6bd900` block-scaled FP4 / UE8M0 FP8 GEMMs; `b419c02` PDL, narrow tiles, 8 warps, stage staging, 64-byte FP4 K, PSUM, BF16; `b19d5e8` sweep / fit / check scripts; `eff4cea` joint-mode refit, `eb61610`+`4659181` NVFP4 + alpha/accumulate/FP32, `bfb637c` tf32 hc, `5dfd734` einsum, `38ef2a2` MQA head dim 64; `1b065a2` cost-model refit; `74e1f61` MN-major BF16, native einsum, k-grouped BF16; `9704db0` BF16 / einsum tests on SM120; `4a95a00` stream-K range after `setmaxnreg`; `a765e73` mixed UE8M0 / FP32 scale pair; `9f19e0a` 1D2D SFA row offsets; `24ff5d4` MN-major FP8; `f3a533a` k-grouped FP8; `bc604f7` MN-major `fp8_einsum`; `0285421` paged MQA head dim 32/64; `6a7d45e` batched `fp8_einsum` launch; `2552171` 1D1D 16x32 stream-K spill; `76dc545` early PDL trigger for FP4, `2f4e3e0` its comment fix | `nctu6` head: the docs commit after `2f4e3e0` |
-| TokenSpeed | `nctu6` | `1c7a96a73` kernel integration; `0623d1552` PDL sync; `9617cda2c` submodule + install.sh + Docker; `b4cf963fc` SM120 auto-detect in install; `f798e68b4`, `f07f3cc54`, `8222224b8`, `63aaaf957` MXFP4 leaves; `5a532c016` mHC on SM120; `8a33e3341` SM100-only leaves capped; `019b65c04`, `469fc9c4a` NVFP4 fixes; `24a47e492` DeepGEMM submodule pin to `7804663` | `nctu6` head: `24a47e492` |
+| TokenSpeed | `nctu6` | `1c7a96a73` kernel integration; `0623d1552` PDL sync; `9617cda2c` submodule + install.sh + Docker; `b4cf963fc` SM120 auto-detect in install; `f798e68b4`, `f07f3cc54`, `8222224b8`, `63aaaf957` MXFP4 leaves; `5a532c016` mHC on SM120; `8a33e3341` SM100-only leaves capped; `019b65c04`, `469fc9c4a` NVFP4 fixes; `24a47e492` DeepGEMM submodule pin to `7804663`; `36211b436` batch-invariant SM120 DSA attention; `990e3e6cd` free ports in `test_control_server.py`; final pin to the DeepGEMM docs head | `nctu6` head: the DeepGEMM pin bump after the docs commit (below) |
 
 Test machine: aws-raichu, 8x RTX PRO 6000 Blackwell Server Edition (96 GB,
 188 SMs), CUDA 13.2, driver 595.99.02, PCIe only (no NVLink). All tests and
@@ -835,6 +836,74 @@ dequantized first, which measured 5-7x slower than the batched launch.
 K-major FP8 / FP4 / BF16 timings against a build of `b01788a` did not move
 (geomean 0.99-1.00, worst +0.4%, over 126 points).
 
+### 7.8 Per-op summary on SM120 (task 15)
+
+One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Triton or FlashInfer kernel that TokenSpeed has on SM120 for the same op. Ratio is baseline time over SM120-kernel time, so above 1 means the SM120 kernel is faster. Every number comes from the sections and commits named in the last column; only the DSA row was re-measured for this task (batch invariance, `36211b436`). Method as in 7.1 (CUDA graph, cold weights, interleaved runs) unless the source section says otherwise.
+
+| Op | SM120 kernel | Baseline | Geomean | Range | Worst shape | Source |
+|---|---|---|---|---|---|---|
+| FP8 dense GEMM (FP32 1x128 / 128x128 scales) | DeepGEMM `sm120_fp8_gemm_1d2d` | best of Triton, FlashInfer block-FP8 | 1.61x (112 TP8 points) | 0.94-4.0x; decode 1.2-4.0x, prefill at parity | 0.94x, 7 points at 0.94-0.99x (q_b M=2048/4096, kv_b M=256, o_proj M=1024, shared gate_up M=4096, shared down M=4096/8192) | 7.2 |
+| FP4 GEMM (MXFP4) | DeepGEMM `sm120_fp8_fp4_gemm_1d1d` | FlashInfer MXFP4, faster of `cudnn` / `b12x` | 1.40x (63 points, 62 wins) | worst 0.979x | 0.979x dense gate_up M=256 (L2-bound tie) | 7.5, analysis 9.15 |
+| FP4 GEMM vs block-FP8 | same | best Triton / FlashInfer block-FP8 | not recorded | 1.07-9.1x | 1.07x (K = 256 `shared down`, large M) | 1 |
+| NVFP4 GEMM | same, 16-element UE4M3 scales | best FlashInfer NVFP4 (`b12x`, `cute-dsl`, `cudnn`, cuBLASLt) | 1.223x (47 of 63 wins) | worst 0.910x; up to 3.4x against cuBLASLt on N=512 | 0.910x | 7.5, 7.6 |
+| MXFP4 linear leaf (activation quantization included) | TokenSpeed `deepgemm_sm120_mxfp4_linear` | FlashInfer quantize + best `mm_fp4` | 1.23x (60 of 63 wins) | worst 0.90x | 0.90x q_b M=256; 0.97x M=1 of o_proj and dense down | 8 |
+| BF16 GEMM | same 1D1D kernel without scales | cuBLASLt (stays the default for `bf16_gemm_nt`) | not measured | | | 7.5 |
+| MN-major FP8 operands | DeepGEMM `fp8_fp4_gemm_nn/tn/tt` | explicit byte transpose + K-major kernel; Triton on the strided operand | 1.63x vs transpose (B operand, M <= 64) | 0.97-1.96x vs transpose; 1.65-4.6x vs Triton | 0.97x (low end of the B-operand range) | 7.7 |
+| k-grouped FP8 | DeepGEMM `k_grouped_fp8_gemm_tn/nt_contiguous` | per-group transpose + K-major kernel; torch BF16 loop | not recorded | 1.11-2.06x vs transpose; 0.76-1.00x vs the torch loop | 0.76x, small-K groups (4096x7168), where the torch loop wins | 7.7 |
+| `fp8_einsum` (3 expressions) | DeepGEMM batched launch | best of cuBLASLt BF16, per-head torch loop, `torch.einsum` | 1.52x (time ratio 0.66; 26 shapes) | worst 0.99x | 0.99x (time ratio 1.007), `bhd,bhr->hdr` h=8, b=128, a tie at the FP32 D-traffic bound | 7.7 |
+| MQA logits indexer (`fp8_mqa_logits`, paged) | DeepGEMM logits + `dsa_decode_topk` / `dsa_prefill_topk` | Triton DSA indexer leaves | not recorded | decode 3.4-19.3x, prefill 7.8-52x | 3.4x decode, 1 x 4K | 7.3 |
+| DeepSelect top-k (V3.2 prefill) | in-tree CuTe DSL, 93 KB on SM120 | Triton radix top-k | not recorded | 1.3-1.9x on the leaf; decode up to 2.7x on the top-k from 96 rows of 32K+ | selected only where it wins; at 16K or fewer than 48 rows it loses 1.4-2x and is not selected | analysis 9.16 |
+| V4.1 indexer (FP8 `index_v4` rows) | `deep_gemm_sm120_dsv41_*` | Triton leaves | not recorded | decode 2.3-7.2x, chunked prefill 1.4-5.1x | Reindex over long histories (0.54-0.99x, kept on Triton); serving does not reach it yet (68-byte rows) | analysis 9.16 |
+| DSA sparse attention | TokenSpeed `triton_dsa_mma_decode` / `_prefill` | `triton_dsa_decode` / `_prefill` | 72x (64 buckets: 16-128 heads, decode batch 1-128, prefill 128-8192, E4M3 and BF16) | 22-114x | 22x, BF16 decode, 16 heads, 1 request | 7.8.1 |
+| MLA decode | TokenSpeed `triton_mla_mma_decode_with_kvcache` | portable `triton_mla_decode_with_kvcache` (FlashInfer / `tokenspeed_mla` cannot run on SM120) | not recorded | 14-131x | 14x | analysis 9.19 |
+| V4 / V4.1 selected attention (prefill) | TokenSpeed `triton_dsv4_mma_prefill` | `triton_dsv4_prefill` (FlashMLA cannot run on SM120) | not recorded | 4-9x | 4x | analysis 9.19 |
+| Hadamard 128 | TokenSpeed `triton_hadamard_transform_128_mma` | portable `triton_hadamard_transform_128` | not recorded | 0.9x at 1 token; 20-117x from 64 tokens | 0.9x at 1 token (2.1 vs 1.9 us, launch-bound); 2.7x at 8 tokens; 55x at 16K and 64K tokens (at the copy roofline) | analysis 9.19 |
+| mHC | DeepGEMM `tf32_hc_prenorm_gemm` leaves | Triton | not recorded | `mhc_pre` 1.5-13.6x, `mhc_mixes` 1.6-15x | 1.5x `mhc_pre` | 8 |
+
+#### 7.8.1 DSA sparse attention after batch invariance
+
+`triton_dsa_mma_*` used to split a token's selection by the token count, so a token's output depended on its batch (the bug `1334fcd70` fixed for the V4 leaf). A selection is now cut into at most 8 chunks by its width alone, each chunk keeps its own online-softmax state, and the states are folded in order by one helper in registers or, for small batches, by a second kernel; rows and LSE are bitwise the same for any batch size, head tile and split count, and the leaves declare `batch_invariant`, `cuda_graph` and `slot_order` (`36211b436`). The price is a second accumulator: the 32-head tile now holds 255 registers and spills 34 (E4M3) to 52 (BF16) of them.
+
+Same 64 buckets as 13.2 (CUDA graph, GPU 7), before and after:
+
+| | before | after |
+|---|---|---|
+| geomean cost | 1.00x | 1.21x |
+| worst bucket | 1.00x | 1.86x (decode of one request: 17-24 us instead of 10-14 us) |
+| E4M3 prefill | | +2-9% (up to +35% for 128-token chunks of 64-128 heads) |
+| BF16 prefill | | +5-9% at 16 heads, +28-37% at 32-128 heads |
+| decode of 8-128 requests | | -5% to +51% (E4M3), -5% to +36% (BF16) |
+| speed-up over `triton_dsa_*` | 38-147x, 86x geomean | 22-114x, 72x geomean |
+
+Every bucket still beats `triton_dsa_*` by at least 22x. Tried and dropped: 16 chunks (prefill unchanged, 1.4-2.2x slower for 8-128 requests of 64-128 heads because of the stored chunk states), 4 chunks (1.32x geomean, 3.6x worst), 16 warps (58-68 spills at 128 registers). Details in `deepgemm-analysis.md` section 9.20.
+
+#### 7.8.2 What SM120 does not run, and why
+
+| Not supported | Reason |
+|---|---|
+| Mega MoE (`fp8_fp4_mega_moe`) | its point is symmetric-memory dispatch across ranks over NVLink; this box is PCIe-only and SM120 has no NVLink symmetric memory |
+| Mega gate, mega mHC | rewritten around TMEM / UMMA (`tcgen05`), which SM120 does not have |
+| FlashMLA DSV4/V4.1, FlashMLA DSA, flashinfer trtllm-gen DSA, `tokenspeed_mla` | `wgmma` / `tcgen05` kernels with no sm_120 cubin; replaced by the Triton `mma.sync` leaves above |
+| `fast_hadamard_transform` wheel | ships sm_90/100/103 cubins and no PTX (the upstream source builds for sm_120 but is 1.6x slower than the Triton leaf at 64K rows) |
+| MN-major FP4 operands | no sub-byte transposing `ldmatrix` (FP8 has `.b8`, BF16 the 16-bit form) |
+| Quantized-D (FP8 output) epilogues, custom epilogue classes | SM100 epilogues built on TMEM |
+| TMA multicast | emulated in software on SM120 (a multicast launch traps into `emulate_tma`), so FP4 at dense gate_up M=256 stays a tie |
+| Paged FP4 MQA, paged MQA with a head dim other than 32/64/128, SM100's varlen paged API | no kernel; 68-byte V4.1 rows stay on Triton |
+| `fp8_einsum` with accumulation `c` for `bhd,hdr->bhr` / `bhr,hdr->bhd` | SM120 FP8 bmm has no accumulation epilogue |
+
+#### 7.8.3 Headroom for a CuTe DSL rewrite
+
+The attention kernels are Triton `mma.sync` and sit at 25-35% of the tensor-pipe floor (cuBLAS reaches E4M3 582 and BF16 413 TFLOP/s on this GPU); TMA or `cp.async` gathers with `ldmatrix` and a warp-specialized softmax could gain up to about 3x:
+
+| Kernel | Now | Floor |
+|---|---|---|
+| DSA sparse attention | 136-158 TFLOP/s before batch invariance | about 540 TFLOP/s (E4M3 QK 779, 16-bit PV 404); a CuTe kernel with a single accumulator would also recover the 1.21x spill cost |
+| V4 selected attention prefill | 106-112 TFLOP/s | |
+| MLA decode, 128 heads | 75-142 TFLOP/s | 16 heads is at the memory roofline |
+| MLA prefill (`triton_mla_prefill`) | 104-146 TFLOP/s | |
+
+FP8 dense GEMM at large M reaches 730-750 TFLOPS (81-83% of the 906 TFLOPS `mma.sync` peak) and the FP4 / BF16 kernels share its mainloop, so the GEMMs have no comparable headroom.
+
 ## 8. TokenSpeed integration
 
 **Kernel registration** (`tokenspeed-kernel`, commit `1c7a96a73`):
@@ -963,8 +1032,8 @@ decode batch 1-128 and prefill chunks 128-8192 (E4M3, 128 heads: decode 13.6
 us at batch 1 and 538 us at 128, prefill 29.5 ms for 8192 tokens), with the
 same error against a float32 reference. They reach 136-158 TFLOP/s, about
 25-30% of the tensor-pipe floor. They use no DeepGEMM code. Not covered: the
-packed FP8 sparse cache, zero-width RoPE and batch-invariant plans keep the
-portable kernels.
+packed FP8 sparse cache keeps the portable kernels. (Zero-width RoPE and
+batch-invariant plans are covered since tasks 14 and 15.)
 **SM120 leaves for the capped SM100-only kernels** (task 14, `analysis`
 section 9.19; TokenSpeed only, no DeepGEMM code). Measured on an RTX PRO 6000
 against the fallback SM120 used before and against the device rooflines
@@ -1143,16 +1212,16 @@ Other notes:
    tensor-pipe floor.** A CuTe DSL kernel (TMA or `cp.async` gathers,
    `ldmatrix`, warp-specialized softmax) could gain up to about 3x; the
    Triton variants tried (pipelined loop, register caps, other tile and warp
-   counts) were all slower (section 9.17 of the analysis). It is not
-   batch-invariant (the split count follows the batch). It now also serves the
-   zero-RoPE GLM-5.3-Flash layout (task 14).
+   counts) were all slower (section 9.17 of the analysis). It is
+   batch-invariant since task 15 (fixed chunks by width, 1.21x geomean cost
+   from a second accumulator that spills 34-52 registers; section 7.8.1), and
+   serves the zero-RoPE GLM-5.3-Flash layout (task 14).
 6. Optional: publish a `tokenspeed-deepgemm` wheel from this fork. No longer
    required, since the source build replaces the wheel.
 7. **SM120 replacements for the capped SM100-only leaves** (task 14). Done:
    Hadamard, MLA decode, V4 selected attention, zero-RoPE DSA (section 8).
    Open: CuTe DSL versions of the three attention kernels (up to about 3x on
-   compute-bound shapes); the DSA cores split by token count, so their prefill
-   rows depend on the batch (the V4 leaf's fixed-chunk fold would fix it); a V4
+   compute-bound shapes); a V4
    decode kernel that reads the FP8 page-planar rows directly instead of a BF16
    workspace.
 
