@@ -937,10 +937,11 @@ On RTX PRO 6000 (CUDA graph), DeepGEMM vs Triton: `mhc_pre` 1.5-13.6x faster,
 portable Triton leaves but declared no upper arch bound, so auto selection
 picked them on SM120 and crashed: flashinfer_trtllm DSA decode/prefill (cap
 10.7), FlashMLA DSA and DSV4 decode/prefill (cap 10.9), `tokenspeed_mla` decode
-(cap 10.7), and `fast_hadamard_transform` (no SM120 cubin; cap 10.3). They are
-capped by arch window, not ported. The DSA sparse attention they would have
-served on SM120 now has its own tensor-core core (below); `tokenspeed_mla`,
-FlashMLA DSV4/V4.1 and `fast_hadamard_transform` are still capped.
+(cap 10.7), and `fast_hadamard_transform` (no SM120 cubin; cap 10.3). The caps
+stay: none can be ported as is (wgmma/tcgen05/TMEM, or no sm_120 image). SM120
+runs its own tensor-core Triton leaves for what they served (task 14, below,
+and the DSA cores of task 13.2); `test_sm120_runs_its_own_leaves` pins which
+leaf replaces which.
 `test_sm120_excludes_sm100_only_leaves` checks against the real registrations
 that none is offered to an SM120 platform and Triton still is. The DeepGEMM DSA
 top-k leaves also use a stable-sort fallback for batch-invariant selection
@@ -964,6 +965,25 @@ same error against a float32 reference. They reach 136-158 TFLOP/s, about
 25-30% of the tensor-pipe floor. They use no DeepGEMM code. Not covered: the
 packed FP8 sparse cache, zero-width RoPE and batch-invariant plans keep the
 portable kernels.
+**SM120 leaves for the capped SM100-only kernels** (task 14, `analysis`
+section 9.19; TokenSpeed only, no DeepGEMM code). Measured on an RTX PRO 6000
+against the fallback SM120 used before and against the device rooflines
+(copy 1461 GB/s, cuBLAS 413 TFLOP/s BF16):
+
+| Capped leaf | Users | SM120 fallback before | New SM120 leaf | Result |
+|---|---|---|---|---|
+| `fast_hadamard_transform` | GLM-5.3-Flash indexer query | `triton_hadamard_transform_128` (25 GB/s) | `triton_hadamard_transform_128_mma` (one `mma.sync` matmul by the sign matrix) | 55-117x from 512 tokens; at the copy roofline from 16K rows; 1.6x faster than the upstream CUDA source built for sm_120 |
+| `tokenspeed_mla` decode | MLA decode (DeepSeek V3-style, Kimi-K3), MTP verify and draft blocks | `triton_mla_decode_with_kvcache` (16-218x off the memory roofline) | `triton_mla_mma_decode_with_kvcache` (heads share each cache tile, split-K) | 14-131x; 0.9-1.5x of the memory roofline at 16 heads, 75-142 TFLOP/s at 128 |
+| FlashMLA DSV4/V4.1 | DeepSeek V4/V4.1 selected attention (prefill and decode) | `triton_dsv4_prefill` | `triton_dsv4_mma_prefill` (batch-invariant fixed-chunk fold) | 4-9x; 106-112 TFLOP/s at 2048 tokens |
+| flashinfer trtllm-gen DSA | V3.2 / GLM-5.3-Flash DSA | `triton_dsa_mma_*` (13.2), except zero-RoPE | zero RoPE added to the 13.2 cores | 29-134x on the GLM-5.3-Flash layout; no other gap (the packed sparse cache has no runtime user) |
+
+Kimi-K3 also defaulted its history consumer to the `tokenspeed_mla` backend on
+every non-AMD GPU; on SM120 it now resolves to the generic `mla` backend, which
+reaches the new decode leaf (`252f7686c`). Commits: `98d36c7b8` (Hadamard),
+`51019f24b` (MLA decode), `4bfa4febf` and `1334fcd70` (V4 attention and its
+batch-invariance fix), `5c24472f2` (zero-RoPE DSA), `252f7686c` (K3 default),
+`23c1ef371` (selection test); docs `caae09a85`, `30277183e`.
+
 **NVFP4 fixes.** `019b65c04`: a checkpoint with one GEMM1 input scale for all
 experts (Qwen3.5-122B-A10B-NVFP4) loads it with shape `(1,)`, but
 `cutlass_fused_moe` accepts only a 0-d scalar or one value per local expert, so
@@ -1084,6 +1104,11 @@ Other notes:
   format yet (section 8). The earlier "blocked by DeepSelect shared memory"
   finding is closed: the in-tree DeepSelect runs in 93 KB. The V3.2 DeepGEMM
   indexer leaves were never blocked.
+- The SM100-only attention and Hadamard kernels (FlashMLA, `tokenspeed_mla`,
+  trtllm-gen, the `fast_hadamard_transform` wheel) stay capped off SM120;
+  their SM120 replacements are Triton `mma.sync` kernels at 25-35% of the
+  tensor-pipe floor on compute-bound shapes (the Hadamard leaf and 16-head MLA
+  decode are at the memory roofline).
 - Call each GEMM once before CUDA-graph capture, so its counters are
   allocated. TokenSpeed warmup does this.
 - TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107.
@@ -1119,9 +1144,17 @@ Other notes:
    `ldmatrix`, warp-specialized softmax) could gain up to about 3x; the
    Triton variants tried (pipelined loop, register caps, other tile and warp
    counts) were all slower (section 9.17 of the analysis). It is not
-   batch-invariant (the split count follows the batch).
+   batch-invariant (the split count follows the batch). It now also serves the
+   zero-RoPE GLM-5.3-Flash layout (task 14).
 6. Optional: publish a `tokenspeed-deepgemm` wheel from this fork. No longer
    required, since the source build replaces the wheel.
+7. **SM120 replacements for the capped SM100-only leaves** (task 14). Done:
+   Hadamard, MLA decode, V4 selected attention, zero-RoPE DSA (section 8).
+   Open: CuTe DSL versions of the three attention kernels (up to about 3x on
+   compute-bound shapes); the DSA cores split by token count, so their prefill
+   rows depend on the batch (the V4 leaf's fixed-chunk fold would fix it); a V4
+   decode kernel that reads the FP8 page-planar rows directly instead of a BF16
+   workspace.
 
 ## 11. Reproducing
 
