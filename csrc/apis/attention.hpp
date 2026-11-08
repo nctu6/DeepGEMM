@@ -44,7 +44,25 @@ static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std:
     const auto [_num_q_tokens, _num_heads] = get_shape<2>(weights);
     DG_HOST_ASSERT(num_q_tokens == _num_q_tokens and num_heads == _num_heads);
     DG_HOST_ASSERT(weights.stride(1) == 1 and (weights.stride(0) * weights.element_size()) % 16 == 0);
-    DG_HOST_ASSERT(weights.scalar_type() == ((arch_major == 10 or (arch_major == 12 and is_mx_sf)) ? torch::kBFloat16 : torch::kFloat32));
+    // SM100 takes BF16 weights. SM120 block-scaled MQA takes BF16 (the SM100 contract) or FP32 weights; the FP8 kernels
+    // of SM90 and SM120 take FP32
+    if (arch_major == 12 and is_mx_sf)
+        DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 or weights.scalar_type() == torch::kFloat32);
+    else
+        DG_HOST_ASSERT(weights.scalar_type() == (arch_major == 10 ? torch::kBFloat16 : torch::kFloat32));
+}
+
+// Logits dtype: BF16 for the block-scaled (MX) kernels, FP32 for the FP8 per-token-scale ones. SM120 block-scaled MQA also
+// writes FP32 logits on request (a selector that ranks the rows wants every bit), the other kernels have the one dtype
+static at::ScalarType get_mqa_logits_dtype(const int& arch_major, const bool& is_mx_sf,
+                                           const std::optional<at::ScalarType>& logits_dtype) {
+    const auto default_dtype = (arch_major == 10 or (arch_major == 12 and is_mx_sf)) ? torch::kBFloat16 : torch::kFloat32;
+    if (not logits_dtype.has_value())
+        return default_dtype;
+    DG_HOST_ASSERT(logits_dtype.value() == torch::kFloat32 or logits_dtype.value() == torch::kBFloat16);
+    DG_HOST_ASSERT((logits_dtype.value() == default_dtype or (arch_major == 12 and is_mx_sf)) and
+                   "Only the SM120 block-scaled MQA logits kernels write a non-default logits dtype");
+    return logits_dtype.value();
 }
 
 static torch::Tensor get_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_start,
@@ -74,14 +92,15 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
                                         const torch::Tensor& cu_seq_len_k_start,
                                         const torch::Tensor& cu_seq_len_k_end,
                                         const int& max_seqlen_k,
-                                        const std::optional<torch::Tensor>& schedule_meta = std::nullopt) {
+                                        const std::optional<torch::Tensor>& schedule_meta = std::nullopt,
+                                        const std::optional<at::ScalarType>& logits_dtype = std::nullopt) {
     const auto [q_fp, q_sf] = q;
     const auto [kv_fp, kv_sf] = kv;
     const auto qk_dtype = q_fp.scalar_type();
     const bool is_fp4 = qk_dtype == kPackedFP4;
     const bool is_mx_sf = q_sf.has_value();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = (arch_major == 10 or (arch_major == 12 and is_mx_sf)) ? torch::kBFloat16 : torch::kFloat32;
+    const auto out_dtype = get_mqa_logits_dtype(arch_major, is_mx_sf, logits_dtype);
 
     // Check Q, SF Q and weights
     const auto [seq_len, num_heads, head_dim] = get_logical_shape<3>(q_fp);
@@ -196,7 +215,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                               const torch::Tensor& block_table,
                                               const torch::Tensor& schedule_meta,
                                               const int& max_context_len,
-                                              const std::optional<torch::Tensor>& indices) {
+                                              const std::optional<torch::Tensor>& indices,
+                                              const std::optional<at::ScalarType>& logits_dtype = std::nullopt) {
     const auto [q_fp, q_sf] = q;
     const auto qk_dtype = q_fp.scalar_type();
     const bool is_fp4 = qk_dtype == kPackedFP4;
@@ -207,7 +227,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     int block_table_stride = block_table.stride(0);
     int num_sms = runtime->get_num_sms();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = (arch_major == 10 or (arch_major == 12 and is_mx_sf)) ? torch::kBFloat16 : torch::kFloat32;
+    const auto out_dtype = get_mqa_logits_dtype(arch_major, is_mx_sf, logits_dtype);
 
     // Check Q, SF Q and weights
     const auto [batch_size, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
@@ -294,9 +314,10 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                   batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                   is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
     } else if (arch_major == 12) {
-        DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
         DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
-        sm120_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, schedule_meta,
+        // The kernel keeps the weights in FP32 shared memory; BF16 weights (the SM100 contract) are widened first
+        const auto weights_fp32 = weights.scalar_type() == torch::kFloat32 ? weights : weights.to(torch::kFloat32).contiguous();
+        sm120_fp8_paged_mqa_logits(q_fp, q_sf, kv_cache, kv_cache_sf, weights_fp32, context_lens, logits, block_table, schedule_meta,
                                    batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                    aligned_max_context_len, block_table_stride, num_sms, split_kv);
     } else {
@@ -484,7 +505,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("max_seqlen_k"),
-          py::arg("schedule_meta") = std::nullopt);
+          py::arg("schedule_meta") = std::nullopt,
+          py::arg("logits_dtype") = std::nullopt);
     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
           py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
           py::arg("indices") = std::nullopt);
@@ -492,7 +514,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
           py::arg("max_context_len"),
-          py::arg("indices") = std::nullopt);
+          py::arg("indices") = std::nullopt,
+          py::arg("logits_dtype") = std::nullopt);
     m.def("get_sparse_mqa_logits_metadata", &get_sparse_mqa_logits_metadata,
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("num_kv_tokens"),
           py::arg("sparse_kv_block_indices"), py::arg("qk_dtype"), py::arg("sparse_block_kv"),

@@ -23,6 +23,7 @@ template <uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          bool kIsMX, bool kIsFP4,
           typename logits_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
@@ -31,16 +32,22 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
                                const uint32_t* block_table, const uint32_t* indices,
                                const uint32_t* schedule_meta,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_q,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
     DG_STATIC_ASSERT(not kIsVarlen, "Varlen is not supported for SM120 paged MQA logits");
+    DG_STATIC_ASSERT(kIsMX or not kIsFP4, "FP4 operands carry block scales");
 
     // Types
     // NOTES: SM120 has no WGMMA, each math warp computes 16 KV rows against all `kNextN * kNumHeads` Q rows
     // with `mma.sync`, keeping the SM90 WGMMA accumulator layout (see `warp_mma_16xNxHd_ss`)
     static constexpr uint32_t kNumAccum = kNextN * kNumHeads / 2;
     DG_STATIC_ASSERT(kHeadDim == 128 or kHeadDim == 64 or kHeadDim == 32, "SM120 paged MQA logits support head dim 32, 64 or 128");
+    DG_STATIC_ASSERT(not kIsMX or kHeadDim == 128, "SM120 block-scaled paged MQA logits only support head dim 128");
+    DG_STATIC_ASSERT(not kIsMX or kIsFP4 or kNextN * kNumHeads <= 64, "MXFP8 paged MQA logits spill at 128 Q rows");
+    // Bytes of one Q / KV row: FP4 packs two values per byte
+    static constexpr uint32_t kRowBytes = kIsFP4 ? kHeadDim / 2 : kHeadDim;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
@@ -54,6 +61,8 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     DG_STATIC_ASSERT(SPLIT_KV == BLOCK_KV * kNumMathWarpGroups, "Invalid `SPLIT_KV`");
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_q);
+        if constexpr (kIsMX)
+            cute::prefetch_tma_descriptor(&tensor_map_sf_q);
         cute::prefetch_tma_descriptor(&tensor_map_kv);
         cute::prefetch_tma_descriptor(&tensor_map_kv_scales);
         cute::prefetch_tma_descriptor(&tensor_map_weights);
@@ -62,15 +71,19 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
     // Shared memory configs
     // NOTES: the manual swizzle in `warp_mma_16xNxHd_ss` assumes every tile base is 1024-byte aligned (a swizzle atom is
-    // `kHeadDim` bytes x 8 rows, i.e. 256 / 512 / 1024 bytes for head dim 32 / 64 / 128)
-    static constexpr uint32_t kSwizzleAlignment = cute::max(kHeadDim * 8, 1024u);
-    static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = kNextN * kNumHeads * kHeadDim * sizeof(__nv_fp8_e4m3);
+    // `kRowBytes` bytes x 8 rows, i.e. 256 / 512 / 1024 bytes for rows of 32 / 64 / 128 bytes)
+    // The block-scaled path (`kIsMX`) carries one packed UE8M0 word (4 scale groups, i.e. 128 elements) per Q row and per
+    // KV token, applied by the tensor core; the FP8 path carries one float scale per KV token, applied after the MMA
+    static constexpr uint32_t kSwizzleAlignment = cute::max(kRowBytes * 8, 1024u);
+    static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = kNextN * kNumHeads * kRowBytes;
     static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = kNextN * kNumHeads * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE = math::constexpr_align(SMEM_WEIGHT_SIZE_PER_STAGE, kSwizzleAlignment);
-    static constexpr uint32_t SMEM_Q_PIPE_SIZE = kNumQStages * (SMEM_Q_SIZE_PER_STAGE + ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE) +
+    static constexpr uint32_t SMEM_Q_SF_SIZE_PER_STAGE = kIsMX ? kNextN * kNumHeads * sizeof(uint32_t) : 0;
+    static constexpr uint32_t ALIGNED_SMEM_Q_SF_SIZE_PER_STAGE = kIsMX ? math::constexpr_align(SMEM_Q_SF_SIZE_PER_STAGE, kSwizzleAlignment) : 0;
+    static constexpr uint32_t SMEM_Q_PIPE_SIZE = kNumQStages * (SMEM_Q_SIZE_PER_STAGE + ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE + ALIGNED_SMEM_Q_SF_SIZE_PER_STAGE) +
                                                  math::constexpr_align(kNumQStages * 8 * 2, kSwizzleAlignment);
 
-    static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = BLOCK_KV * kHeadDim * sizeof(__nv_fp8_e4m3);
+    static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = BLOCK_KV * kRowBytes;
     static constexpr uint32_t SMEM_KV_SCALE_SIZE_PER_STAGE = BLOCK_KV * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE = math::constexpr_align(SMEM_KV_SCALE_SIZE_PER_STAGE, kSwizzleAlignment);
     static constexpr uint32_t SMEM_KV_PIPE_SIZE = kNumKVStages * (SMEM_KV_SIZE_PER_STAGE + ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE) +
@@ -83,12 +96,16 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
     // Q data and barriers on shared memory
     auto smem_q = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_Q_SIZE_PER_STAGE * i);
+        return reinterpret_cast<uint8_t*>(smem_buffer + SMEM_Q_SIZE_PER_STAGE * i);
     });
     auto smem_weights = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + SMEM_Q_SIZE_PER_STAGE * kNumQStages + ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE * i);
     });
-    auto q_barrier_ptr = reinterpret_cast<Barrier*>(smem_weights[kNumQStages]);
+    auto smem_q_sf = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<uint32_t*>(smem_buffer + (SMEM_Q_SIZE_PER_STAGE + ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE) * kNumQStages +
+                                           ALIGNED_SMEM_Q_SF_SIZE_PER_STAGE * i);
+    });
+    auto q_barrier_ptr = reinterpret_cast<Barrier*>(smem_buffer + (SMEM_Q_SIZE_PER_STAGE + ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE + ALIGNED_SMEM_Q_SF_SIZE_PER_STAGE) * kNumQStages);
     auto full_q_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return q_barrier_ptr + i; });
     auto empty_q_barriers = utils::PatternVisitor([&](const uint32_t& i) { return q_barrier_ptr + (kNumQStages + i); });
 
@@ -99,8 +116,9 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     // Per group KV data and barriers on shared memory
     const auto smem_offset = SMEM_Q_PIPE_SIZE + SMEM_KV_PIPE_SIZE * kv_group_idx;
     auto smem_kv = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + smem_offset + SMEM_KV_SIZE_PER_STAGE * i);
+        return reinterpret_cast<uint8_t*>(smem_buffer + smem_offset + SMEM_KV_SIZE_PER_STAGE * i);
     });
+    // Per-token scales: float (FP8) or a packed UE8M0 word (block-scaled), both 4 bytes
     auto smem_kv_scales = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + smem_offset + SMEM_KV_SIZE_PER_STAGE * kNumKVStages + ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE * i);
     });
@@ -131,6 +149,8 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     __syncthreads();
 
     // Register reconfigurations
+    // NOTES: 128 x 64 + 512 x 104 is the whole register pool of the 640-thread CTA (96 per thread at launch), so a larger
+    // math share blocks `setmaxnreg.inc` forever
     constexpr uint32_t kNumTMARegisters = 64;
     constexpr uint32_t kNumMathRegisters = 104;
 
@@ -159,9 +179,11 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
         const auto issue_tma_q = [&](const uint32_t& stage_idx, const uint32_t& q_idx) {
             if (kv_group_idx == 0 and cute::elect_one_sync()) {
-                tma::copy<kHeadDim, kNextN * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, q_idx * kNextN * kNumHeads);
+                tma::copy<kRowBytes, kNextN * kNumHeads, kRowBytes>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, q_idx * kNextN * kNumHeads);
                 tma::copy<kNextN * kNumHeads, 1, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, q_idx * kNextN);
-                full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
+                if constexpr (kIsMX)
+                    tma::copy<kNumHeads, kNextN, 0>(&tensor_map_sf_q, full_q_barriers[stage_idx], smem_q_sf[stage_idx], 0, q_idx * kNextN);
+                full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE + SMEM_Q_SF_SIZE_PER_STAGE);
             }
         };
 
@@ -206,7 +228,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Issue TMA KV
             if (cute::elect_one_sync()) {
-                tma::copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
+                tma::copy<kRowBytes, BLOCK_KV, 0, uint8_t, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
                                                                       smem_kv[kv_stage_idx], 0, 0, 1, kv_block_idx);
                 tma::copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
                                           smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
@@ -267,13 +289,22 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Issue MMAs
             DG_STATIC_ASSERT(BLOCK_KV == 64, "Invalid block size");
-            mma::sm120::warp_mma_16xNxHd_ss<kNextN * kNumHeads, kHeadDim>(
-                mma::sm120::to_smem_addr(smem_kv[kv_stage_idx]), sub_warp_offset,
-                mma::sm120::to_smem_addr(smem_q[q_stage_idx]), accum);
-            // Read per-KV scales
-            float scale_kv_0 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + sub_warp_offset + v_0_offset);
-            float scale_kv_1 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + sub_warp_offset + v_1_offset);
-
+            float scale_kv_0 = 1.0f, scale_kv_1 = 1.0f;
+            if constexpr (kIsMX) {
+                // The tensor core applies the scales of both operands
+                mma::sm120::warp_mma_16xNxHd_block_scaled_ss<kNextN * kNumHeads, kHeadDim, kIsFP4>(
+                    mma::sm120::to_smem_addr(smem_kv[kv_stage_idx]), sub_warp_offset,
+                    mma::sm120::to_smem_addr(smem_q[q_stage_idx]),
+                    reinterpret_cast<const uint32_t*>(smem_kv_scales[kv_stage_idx]), BLOCK_KV,
+                    smem_q_sf[q_stage_idx], kNextN * kNumHeads, accum);
+            } else {
+                mma::sm120::warp_mma_16xNxHd_ss<kNextN * kNumHeads, kHeadDim>(
+                    mma::sm120::to_smem_addr(smem_kv[kv_stage_idx]), sub_warp_offset,
+                    mma::sm120::to_smem_addr(smem_q[q_stage_idx]), accum);
+                // Read per-KV scales
+                scale_kv_0 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + sub_warp_offset + v_0_offset);
+                scale_kv_1 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + sub_warp_offset + v_1_offset);
+            }
 
             // Release KV empty
             // Order the `ldmatrix` (generic proxy) reads before the next TMA (async proxy) write

@@ -117,7 +117,8 @@ static void sm120_fp8_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor
     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
     DG_HOST_ASSERT(head_dim == 128 and "SM120 block-scaled MQA logits only support head dim 128");
     DG_HOST_ASSERT(128 % num_heads == 0);
-    const int num_weight_elems = align<int>(num_heads, 8);
+    const int num_weight_elems = align<int>(num_heads, 16 / static_cast<int>(weights.element_size()));
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 or weights.scalar_type() == torch::kFloat);
 
     const auto tensor_map_q = make_tma_2d_desc(q, head_dim, seq_len * num_heads,
                                                head_dim, block_q * num_heads, row_bytes,
@@ -139,7 +140,7 @@ static void sm120_fp8_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor
     smem_size += num_kv_stages * block_kv * row_bytes;
     smem_size += num_q_stages * align<int>(block_q * num_heads * 4, 128);
     smem_size += num_kv_stages * align<int>(block_kv * 4, 128);
-    smem_size += num_q_stages * align<int>(block_q * num_weight_elems * 2, 128);
+    smem_size += num_q_stages * align<int>(block_q * num_weight_elems * static_cast<int>(weights.element_size()), 128);
     smem_size = align(smem_size, 16) + (num_q_stages * 2 + num_kv_stages * 2) * 16;
     DG_HOST_ASSERT(smem_size <= SM120ArchSpec::get_smem_capacity());
 
@@ -155,7 +156,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
-        {}
+        {}, {}, {}
     >);
 }};
 )",
@@ -164,7 +165,7 @@ static void __instantiate_kernel() {{
     num_q_stages, num_kv_stages,
     num_sms,
     num_specialized_threads, num_math_threads,
-    is_fp4 ? "true" : "false"));
+    is_fp4 ? "true" : "false", to_string(weights.scalar_type()), to_string(logits.scalar_type())));
 
     jit->launch(
         kernel, {
@@ -179,7 +180,11 @@ static void __instantiate_kernel() {{
     );
 }
 
+// Paged MQA logits. FP8 queries and keys carry a float scale per KV token (`q_sf` empty); block-scaled MXFP8 / MXFP4 ones
+// (`q_sf` given, head dim 128) carry a packed UE8M0 word per Q row and per KV token, applied by the tensor core. The same
+// kernel serves both: the K dtype is a template parameter
 static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
+                                       const std::optional<torch::Tensor>& q_sf,
                                        const torch::Tensor& kv_cache,
                                        const torch::Tensor& kv_cache_scales,
                                        const torch::Tensor& weights,
@@ -199,23 +204,38 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
     constexpr int mma_m = 64;
     const int num_math_warp_groups = split_kv / mma_m;
     const int num_math_threads = num_math_warp_groups * 128;
+    const bool is_mx = q_sf.has_value();
+    const bool is_fp4 = q.scalar_type() == kPackedFP4;
+    // Bytes of one Q / KV row: FP4 packs two values per byte
+    const int row_bytes = is_fp4 ? head_dim / 2 : head_dim;
     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
     DG_HOST_ASSERT((head_dim == 128 or head_dim == 64 or head_dim == 32) and "SM120 paged MQA logits support head dim 32, 64 or 128");
+    DG_HOST_ASSERT((not is_mx or head_dim == 128) and "SM120 block-scaled paged MQA logits support head dim 128");
+    DG_HOST_ASSERT(not is_fp4 or is_mx);
+    // MXFP8 needs twice the K steps of MXFP4 per row; at 128 Q rows (next_n 2 x 64 heads) its fragments and scale words
+    // overflow the 104 registers of a math thread (see `kNumMathRegisters`), so that one combination is rejected
+    DG_HOST_ASSERT((not is_mx or is_fp4 or next_n * num_heads <= 64) and
+                   "SM120 MXFP8 paged MQA logits support at most 64 Q rows (next_n x heads); use MXFP4 or FP8");
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(block_kv == 64 and split_kv == kSM120PagedMQALogitsSplitKV);
     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
     DG_HOST_ASSERT(next_n == 1 or next_n == 2);
     DG_HOST_ASSERT(128 % num_heads == 0);
 
     const int next_n_atom = next_n >= 2 ? 2 : 1;
+    // FP4 rows are 4-bit elements in the tensor maps, packed two per byte in shared memory
     const auto tensor_map_q = make_tma_2d_desc(q, head_dim, batch_size * next_n * num_heads,
                                                head_dim, next_n_atom * num_heads,
                                                static_cast<int>(q.stride(2)),
-                                               head_dim);
+                                               row_bytes, 0, false, not is_fp4);
+    const auto tensor_map_sf_q = is_mx ? make_tma_2d_desc(q_sf.value(), num_heads, batch_size * next_n,
+                                                          num_heads, next_n_atom, num_heads, 0)
+                                       : tensor_map_q;
     const auto tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, block_kv, num_kv_blocks,
                                                 head_dim, block_kv, 1,
                                                 static_cast<int>(kv_cache.stride(1)),
                                                 static_cast<int>(kv_cache.stride(0)),
-                                                head_dim);
+                                                row_bytes, 0, false, not is_fp4);
     const auto tensor_map_kv_scales = make_tma_2d_desc(kv_cache_scales, block_kv, num_kv_blocks,
                                                        block_kv, 1,
                                                        static_cast<int>(kv_cache_scales.stride(0)), 0);
@@ -226,14 +246,15 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
     // Same layout as the kernel: a Q pipeline, then one KV pipeline per math warp-group
     // NOTES: pick the deepest pipelines (at most 3 stages) that fit in shared memory; at least 2 Q stages are
     // required, as the TMA warp prefetches the next Q (blocking its KV loads) while the current one is in use
-    // The kernel needs 1024-byte aligned tiles for every head dim (see `kSwizzleAlignment` there)
-    const int swizzle_alignment = std::max(head_dim * 8, 1024);
-    const int smem_q_size_per_stage = next_n * num_heads * head_dim * static_cast<int>(q.element_size());
+    // The kernel needs 1024-byte aligned tiles for every row width (see `kSwizzleAlignment` there)
+    const int swizzle_alignment = std::max(row_bytes * 8, 1024);
+    const int smem_q_size_per_stage = next_n * num_heads * row_bytes;
     const int aligned_smem_weight_size_per_stage = align(next_n * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
-    const int smem_kv_size_per_stage = block_kv * head_dim * static_cast<int>(kv_cache.element_size());
+    const int aligned_smem_q_sf_size_per_stage = is_mx ? align(next_n * num_heads * 4, swizzle_alignment) : 0;
+    const int smem_kv_size_per_stage = block_kv * row_bytes;
     const int aligned_smem_kv_scale_size_per_stage = align(block_kv * static_cast<int>(kv_cache_scales.element_size()), swizzle_alignment);
     const auto get_smem_size = [&](const int& num_q_stages, const int& num_kv_stages) {
-        const int smem_q_pipe_size = num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) +
+        const int smem_q_pipe_size = num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage + aligned_smem_q_sf_size_per_stage) +
                                      align(num_q_stages * 8 * 2, swizzle_alignment);
         const int smem_kv_pipe_size = num_kv_stages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage) +
                                       align(num_kv_stages * 8 * 2, swizzle_alignment);
@@ -262,6 +283,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
+        {}, {},
         {}
     >);
 }};
@@ -272,6 +294,7 @@ static void __instantiate_kernel() {{
     num_q_stages, num_kv_stages,
     split_kv,
     num_specialized_threads, num_math_threads,
+    is_mx ? "true" : "false", is_fp4 ? "true" : "false",
     to_string(logits.scalar_type())));
 
     jit->launch(
@@ -284,7 +307,7 @@ static void __instantiate_kernel() {{
         logits_stride, block_table_stride,
         context_lens.data_ptr<int>(), logits.data_ptr(),
         block_table.data_ptr<int>(), nullptr, schedule_meta.data_ptr<int>(),
-        tensor_map_q, tensor_map_kv,
+        tensor_map_q, tensor_map_sf_q, tensor_map_kv,
         tensor_map_kv_scales, tensor_map_weights
     );
 }

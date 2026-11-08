@@ -19,7 +19,7 @@
 // SM120 block-scaled dense MQA logits: logits[q, kv] = sum_h relu(Q[q,h,:] . KV[kv,:]) * weight[q,h], with Q and KV
 // block-scaled by 32-element UE8M0 scales (MXFP8 E4M3 or MXFP4 E2M1). BF16 output. This mirrors the SM100 dense
 // `fp8_fp4_mqa_logits` for arch 12: the tensor core applies the MX scales (no post-MMA float scale, unlike the FP8
-// per-token-scale `sm120_fp8_mqa_logits`). The pipeline is that FP8 kernel's (dedicated TMA warp-group, staged Q/KV);
+// per-token-scale `sm120_fp8_mqa_logits`). Weights and logits are BF16 or FP32 (template parameters). The pipeline is that FP8 kernel's (dedicated TMA warp-group, staged Q/KV);
 // the compute is the block-scaled warp MMA used by the sparse kernel (`warp_mma_16xNxHd_block_scaled_ss`).
 
 namespace deep_gemm {
@@ -29,13 +29,13 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
-          bool kIsFP4>
+          bool kIsFP4, typename weights_t, typename logits_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm120_fp8_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                               const uint32_t stride_logits,
                               uint32_t* cu_seq_len_k_start,
                               uint32_t* cu_seq_len_k_end,
-                              nv_bfloat16* logits,
+                              logits_t* logits,
                               const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                               const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                               const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -61,14 +61,15 @@ void sm120_fp8_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Shared memory. Q/KV are block-scaled (kRowBytes per row), with a 128B (FP8) / 64B (FP4) swizzle; TMA needs the
     // tile base aligned to the swizzle atom (kRowBytes x 8 rows) and >= 1024 bytes. SF are one int32 UE8M0 word per
-    // row (head dim 128 => one 4-group word). Weights are BF16 (the SM100 MX layout).
+    // row (head dim 128 => one 4-group word). Weights are BF16 (the SM100 MX layout) or FP32.
     static constexpr uint32_t kSwizzleAlignment = cute::max(kRowBytes * 8, 1024u);
     static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * kRowBytes;
     static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = BLOCK_KV * kRowBytes;
     static constexpr uint32_t SMEM_SF_Q_SIZE_PER_STAGE = math::constexpr_align(BLOCK_Q * kNumHeads * 4u, 128u);
     static constexpr uint32_t SMEM_SF_KV_SIZE_PER_STAGE = math::constexpr_align(BLOCK_KV * 4u, 128u);
-    static constexpr uint32_t kNumWeightElems = math::constexpr_align(kNumHeads, 8u);
-    static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = math::constexpr_align(BLOCK_Q * kNumWeightElems * 2u, 128u);
+    static constexpr uint32_t kWeightBytes = sizeof(weights_t);
+    static constexpr uint32_t kNumWeightElems = math::constexpr_align(kNumHeads, 16u / kWeightBytes);
+    static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = math::constexpr_align(BLOCK_Q * kNumWeightElems * kWeightBytes, 128u);
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     DG_STATIC_ASSERT(SMEM_Q_SIZE_PER_STAGE % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
@@ -87,7 +88,7 @@ void sm120_fp8_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         return reinterpret_cast<uint32_t*>(smem_buffer + off_sf_kv + SMEM_SF_KV_SIZE_PER_STAGE * i); });
     const uint32_t off_w = off_sf_kv + kNumKVStages * SMEM_SF_KV_SIZE_PER_STAGE;
     auto smem_weights = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<nv_bfloat16*>(smem_buffer + off_w + SMEM_WEIGHT_SIZE_PER_STAGE * i); });
+        return reinterpret_cast<weights_t*>(smem_buffer + off_w + SMEM_WEIGHT_SIZE_PER_STAGE * i); });
     const uint32_t off_bar = math::constexpr_align(off_w + kNumQStages * SMEM_WEIGHT_SIZE_PER_STAGE, 16u);
     auto barrier_ptr = reinterpret_cast<Barrier*>(smem_buffer + off_bar);
     auto full_q_barriers   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
@@ -154,7 +155,7 @@ void sm120_fp8_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             tma::copy<kNumWeightElems, BLOCK_Q, 0>(&tensor_map_weights, full_q_barriers[stage_idx],
                      smem_weights[stage_idx], 0, block_idx * BLOCK_Q);
             full_q_barriers[stage_idx]->arrive_and_expect_tx(
-                SMEM_Q_SIZE_PER_STAGE + BLOCK_Q * kNumHeads * 4 + BLOCK_Q * kNumWeightElems * 2);
+                SMEM_Q_SIZE_PER_STAGE + BLOCK_Q * kNumHeads * 4 + BLOCK_Q * kNumWeightElems * kWeightBytes);
         };
         if (cute::elect_one_sync() and block_q_idx < num_q_blocks)
             issue_tma_q(0, block_q_idx);
@@ -198,7 +199,7 @@ void sm120_fp8_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             for (uint32_t i = 0; i < BLOCK_Q; ++ i)
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
-                    weights[i][j] = __bfloat162float(smem_weights[q_stage_idx][i * kNumWeightElems + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2]);
+                    weights[i][j] = static_cast<float>(smem_weights[q_stage_idx][i * kNumWeightElems + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2]);
 
             #pragma unroll
             for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++ kv_block_idx) {
@@ -238,9 +239,9 @@ void sm120_fp8_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     }
                     const auto q_offset = (block_q_idx * BLOCK_Q + i) * static_cast<uint64_t>(stride_logits);
                     if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
-                        logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<nv_bfloat16>(v_0);
+                        logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_t>(v_0);
                     if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
-                        logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<nv_bfloat16>(v_1);
+                        logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_t>(v_1);
                 }
             }
             num_total_kv_blocks += num_kv_blocks;

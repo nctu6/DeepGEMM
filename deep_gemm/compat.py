@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from ._C import fp8_fp4_mqa_logits, fp8_fp4_paged_mqa_logits
+from ._C import fp8_fp4_mqa_logits as _fp8_fp4_mqa_logits, fp8_fp4_paged_mqa_logits as _fp8_fp4_paged_mqa_logits
 
 
 def fp8_mqa_logits(q: torch.Tensor,
@@ -33,7 +33,7 @@ def fp8_mqa_logits(q: torch.Tensor,
         raise ValueError('`max_seqlen_k` must be positive: only compressed logits are supported')
     if clean_logits:
         raise ValueError('Compressed logits cannot be cleaned, pass `clean_logits=False`')
-    return fp8_fp4_mqa_logits((q, None), kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k)
+    return _fp8_fp4_mqa_logits((q, None), kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k)
 
 
 def fp8_paged_mqa_logits(q: torch.Tensor,
@@ -61,8 +61,54 @@ def fp8_paged_mqa_logits(q: torch.Tensor,
     Returns:
         `[batch_size * next_n, max_context_len]` logits.
     """
-    logits = fp8_fp4_paged_mqa_logits((q, None), fused_kv_cache, weights, context_lens, block_table,
-                                      schedule_meta, max_context_len, indices)
+    logits = _fp8_fp4_paged_mqa_logits((q, None), fused_kv_cache, weights, context_lens, block_table,
+                                       schedule_meta, max_context_len, indices)
+    if clean_logits:
+        positions = torch.arange(logits.size(-1), device=logits.device)
+        logits.masked_fill_(positions[None, :] >= context_lens.reshape(-1, 1), float('-inf'))
+    return logits
+
+
+def fp8_fp4_mqa_logits(q: Tuple[torch.Tensor, Optional[torch.Tensor]],
+                       kv: Tuple[torch.Tensor, torch.Tensor],
+                       weights: torch.Tensor,
+                       cu_seq_len_k_start: torch.Tensor,
+                       cu_seq_len_k_end: torch.Tensor,
+                       max_seqlen_k: int,
+                       schedule_meta: Optional[torch.Tensor] = None,
+                       *,
+                       clean_logits: bool = False,
+                       logits_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    """Contiguous MQA logits (FP8 per-token scales, or block-scaled MXFP8 / MXFP4).
+
+    Besides the arguments of the extension function, it takes the keywords of the pre-2.8.2 API:
+    `clean_logits` (must be False, as compressed rows are never cleaned) and `logits_dtype` (the dtype of the logits: BF16
+    for the block-scaled kernels unless SM120 is asked for FP32; FP32 for the FP8 per-token-scale ones).
+    """
+    if clean_logits:
+        raise ValueError('Compressed logits cannot be cleaned, pass `clean_logits=False`')
+    return _fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta,
+                               logits_dtype)
+
+
+def fp8_fp4_paged_mqa_logits(q: Tuple[torch.Tensor, Optional[torch.Tensor]],
+                             kv_cache: torch.Tensor,
+                             weights: torch.Tensor,
+                             context_lens: torch.Tensor,
+                             block_table: torch.Tensor,
+                             schedule_meta: torch.Tensor,
+                             max_context_len: int,
+                             indices: Optional[torch.Tensor] = None,
+                             *,
+                             clean_logits: bool = False,
+                             logits_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    """Paged MQA logits (FP8 per-token scales, or block-scaled MXFP8 / MXFP4).
+
+    Besides the arguments of the extension function, it takes the keywords of the pre-2.8.2 API: `clean_logits` (fill
+    entries at or beyond each row's context length with `-inf`) and `logits_dtype` (see `fp8_fp4_mqa_logits`).
+    """
+    logits = _fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta,
+                                       max_context_len, indices, logits_dtype)
     if clean_logits:
         positions = torch.arange(logits.size(-1), device=logits.device)
         logits.masked_fill_(positions[None, :] >= context_lens.reshape(-1, 1), float('-inf'))

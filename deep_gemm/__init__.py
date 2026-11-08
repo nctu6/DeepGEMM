@@ -69,9 +69,7 @@ from ._C import (
     fp8_einsum,
     # Attention kernels
     get_mqa_logits_metadata,
-    fp8_fp4_mqa_logits,
     get_paged_mqa_logits_metadata,
-    fp8_fp4_paged_mqa_logits,
     get_sparse_mqa_logits_metadata,
     get_paged_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,
@@ -86,7 +84,7 @@ from ._C import (
 )
 
 # Pre-2.8.2 attention entry points
-from .compat import fp8_mqa_logits, fp8_paged_mqa_logits
+from .compat import fp8_fp4_mqa_logits, fp8_fp4_paged_mqa_logits, fp8_mqa_logits, fp8_paged_mqa_logits
 
 
 def get_supported_arch_majors() -> tuple:
