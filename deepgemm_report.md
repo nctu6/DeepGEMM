@@ -23,6 +23,10 @@ hardware.
     Plain `bf16_gemm_nt` still goes to cuBLASLt by default.
   - Both GEMM kernels use **PDL**: weight loads of the first pipeline stages
     are issued before waiting on the previous kernel.
+  - **Block-scaled paged MQA logits** (MXFP4 / MXFP8, task 16): the paged
+    indexer kernel scores the 68-byte V4.1 index rows natively, so V4.1 serves
+    on the native indexer on SM120 with its own cache format (2.2-88x over the
+    Triton leaf per index pass; section 4 and section 8).
 - **Speed vs TokenSpeed's SM120 fallbacks** (Triton and FlashInfer):
   - Dense decode (M <= 128) is 1.2-4.0x faster at TP8 shapes. Dense prefill
     (M >= 512) is on par with FlashInfer: 0.98-1.37x, except the N = 512
@@ -414,11 +418,27 @@ accumulator layout. The SM90 paged metadata kernel
 - Correctness: `scripts/sm120_mqa_check.py` matches a dequantized reference to
   ~1e-14. It covers contiguous; paged with next_n 1/2, H 32/64, head dim
   128/64/32, context up to 20K, and B 32/64/128 (46 cases).
+- **Block-scaled paged MQA (task 16, `6b2df9e`).** The paged kernel takes the
+  K dtype as a template parameter: FP8 rows with a float scale per token, or
+  MXFP4 / MXFP8 rows with one packed UE8M0 word per Q row and per KV token,
+  applied by the block-scaled `mma.sync` (`kind::mxf4nvf4 m16n8k64`,
+  `kind::mxf8f6f4 m16n8k32`). Scheduler, SPLIT_KV, pipelines, proxy fences and
+  the 64/104 register split are shared; the Q stage gains a scale tile. This
+  scores the 68-byte V4.1 index rows (64 bytes of E2M1 pairs plus a scale
+  word, page-planar) natively, 1.02-1.74x faster than the FP8 kernel at the
+  same shapes. Head dim 128, H 32/64, next_n 1/2; MXFP8 at 128 Q rows
+  (next_n 2 x 64 heads) spills and is rejected. The block-scaled contiguous
+  and paged kernels also take FP32 weights and write FP32 logits on request
+  (`logits_dtype`). `scripts/sm120_paged_mqa_blockscale_check.py` (51 cases)
+  matches a float64 dequantized reference: FP32 logits ~2e-15, BF16 ~1.5e-6;
+  `tests/test_attention.py` runs the MX formats on SM120 (159 cases).
 
 **API compatibility.** DeepGEMM 2.8.2 renamed the indexer APIs to
 `fp8_fp4_mqa_logits` and `fp8_fp4_paged_mqa_logits`. TokenSpeed calls the old
 names, so `deep_gemm/compat.py` provides `fp8_mqa_logits` and
-`fp8_paged_mqa_logits` wrappers. `deep_gemm.get_supported_arch_majors()`
+`fp8_paged_mqa_logits` wrappers, and wraps `fp8_fp4_mqa_logits` /
+`fp8_fp4_paged_mqa_logits` so they accept the pre-2.8.2 `clean_logits` and
+`logits_dtype` keywords. `deep_gemm.get_supported_arch_majors()`
 returns `(9, 10, 12)`, so callers can tell an SM120-capable build from the
 pinned 2.8.0 wheel.
 
@@ -853,7 +873,9 @@ One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Trito
 | `fp8_einsum` (3 expressions) | DeepGEMM batched launch | best of cuBLASLt BF16, per-head torch loop, `torch.einsum` | 1.52x (time ratio 0.66; 26 shapes) | worst 0.99x | 0.99x (time ratio 1.007), `bhd,bhr->hdr` h=8, b=128, a tie at the FP32 D-traffic bound | 7.7 |
 | MQA logits indexer (`fp8_mqa_logits`, paged) | DeepGEMM logits + `dsa_decode_topk` / `dsa_prefill_topk` | Triton DSA indexer leaves | not recorded | decode 3.4-19.3x, prefill 7.8-52x | 3.4x decode, 1 x 4K | 7.3 |
 | DeepSelect top-k (V3.2 prefill) | in-tree CuTe DSL, 93 KB on SM120 | Triton radix top-k | not recorded | 1.3-1.9x on the leaf; decode up to 2.7x on the top-k from 96 rows of 32K+ | selected only where it wins; at 16K or fewer than 48 rows it loses 1.4-2x and is not selected | analysis 9.16 |
-| V4.1 indexer (FP8 `index_v4` rows) | `deep_gemm_sm120_dsv41_*` | Triton leaves | not recorded | decode 2.3-7.2x, chunked prefill 1.4-5.1x | Reindex over long histories (0.54-0.99x, kept on Triton); serving does not reach it yet (68-byte rows) | analysis 9.16 |
+| Paged MQA logits, MXFP4 rows | DeepGEMM `sm120_fp8_paged_mqa_logits` (block-scaled) | the same kernel on FP8 rows (no Triton/FlashInfer paged FP4 MQA exists) | not recorded | 1.02-1.74x (16 V4.1 decode shapes, 6 of 9.13) | 1.02x, 1 request x 1K rows (launch-bound) | analysis 9.21 |
+| V4.1 indexer, packed 68-byte rows (what SM120 serves) | `deep_gemm_sm120_dsv41_index_topk` | `triton_dsv41_index_topk` | not recorded | decode: Full 5.6-16x, source 7.7-33x, Reindex 2.2-22x; prefill: 11-46x, 22-88x, 6.8-22x | 2.2x, Reindex of 1-8 requests | analysis 9.21 |
+| V4.1 indexer, FP8 `index_v4` rows | `deep_gemm_sm120_dsv41_index_topk` | Triton leaves | not recorded | decode 2.3-7.2x, chunked prefill 1.4-5.1x | Reindex over long histories (0.54-0.99x, kept on Triton); the runtime does not store these rows on SM120 | analysis 9.16 |
 | DSA sparse attention | TokenSpeed `triton_dsa_mma_decode` / `_prefill` | `triton_dsa_decode` / `_prefill` | 72x (64 buckets: 16-128 heads, decode batch 1-128, prefill 128-8192, E4M3 and BF16) | 22-114x | 22x, BF16 decode, 16 heads, 1 request | 7.8.1 |
 | MLA decode | TokenSpeed `triton_mla_mma_decode_with_kvcache` | portable `triton_mla_decode_with_kvcache` (FlashInfer / `tokenspeed_mla` cannot run on SM120) | not recorded | 14-131x | 14x | analysis 9.19 |
 | V4 / V4.1 selected attention (prefill) | TokenSpeed `triton_dsv4_mma_prefill` | `triton_dsv4_prefill` (FlashMLA cannot run on SM120) | not recorded | 4-9x | 4x | analysis 9.19 |
@@ -888,7 +910,7 @@ Every bucket still beats `triton_dsa_*` by at least 22x. Tried and dropped: 16 c
 | MN-major FP4 operands | no sub-byte transposing `ldmatrix` (FP8 has `.b8`, BF16 the 16-bit form) |
 | Quantized-D (FP8 output) epilogues, custom epilogue classes | SM100 epilogues built on TMEM |
 | TMA multicast | emulated in software on SM120 (a multicast launch traps into `emulate_tma`), so FP4 at dense gate_up M=256 stays a tie |
-| Paged FP4 MQA, paged MQA with a head dim other than 32/64/128, SM100's varlen paged API | no kernel; 68-byte V4.1 rows stay on Triton |
+| Paged MQA with a head dim other than 32/64/128, block-scaled paged MQA with a head dim other than 128 or MXFP8 at 128 Q rows, SM100's varlen paged API | no kernel (MXFP8 at 128 Q rows spills in the 104 math registers); paged MXFP4 at head dim 128 is supported since task 16 |
 | `fp8_einsum` with accumulation `c` for `bhd,hdr->bhr` / `bhr,hdr->bhd` | SM120 FP8 bmm has no accumulation epilogue |
 
 #### 7.8.3 Headroom for a CuTe DSL rewrite
@@ -962,6 +984,29 @@ of shared memory and a V4.1 route that does not need FP4 paged MQA.
   tokens per byte).
 - Tests: `test_dsa_indexer_sm120.py`, `test_dsv41_indexer_sm120.py`, the Hopper
   DeepSelect suite now on SM120 too, and registry tests.
+
+**V4.1 serving on the native indexer** (task 16, 2026-11-08; `f01d594a5`,
+`76b2134a7`, docs `6d4188f43`; details in `deepgemm-analysis.md` section 9.21).
+With the block-scaled paged MQA kernel (section 4), `deep_gemm_sm120_dsv41_index_topk`
+also scores the 68-byte `v41` rows the runtime stores on SM120, so the previous
+bullet's capacity trade is gone and the cache format is unchanged.
+- One leaf for both row formats, told apart by width. Packed rows: the paged
+  kernel for Full passes, the contiguous kernel for one request's chunk, FP32
+  logits, then the CuTe DSL DeepSelect; Reindex scores the whole history and
+  gathers the pool, or reads only the pool with the sparse kernel where that
+  wins (`_sparse_reindex_wins`: paged histories past the 16K-row pool from 2^21
+  scores, one request's chunk from four or eight times the pool).
+- Against `triton_dsv41_index_topk` (CUDA graph, 32 heads, top-k 512, 2048
+  candidate blocks): decode Full 5.6-16x, candidate-source Full 7.7-33x,
+  Reindex 2.2-22x; chunked prefill 11-46x, 22-88x, 6.8-22x. Every pass wins.
+- Selected sets match an exact float64 reference (Reindex within one BF16
+  rounding of the k-th score, the sparse kernel's logits dtype); a recompile
+  guard sweeps request counts and histories (it found and fixed per-batch
+  specialization in `_finish_topk_kernel`).
+- End to end (in-process `Engine`, the real 40-layer V4.1 topology and index
+  geometry with dummy weights, 16 experts): the serving path selects the native
+  leaf; prefill 1.11-1.19x, TPOT 1.02-1.06x over the Triton leaf, same greedy
+  tokens.
 **MXFP4 leaves** (`f798e68b4`, `f07f3cc54`, `8222224b8`, `63aaaf957`). TokenSpeed
 had no NVIDIA MXFP4 `mm` leaf (the Triton one is AMD-only), so dense MXFP4
 linears had no path on SM120. All leaves are `SPECIALIZED`, SM120-gated and
@@ -1146,8 +1191,10 @@ See section 7.
   ("SM120 FP8 bmm does not support accumulation"), and any einsum with a
   custom epilogue: SM100 only. `bhd,bhr->hdr` accepts `c` and only the
   `(1, 1, 128)` recipe.
-- Paged MQA with a head dim other than 32, 64 and 128, and SM100's varlen
-  paged API (`indices`, next_n 1), which SM120 doesn't expose, as on SM90.
+- Paged MQA with a head dim other than 32, 64 and 128 (128 only for the
+  block-scaled formats), MXFP8 paged MQA at 128 Q rows (it spills), and SM100's
+  varlen paged API (`indices`, next_n 1), which SM120 doesn't expose, as on
+  SM90.
 - mega MoE/gate/mHC. MoE's point is NVLink symmetric-memory dispatch across
   ranks (pointless on one PCIe GPU); gate/mHC are TMEM/TF32-pipeline rewrites.
   (The DeepGEMM mHC pre/mixes kernels built on `tf32_hc_prenorm_gemm` do run,
@@ -1167,12 +1214,12 @@ leaves) and `tf32_hc_prenorm_gemm` (mHC) are used, see section 8.
 Other notes:
 - The DeepGEMM FP4 kernel beats FlashInfer's MXFP4 backends on 62 of 63
   points; the other is a tie (dense gate_up M=256, 0.98x, section 7.5).
-- The V4.1 packed-FP4 indexer cannot run on SM120: DeepGEMM has no paged FP4
-  MQA kernel there (only FP8 paged and dense/sparse MX). V4.1 uses FP8
-  `index_v4` rows on SM120 instead, and the runtime does not select that cache
-  format yet (section 8). The earlier "blocked by DeepSelect shared memory"
-  finding is closed: the in-tree DeepSelect runs in 93 KB. The V3.2 DeepGEMM
-  indexer leaves were never blocked.
+- The V4.1 indexer is native on SM120 for the 68-byte rows the runtime
+  stores (task 16): the block-scaled paged MQA kernel scores them and the
+  in-tree CuTe DSL DeepSelect selects (the upstream `deep_select` package
+  stays sm100-only). No cache-format change was needed. The earlier "blocked by
+  DeepSelect shared memory" finding is closed: the in-tree DeepSelect runs in
+  93 KB. The V3.2 DeepGEMM indexer leaves were never blocked.
 - The SM100-only attention and Hadamard kernels (FlashMLA, `tokenspeed_mla`,
   trtllm-gen, the `fast_hadamard_transform` wheel) stay capped off SM120;
   their SM120 replacements are Triton `mma.sync` kernels at 25-35% of the
@@ -1192,12 +1239,15 @@ Other notes:
    refit, two CTAs per SM, stream-K at mid M, `DG_SM120_AUTOTUNE=1`, an L2
    prefetch of B, an early or a never PDL trigger, and TMA multicast (emulated
    in software on SM120).
-2. **V4.1 indexer on SM120 in serving**: the kernels and leaves are done
-   (section 8); the runtime config must pick the `v4` index cache on SM120,
-   which costs about 45% of the token capacity, for the 2.3-7.2x index-step
-   speedup. A Reindex scorer for FP8 rows that reads only the candidate pool
-   (DeepGEMM's sparse MQA kernel) or a paged FP4 MQA kernel would remove that
-   trade. Out of DeepGEMM scope unless one of those kernels is added.
+2. **V4.1 indexer on SM120 in serving: done (task 16).** The block-scaled
+   paged MQA kernel scores the 68-byte rows, so the runtime keeps its `v41`
+   cache and serving selects the native leaf (2.2-88x over the Triton leaf on
+   every pass; end to end 1.11-1.19x prefill). Open: DeepGEMM's SM120 sparse MQA
+   kernel runs in one wave (about 85 us at any size), so a Reindex pass reads
+   only the candidate pool only once the history is several times the pool;
+   a multi-wave sparse kernel would widen that. FP8 `index_v4` rows still have
+   no pool-only scorer on SM120 (`fp8_indexer_wins`), but the runtime does not
+   store them there.
 3. DeepSeek-V3/V3.2 TP8 end-to-end run with a real checkpoint. It needs GPUs
    0-7, and only GPU 7 was available. A reduced-layer V3.2 with random weights
    ran on one GPU (section 7.4, task 13.3).
