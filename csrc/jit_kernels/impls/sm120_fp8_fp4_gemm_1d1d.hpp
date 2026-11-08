@@ -306,7 +306,8 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                            const int& num_groups_a, const int& num_groups_b,
                                            const int& num_groups_sfa, const int& num_groups_sfb,
                                            const int& gran_k_a, const int& gran_k_b,
-                                           const float& alpha) {
+                                           const float& alpha,
+                                           const std::optional<SM120BlockScaledChoice>& forced_choice = std::nullopt) {
     // `desc.k` counts logical elements, so FP4 (packed two per byte) has `a.size(-1) * 2 == k`
     const bool is_fp4 = a_in.scalar_type() == kPackedFP4;
     const bool is_bf16 = a_in.scalar_type() == torch::kBFloat16;
@@ -349,7 +350,7 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                     num_groups_a, num_groups_b, num_groups_sfa, num_groups_sfb, gran_k_a, alpha);
     };
     // NOTES: tuning runs the GEMM several times into `d`, which is overwritten by the final launch below
-    run(sm120_block_scaled_choice(desc, run));
+    run(forced_choice.has_value() ? forced_choice.value() : sm120_block_scaled_choice(desc, run));
 }
 
 static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -505,12 +506,48 @@ static void sm120_bf16_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& b,
                                  const torch::Tensor& d,
                                  const int& m, const int& n, const int& k,
                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                 const std::string& compiled_dims, const float& alpha) {
+                                 const std::string& compiled_dims, const float& alpha,
+                                 const std::optional<SM120BlockScaledChoice>& forced_choice = std::nullopt) {
     // With `c`, D already holds C (see `early_return`), and the kernel adds to it
     const auto desc = sm120_bf16_desc(GemmType::Normal, a, b, d, 1, m, n, k, major_a, major_b, compiled_dims, m, 1,
                                       c.has_value());
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_bf16_gemm_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d, nullptr,
-                                   1, 1, 1, 1, 32, 32, alpha);
+                                   1, 1, 1, 1, 32, 32, alpha, forced_choice);
+}
+
+// Batched BF16 GEMM `D[g] (+)= A[g] @ B[g]^T` in one launch (`a`: `[G, M, K]`, `b`: `[G, N, K]`, `d`: `[G, M, N]`), on strided
+// views of any layout the 3D tensor maps can describe (the heads of a `[b, h, d]` tensor, an MN-major `[G, N, K]` view of a
+// `[G, K, N]` weight). With `accumulate`, D already holds C. Callers check `sm120_bf16_bmm_supported` and run a GEMM per
+// batch when the views are not supported; both routes give identical bits
+static bool sm120_bf16_bmm_supported(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d, const int& k,
+                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b) {
+    return sm120_batched_launch_enabled() and is_tma_batched_operand(major_a, a) and is_tma_batched_operand(major_b, b) and
+           d.dim() == 3 and d.stride(-1) == 1 and d.stride(-2) % 4 == 0 and d.stride(0) % 4 == 0 and
+           d.size(-1) % 8 == 0 and reinterpret_cast<uintptr_t>(d.data_ptr()) % 8 == 0 and k % 8 == 0;
+}
+
+// The tile layout of the batched launch, data-parallel. A GEMM's bits depend on its layout (the warps split each K block,
+// and stream-K reduces partial sums), so a launch per batch that wants the same bits runs this layout as well
+static SM120BlockScaledChoice sm120_bf16_bmm_choice(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                                    const int& batch_size, const int& m, const int& n, const int& k,
+                                                    const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                    const std::string& compiled_dims, const bool& accumulate) {
+    const auto desc = sm120_bf16_desc(GemmType::Batched, a, b, d, batch_size, m, n, k, major_a, major_b, compiled_dims, m,
+                                      batch_size, accumulate);
+    return {get_best_config<SM120ArchSpec>(desc).layout, false};
+}
+
+static void sm120_bf16_bmm_1d1d(const torch::Tensor& a, const torch::Tensor& b,
+                                const bool& accumulate, const torch::Tensor& d,
+                                const int& batch_size, const int& m, const int& n, const int& k,
+                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                const std::string& compiled_dims, const float& alpha) {
+    DG_HOST_ASSERT(sm120_bf16_bmm_supported(a, b, d, k, major_a, major_b));
+    const auto desc = sm120_bf16_desc(GemmType::Batched, a, b, d, batch_size, m, n, k, major_a, major_b, compiled_dims, m,
+                                      batch_size, accumulate);
+    sm120_fp8_fp4_gemm_1d1d_launch("sm120_bf16_bmm_1d1d", desc, a, torch::Tensor(), b, torch::Tensor(), d, nullptr,
+                                   1, 1, 1, 1, 32, 32, alpha,
+                                   sm120_bf16_bmm_choice(a, b, d, batch_size, m, n, k, major_a, major_b, compiled_dims, accumulate));
 }
 
 static void sm120_m_grouped_bf16_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& b,

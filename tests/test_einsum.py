@@ -355,6 +355,35 @@ def test_fp8_einsum_batched_launch():
             ref = torch.einsum(expr, xd, yd)
         assert calc_diff(outputs[0], ref) < 1e-5, f'{expr=}, {h=}, {r=}, {d=}, {b=}: {calc_diff(outputs[0], ref)}'
     print(' > OK\n')
+def test_bf16_einsum_batched_launch():
+    # SM120 runs the heads of the BF16 einsums in one batched launch; a launch per head (DG_SM120_BATCHED_LAUNCH=0) must give
+    # the same bits, with and without an accumulator, on views with padded strides
+    if get_arch_major() != 12:
+        return
+    print('Testing the SM120 batched launch of BF16 einsum against a launch per head:')
+    deep_gemm.use_deterministic_algorithms(True)
+    cases = [('bhr,hdr->bhd', 8, 4096, 1024, 4), ('bhr,hdr->bhd', 128, 512, 128, 33), ('bhr,hdr->bhd', 16, 384, 256, 200),
+             ('bhd,hdr->bhr', 8, 4096, 1024, 5), ('bhd,hdr->bhr', 128, 512, 128, 130), ('bhd,hdr->bhr', 16, 384, 256, 200)]
+    for expr, h, r, d, b in cases:
+        k = r if expr == 'bhr,hdr->bhd' else d
+        n = d if expr == 'bhr,hdr->bhd' else r
+        x = torch.randn((b, h, k), device='cuda', dtype=torch.bfloat16)
+        fy = torch.randn((h, d, r + 64), device='cuda', dtype=torch.bfloat16)
+        y = fy[:, :, :r]
+        ref = torch.einsum(expr, x.float(), y.float())
+        for accumulate in (False, True):
+            init = torch.randn((b, h, n), device='cuda', dtype=torch.bfloat16)
+            outputs = []
+            for batched in ('1', '0'):
+                os.environ['DG_SM120_BATCHED_LAUNCH'] = batched
+                out = init.clone()
+                deep_gemm.einsum(expr, x, y, out, c=out if accumulate else None)
+                outputs.append(out)
+            del os.environ['DG_SM120_BATCHED_LAUNCH']
+            assert torch.equal(outputs[0], outputs[1]), f'{expr=}, {h=}, {r=}, {d=}, {b=}, {accumulate=}: batched != per-head'
+            expected = ref + (init.float() if accumulate else 0)
+            assert calc_diff(outputs[0], expected) < 1e-5, f'{expr=}, {h=}, {r=}, {d=}, {b=}: {calc_diff(outputs[0], expected)}'
+    print(' > OK\n')
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -371,3 +400,4 @@ if __name__ == '__main__':
     test_fp8_bhd_hdr_bhr()
     test_fp8_bhd_bhr_hdr()
     test_fp8_einsum_batched_launch()
+    test_bf16_einsum_batched_launch()

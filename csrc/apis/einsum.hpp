@@ -99,9 +99,19 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
         // One BF16 GEMM per head on strided views: `D[:, i] = A[:, i] @ B[i]^T` (+ C, which `early_return` has already
         // copied into D), all K-major
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        for (int i = 0; i < h; ++ i)
-            sm120_bf16_gemm_1d1d(A.select(1, i), B[i], C.has_value() ? std::make_optional(D) : std::nullopt, D.select(1, i),
-                                 b, d, r, cute::UMMA::Major::K, cute::UMMA::Major::K, "nk", 1.0f);
+        // All heads in one batched launch over the strided views `[h, b, r]` and `[h, b, d]`. A GEMM per head (strides
+        // TMA cannot describe, or DG_SM120_BATCHED_LAUNCH=0) runs the batched launch's layout, so both give the same bits
+        const auto a_heads = A.transpose(0, 1), d_heads = D.transpose(0, 1);
+        if (sm120_bf16_bmm_supported(a_heads, B, d_heads, r, cute::UMMA::Major::K, cute::UMMA::Major::K)) {
+            sm120_bf16_bmm_1d1d(a_heads, B, C.has_value(), d_heads, h, b, d, r,
+                                cute::UMMA::Major::K, cute::UMMA::Major::K, "nk", 1.0f);
+        } else {
+            const auto choice = sm120_bf16_bmm_choice(a_heads, B, d_heads, h, b, d, r,
+                                                      cute::UMMA::Major::K, cute::UMMA::Major::K, "nk", C.has_value());
+            for (int i = 0; i < h; ++ i)
+                sm120_bf16_gemm_1d1d(A.select(1, i), B[i], C.has_value() ? std::make_optional(D) : std::nullopt, D.select(1, i),
+                                     b, d, r, cute::UMMA::Major::K, cute::UMMA::Major::K, "nk", 1.0f, choice);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -139,10 +149,19 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
     } else if (arch_major == 12) {
         // One BF16 GEMM per head: `D[:, i] = A[:, i] @ B[i]` (+ C, already in D). `B[i]` is `[d, r]` with `r` contiguous,
         // i.e. an MN-major `[r, d]` B operand
+        // Batched like `bhr_hdr_bhd`: B as the MN-major `[h, r, d]` view
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        for (int i = 0; i < h; ++ i)
-            sm120_bf16_gemm_1d1d(A.select(1, i), B[i].transpose(0, 1), C.has_value() ? std::make_optional(D) : std::nullopt,
-                                 D.select(1, i), b, r, d, cute::UMMA::Major::K, cute::UMMA::Major::MN, "nk", 1.0f);
+        const auto a_heads = A.transpose(0, 1), d_heads = D.transpose(0, 1), b_heads = B.transpose(1, 2);
+        if (sm120_bf16_bmm_supported(a_heads, b_heads, d_heads, d, cute::UMMA::Major::K, cute::UMMA::Major::MN)) {
+            sm120_bf16_bmm_1d1d(a_heads, b_heads, C.has_value(), d_heads, h, b, r, d,
+                                cute::UMMA::Major::K, cute::UMMA::Major::MN, "nk", 1.0f);
+        } else {
+            const auto choice = sm120_bf16_bmm_choice(a_heads, b_heads, d_heads, h, b, r, d,
+                                                      cute::UMMA::Major::K, cute::UMMA::Major::MN, "nk", C.has_value());
+            for (int i = 0; i < h; ++ i)
+                sm120_bf16_gemm_1d1d(A.select(1, i), B[i].transpose(0, 1), C.has_value() ? std::make_optional(D) : std::nullopt,
+                                     D.select(1, i), b, r, d, cute::UMMA::Major::K, cute::UMMA::Major::MN, "nk", 1.0f, choice);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
