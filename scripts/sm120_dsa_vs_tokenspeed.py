@@ -2,7 +2,7 @@
 #
 # Run in the TokenSpeed venv with this DeepGEMM build first on PYTHONPATH (see `sm120_remote.sh ts`).
 #  - decode: `dsa_plan` + `dsa_decode_topk`, CUDA graph over several cache copies (exceeding L2), per call
-#  - prefill: `dsa_prefill_topk`, eager (as served), CUDA-event wall time per call
+#  - prefill: the two `dsa_prefill_topk` leaves, eager (as served), back-to-back calls timed with CUDA events
 import argparse
 import math
 
@@ -87,40 +87,30 @@ def bench_prefill(num_tokens: int, prefix: int):
     kwargs = dict(topk=TOPK, softmax_scale=DIM ** -0.5, index_k_cache=cache, page_size=PAGE)
     candidate_lens_cpu = (row_ends - row_starts).cpu()
 
-    # DeepGEMM prefill as TokenSpeed runs it (quantize Q, fold its scale into the weights, gather keys, MQA logits),
-    # with Triton's radix top-k, as TokenSpeed's default top-k (`torch.ops.trtllm.indexer_topk_prefill`) and the
-    # FlashInfer row-invariant fallback (`k=2048` needs 128 KB smem) have no sm120 support
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
-    from tokenspeed_kernel.ops.attention.dsa._triton.topk import _topk_with_padding, combine_topk_weights
-    import deep_gemm
-    pages = cache.view(-1, PAGE * ROW_BYTES)
-    k_fp8 = pages[:, :PAGE * DIM].contiguous().view(torch.float8_e4m3fn).view(-1, DIM)[:num_keys]
-    k_scale = pages[:, PAGE * DIM:].contiguous().view(torch.float32).view(-1)[:num_keys]
-    lens = (row_ends - row_starts).contiguous()
-
-    def deepgemm_prefill():
-        q_fp8, q_scale = quantize_fp8(q.view(-1, DIM), granularity='token_group', group_size=128, scale_encoding='float32')
-        w = combine_topk_weights(weights, q_scale, DIM ** -0.5)
-        logits = deep_gemm.fp8_mqa_logits(q_fp8.view_as(q), (k_fp8, k_scale), w, row_starts, row_ends,
-                                          clean_logits=False, max_seqlen_k=num_keys)
-        return (_topk_with_padding(logits, TOPK, seq_lens=lens, enable_pdl=False), )
-
+    # The shipped DeepGEMM leaf (fused input preparation, DeepGEMM MQA logits, DeepSelect) against the Triton leaf. Both
+    # get the key plane and slots, as the DSA backend hands them; the DeepGEMM one also the host mirror of the lengths
     impls = {
-        'deepgemm': deepgemm_prefill,
+        'deepgemm': lambda: dsa_dg.deep_gemm_dsa_prefill_topk(q, weights, slots, row_starts, row_ends,
+                                                              candidate_lens_cpu=candidate_lens_cpu, **kwargs),
         'triton': lambda: dsa_triton.triton_dsa_prefill_topk_fp8(q, weights, slots, row_starts, row_ends, **kwargs),
     }
     times, outs = {}, {}
     for name, fn in impls.items():
         outs[name] = fn()[0].clone()
         torch.cuda.synchronize()
+        # Back-to-back calls, as consecutive layers issue them: a host-bound leaf shows its launch time here
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize()
         samples = []
-        for _ in range(7):
+        for _ in range(5):
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record()
-            fn()
+            for _ in range(20):
+                fn()
             end.record()
             torch.cuda.synchronize()
-            samples.append(start.elapsed_time(end) / 1e3)
+            samples.append(start.elapsed_time(end) / 1e3 / 20)
         times[name] = sorted(samples)[len(samples) // 2]
     return times, overlap(outs['deepgemm'], outs['triton'])
 
@@ -128,7 +118,7 @@ def bench_prefill(num_tokens: int, prefix: int):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--decode', type=str, default='1x4096,8x4096,32x4096,128x4096,1x16384,8x16384,32x16384,128x16384,1x65536,8x65536,32x65536,1x131072,8x131072')
-    parser.add_argument('--prefill', type=str, default='1024x0,4096x0,4096x4096,2048x14336,8192x0')
+    parser.add_argument('--prefill', type=str, default='1x0,16x0,64x0,128x0,256x0,512x0,128x2048,1024x0,4096x0,4096x4096,2048x14336,8192x0')
     args = parser.parse_args()
     print('decode (graph, per call)')
     for case in filter(None, args.decode.split(',')):
@@ -137,7 +127,7 @@ def main():
         ratio = times['triton'] / times['deepgemm']
         print(f'  B={batch:4} ctx={ctx:6}: deepgemm {times["deepgemm"] * 1e6:8.1f} us | triton {times["triton"] * 1e6:8.1f} us | '
               f'triton/DG {ratio:5.2f}{"  LOSE" if ratio < 1 else ""} | top-k overlap {ov:.3f}', flush=True)
-    print('prefill (eager, per call)')
+    print('prefill (eager, back-to-back calls)')
     for case in filter(None, args.prefill.split(',')):
         tokens, prefix = (int(x) for x in case.split('x'))
         times, ov = bench_prefill(tokens, prefix)
