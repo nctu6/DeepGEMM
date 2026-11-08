@@ -858,7 +858,7 @@ K-major FP8 / FP4 / BF16 timings against a build of `b01788a` did not move
 
 ### 7.8 Per-op summary on SM120 (task 15)
 
-One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Triton or FlashInfer kernel that TokenSpeed has on SM120 for the same op. Ratio is baseline time over SM120-kernel time, so above 1 means the SM120 kernel is faster. Every number comes from the sections and commits named in the last column; only the DSA row was re-measured for this task (batch invariance, `36211b436`). Method as in 7.1 (CUDA graph, cold weights, interleaved runs) unless the source section says otherwise.
+One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Triton or FlashInfer kernel that TokenSpeed has on SM120 for the same op. Ratio is baseline time over SM120-kernel time, so above 1 means the SM120 kernel is faster. Every number comes from the sections and commits named in the last column; only the DSA row was re-measured for this task (batch invariance, `36211b436`), and the DSA and V4 rows again for task 17 (CuTe DSL DSA cores, analysis 9.22). Method as in 7.1 (CUDA graph, cold weights, interleaved runs) unless the source section says otherwise.
 
 | Op | SM120 kernel | Baseline | Geomean | Range | Worst shape | Source |
 |---|---|---|---|---|---|---|
@@ -876,9 +876,10 @@ One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Trito
 | Paged MQA logits, MXFP4 rows | DeepGEMM `sm120_fp8_paged_mqa_logits` (block-scaled) | the same kernel on FP8 rows (no Triton/FlashInfer paged FP4 MQA exists) | not recorded | 1.02-1.74x (16 V4.1 decode shapes, 6 of 9.13) | 1.02x, 1 request x 1K rows (launch-bound) | analysis 9.21 |
 | V4.1 indexer, packed 68-byte rows (what SM120 serves) | `deep_gemm_sm120_dsv41_index_topk` | `triton_dsv41_index_topk` | not recorded | decode: Full 5.6-16x, source 7.7-33x, Reindex 2.2-22x; prefill: 11-46x, 22-88x, 6.8-22x | 2.2x, Reindex of 1-8 requests | analysis 9.21 |
 | V4.1 indexer, FP8 `index_v4` rows | `deep_gemm_sm120_dsv41_index_topk` | Triton leaves | not recorded | decode 2.3-7.2x, chunked prefill 1.4-5.1x | Reindex over long histories (0.54-0.99x, kept on Triton); the runtime does not store these rows on SM120 | analysis 9.16 |
-| DSA sparse attention | TokenSpeed `triton_dsa_mma_decode` / `_prefill` | `triton_dsa_decode` / `_prefill` | 72x (64 buckets: 16-128 heads, decode batch 1-128, prefill 128-8192, E4M3 and BF16) | 22-114x | 22x, BF16 decode, 16 heads, 1 request | 7.8.1 |
+| DSA sparse attention | TokenSpeed `cute_dsl_dsa_mma_decode` / `_prefill` (CuTe DSL, task 17) | `triton_dsa_mma_*`, the best Triton core (FlashMLA / trtllm-gen cannot run on SM120) | E4M3 1.91x, BF16 1.16x (64 buckets: 16-128 heads, decode batch 1-128, prefill 128-8192) | 1.00-2.34x | 1.00x, BF16 16 heads (prefill 8192, decode batch 1) | 7.8.1, analysis 9.22 |
+| DSA sparse attention (Triton core) | TokenSpeed `triton_dsa_mma_decode` / `_prefill` | `triton_dsa_decode` / `_prefill` | 72x before task 17 (BF16 1.24x faster since) | 22-114x | 22x, BF16 decode, 16 heads, 1 request | 7.8.1 |
 | MLA decode | TokenSpeed `triton_mla_mma_decode_with_kvcache` | portable `triton_mla_decode_with_kvcache` (FlashInfer / `tokenspeed_mla` cannot run on SM120) | not recorded | 14-131x | 14x | analysis 9.19 |
-| V4 / V4.1 selected attention (prefill) | TokenSpeed `triton_dsv4_mma_prefill` | `triton_dsv4_prefill` (FlashMLA cannot run on SM120) | not recorded | 4-9x | 4x | analysis 9.19 |
+| V4 / V4.1 selected attention (prefill) | TokenSpeed `triton_dsv4_mma_prefill` | `triton_dsv4_prefill` (FlashMLA cannot run on SM120) | not recorded | 4-9x (and 1.24-1.31x more from 128 tokens since task 17) | 4x | analysis 9.19, 9.22 |
 | Hadamard 128 | TokenSpeed `triton_hadamard_transform_128_mma` | portable `triton_hadamard_transform_128` | not recorded | 0.9x at 1 token; 20-117x from 64 tokens | 0.9x at 1 token (2.1 vs 1.9 us, launch-bound); 2.7x at 8 tokens; 55x at 16K and 64K tokens (at the copy roofline) | analysis 9.19 |
 | mHC | DeepGEMM `tf32_hc_prenorm_gemm` leaves | Triton | not recorded | `mhc_pre` 1.5-13.6x, `mhc_mixes` 1.6-15x | 1.5x `mhc_pre` | 8 |
 
@@ -899,6 +900,15 @@ Same 64 buckets as 13.2 (CUDA graph, GPU 7), before and after:
 
 Every bucket still beats `triton_dsa_*` by at least 22x. Tried and dropped: 16 chunks (prefill unchanged, 1.4-2.2x slower for 8-128 requests of 64-128 heads because of the stored chunk states), 4 chunks (1.32x geomean, 3.6x worst), 16 warps (58-68 spills at 128 registers). Details in `deepgemm-analysis.md` section 9.20.
 
+Task 17 (analysis 9.22) recovered and passed the cost. In Triton, BF16 tiles now prefetch only the next slots (the whole-tile register prefetch spilled next to the second accumulator): BF16 1.24x faster than the batch-invariant core, 0.96x of the pre-invariance one; E4M3 unchanged. The CuTe DSL cores `cute_dsl_dsa_mma_*` keep the same chunked fold (bitwise batch-invariant) with one accumulator per warp and are selected on SM120:
+
+| 64 buckets | E4M3 | BF16 |
+|---|---|---|
+| CuTe vs Triton core (after task 17) | 1.91x (1.49-2.34x) | 1.16x (1.00-1.42x) |
+| CuTe vs batch-invariant Triton (`36211b436`) | 1.92x | 1.44x |
+| CuTe vs pre-invariance Triton | 1.62x (0.95-2.17x) | 1.12x (0.65-1.48x; decode of one request 20 vs 13-14 us) |
+| 128 heads, 8192-token chunk | 13.7 ms, 342 TFLOP/s (63% of the floor) | 24.3 ms, 192 TFLOP/s (48%) |
+
 #### 7.8.2 What SM120 does not run, and why
 
 | Not supported | Reason |
@@ -915,12 +925,12 @@ Every bucket still beats `triton_dsa_*` by at least 22x. Tried and dropped: 16 c
 
 #### 7.8.3 Headroom for a CuTe DSL rewrite
 
-The attention kernels are Triton `mma.sync` and sit at 25-35% of the tensor-pipe floor (cuBLAS reaches E4M3 582 and BF16 413 TFLOP/s on this GPU); TMA or `cp.async` gathers with `ldmatrix` and a warp-specialized softmax could gain up to about 3x:
+The Triton attention kernels sit at 25-35% of the tensor-pipe floor (cuBLAS reaches E4M3 582 and BF16 413 TFLOP/s on this GPU). Task 17 wrote the DSA one in CuTe DSL (`cp.async` ring, `ldmatrix`, `mma.sync`, one accumulator per warp; analysis 9.22); MLA decode and V4 prefill are still Triton:
 
 | Kernel | Now | Floor |
 |---|---|---|
-| DSA sparse attention | 136-158 TFLOP/s before batch invariance | about 540 TFLOP/s (E4M3 QK 779, 16-bit PV 404); a CuTe kernel with a single accumulator would also recover the 1.21x spill cost |
-| V4 selected attention prefill | 106-112 TFLOP/s | |
+| DSA sparse attention | CuTe: E4M3 342 TFLOP/s (63%), BF16 192 TFLOP/s (48%); the Triton core 141-153 | about 540 TFLOP/s (E4M3 QK 779, 16-bit PV 404), 404 for BF16 |
+| V4 selected attention prefill | about 140 TFLOP/s since task 17 (106-112 before) | 404 (BF16); CuTe port open, the DSA BF16 path is the template |
 | MLA decode, 128 heads | 75-142 TFLOP/s | 16 heads is at the memory roofline |
 | MLA prefill (`triton_mla_prefill`) | 104-146 TFLOP/s | |
 
@@ -1258,20 +1268,21 @@ Other notes:
    The native BF16 einsum (deterministic mode only) still launches a GEMM per
    head; the batched kernel path would serve it, but the default BF16 einsum
    is cuBLASLt, so it was left alone.
-5. **DSA sparse attention is a Triton `mma.sync` kernel, 25-30% of the
-   tensor-pipe floor.** A CuTe DSL kernel (TMA or `cp.async` gathers,
-   `ldmatrix`, warp-specialized softmax) could gain up to about 3x; the
-   Triton variants tried (pipelined loop, register caps, other tile and warp
-   counts) were all slower (section 9.17 of the analysis). It is
-   batch-invariant since task 15 (fixed chunks by width, 1.21x geomean cost
-   from a second accumulator that spills 34-52 registers; section 7.8.1), and
-   serves the zero-RoPE GLM-5.3-Flash layout (task 14).
+5. **DSA sparse attention: CuTe DSL cores done (task 17).** 1.91x (E4M3) and
+   1.16x (BF16) over the Triton core, bitwise batch-invariant, 63% / 48% of
+   the tensor-pipe floor (section 7.8.1, analysis 9.22). Open: BF16 above
+   48% (its channel-split scores pay a partial-sum exchange; a 64-row BF16
+   tile does not fit with the query in shared memory), decode of one request
+   (20 us BF16, bound by 8 chunks per selection), a producer warp / ping-pong
+   head groups (no register room at 256 threads), and lifting the dots3-note
+   `triton` solution pin on SM120 (its tests pass on the CuTe cores).
 6. Optional: publish a `tokenspeed-deepgemm` wheel from this fork. No longer
    required, since the source build replaces the wheel.
 7. **SM120 replacements for the capped SM100-only leaves** (task 14). Done:
    Hadamard, MLA decode, V4 selected attention, zero-RoPE DSA (section 8).
-   Open: CuTe DSL versions of the three attention kernels (up to about 3x on
-   compute-bound shapes); a V4
+   Open: CuTe DSL versions of MLA decode and V4 prefill (the DSA one is done,
+   item 5; expected about the BF16 DSA gain for V4 and up to the E4M3 one for
+   MLA with an E4M3 cache); a V4
    decode kernel that reads the FP8 page-planar rows directly instead of a BF16
    workspace.
 
