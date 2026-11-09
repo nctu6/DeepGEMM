@@ -915,7 +915,7 @@ The before/after cost table (per-bucket changes, 16 and 4 chunks, 16 warps) is i
 
 | Not supported | Reason |
 |---|---|
-| Mega MoE (`fp8_fp4_mega_moe`) at EP > 1, fused shared experts | not implemented. Not a hardware limit: the one-rank version runs (analysis 9.26), and GPUs 6 and 7 do P2P over PCIe (54 GB/s) |
+| Mega MoE (`fp8_fp4_mega_moe`) with fused shared experts | not implemented. Not a hardware limit: one rank and EP over CUDA IPC both run (analysis 9.26) |
 | Mega gate, mega mHC | not implemented. The SM100 kernels use TMEM / UMMA, but what they compute is a GEMM plus elementwise work that `mma.sync` can do. TokenSpeed has no caller |
 | FlashMLA DSV4/V4.1, FlashMLA DSA, flashinfer trtllm-gen DSA, `tokenspeed_mla` | `wgmma` / `tcgen05` kernels with no sm_120 cubin; replaced by the Triton `mma.sync` leaves above |
 | `fast_hadamard_transform` wheel | ships sm_90/100/103 cubins and no PTX (the upstream source builds for sm_120 but is 1.6x slower than the Triton leaf at 64K rows) |
@@ -1199,14 +1199,19 @@ See section 7.
   block-scaled formats), MXFP8 paged MQA at 128 Q rows (it spills), and SM100's
   varlen paged API (`indices`, next_n 1), which SM120 doesn't expose, as on
   SM90.
-- Mega MoE with more than one rank or fused shared experts, mega gate and mega
-  mHC. Since task 21, `fp8_fp4_mega_moe` runs on one SM120 rank. It is dispatch,
-  two FP8 x MXFP4 (W4A8) grouped GEMMs, SwiGLU and combine as separate kernels,
-  with the SM100 arithmetic. None of the rest needs missing hardware. GPUs 6 and
-  7 do P2P over PCIe at 54 GB/s, so EP=2 over CUDA IPC is possible. Gate and mHC
-  are a GEMM plus elementwise work (`tf32_hc_prenorm_gemm` exists). TokenSpeed has
-  no SM120 caller for any of them: its MegaMoE path needs EP > 1, the V4 / V4.1
-  experts do not fit one GPU, and it calls no mega gate or mHC. Analysis 9.26.
+- Mega MoE with fused shared experts, mega gate and mega mHC. Since task 21,
+  `fp8_fp4_mega_moe` runs on SM120 as dispatch, two FP8 x MXFP4 (W4A8) grouped
+  GEMMs, SwiGLU and combine as separate kernels, with the SM100 arithmetic, on
+  one rank or across ranks (up to 8, run on 2). The ranks write into each other's
+  torch symmetric-memory buffers with peer stores over PCIe (CUDA IPC) and order
+  with a system-scope epoch barrier that traps after `DG_SM120_COMM_TIMEOUT_S`.
+  Peer loads were 100-300x slower and are not used. Calls that share a buffer
+  must be stream-ordered per rank. Results are bitwise equal to one rank over
+  all experts, and the sequence replays in CUDA graphs. At EP 2 it ties Marlin
+  W4A16 plus its collective up to 1024 tokens per rank (0.95-1.05x) and wins
+  1.28-1.39x from 2048; TokenSpeed offers it on SM120 for EP 2 (opt-in). Gate and
+  mHC are a GEMM plus elementwise work (`tf32_hc_prenorm_gemm` exists), and
+  TokenSpeed calls neither. Analysis 9.26.
   (The DeepGEMM mHC pre/mixes kernels built on `tf32_hc_prenorm_gemm` do run,
   section 8.)
 - W4A8 (FP8 x MXFP4) takes K-major operands, 32-element UE8M0 scales and
@@ -1264,9 +1269,10 @@ Other notes:
 3. DeepSeek-V3/V3.2 TP8 end-to-end run with a real checkpoint. It needs GPUs
    0-7, and only GPU 7 was available. A reduced-layer V3.2 with random weights
    ran on one GPU (section 7.4, task 13.3).
-4. Deferred, low value here: mega MoE at EP > 1 (P2P works on GPUs 6/7), the
-   mega MoE 1-token gap against Marlin (0.82x, launch count), mega gate and mHC
-   (no TokenSpeed caller; analysis 9.26). Closed since the last report: MN-major FP8 operands, k-grouped
+4. Deferred, low value here: the mega MoE 1-token gap (0.82x at one rank,
+   0.95x at EP 2; launch count), the V4 EP 2 end-to-end run, mega gate and mHC
+   (no TokenSpeed caller; analysis 9.26). Done in task 21: mega MoE at EP 2 over
+   CUDA IPC. Closed since the last report: MN-major FP8 operands, k-grouped
    FP8, the MN-major `fp8_einsum` expressions (all heads in one launch), paged
    MQA head dim 32/64, and the 16x32 stream-K register spill (section 3.4).
    The native BF16 einsum (deterministic mode only) now runs all heads in one

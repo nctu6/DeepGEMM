@@ -25,7 +25,7 @@ TokenSpeed); nothing is pushed.
 | BF16 GEMMs (K- or MN-major, m-grouped, k-grouped) | supported; `bf16_gemm_nt` stays on cuBLASLt unless deterministic mode |
 | `einsum`: `bmk,bnk->mn`, `bhr,hdr->bhd`, `bhd,hdr->bhr` (BF16); `fp8_einsum` (3 expressions) | supported; the head expressions run as one batched launch |
 | `tf32_hc_prenorm_gemm` (mHC pre-norm) | supported |
-| `fp8_fp4_mega_moe` (MXFP4 routed experts, one rank; task 21) | supported as a sequence of kernels with the SM100 arithmetic; EP > 1 and fused shared experts are rejected |
+| `fp8_fp4_mega_moe` (MXFP4 routed experts; task 21) | supported as a sequence of kernels with the SM100 arithmetic, on one rank or across up to 8 ranks (run on 2) with CUDA IPC peer stores over PCIe; bitwise equal to one rank, CUDA-graph safe. Fused shared experts are rejected |
 | `fp8_mqa_logits`, `fp8_paged_mqa_logits` (head dim 128/64, paged also 32), sparse MQA logits | supported |
 | Block-scaled MQA logits, MXFP4 / MXFP8 rows (contiguous, paged, sparse) | supported; scores the 68-byte V4.1 index rows natively |
 | Mixed packed-UE8M0 / FP32 scale pair, legacy `fp8_*` aliases, `get_supported_arch_majors()` | supported |
@@ -44,7 +44,8 @@ table is design 7.8).
 | MXFP4 GEMM | same | best Triton / FlashInfer block-FP8 | 1.5-11.4x (geomean 3.1x); 1.4-2.3x (geomean 1.8x) over the best FP8 kernel | 1.52x (K = 256 `shared down`, M = 4096); 0.94x vs the best FP8 kernel (`shared down`, M = 32) |
 | NVFP4 GEMM | same, 16-element scales | best FlashInfer NVFP4 | 1.223x geomean, 47 of 63 wins | 0.910x |
 | W4A8 grouped GEMM (task 21) | DeepGEMM 1D1D, FP8 x MXFP4 | same kernel, FP8 x FP8 on converted weights (bitwise equal) | 1.35-1.72x at decode / mid shapes, 1.07-1.10x small | 0.84x (4 x 4096 x 4096 x 2048, compute-bound) |
-| Mega MoE, one rank, V4 / V4.1 shapes (task 21) | `fp8_fp4_mega_moe` | Marlin W4A16 (TokenSpeed's SM120 MXFP4 MoE; Triton MXFP4 is 9-13x slower) | 0.97-0.99x at 4-64 tokens (DRAM roofline), 1.01-1.09x at 256-1024, 1.59-1.87x at 4096-8192 | 0.82x at 1 token (launch count); not enabled in TokenSpeed |
+| Mega MoE, one rank, V4 / V4.1 shapes (task 21) | `fp8_fp4_mega_moe` | Marlin W4A16 (TokenSpeed's SM120 MXFP4 MoE; Triton MXFP4 is 9-13x slower) | 0.97-0.99x at 4-64 tokens (DRAM roofline), 1.01-1.09x at 256-1024, 1.59-1.87x at 4096-8192 | 0.82x at 1 token (launch count); no TokenSpeed caller at one rank |
+| Mega MoE, EP 2 on GPUs 6+7, V4 / V4.1 shapes (task 21) | `fp8_fp4_mega_moe` over CUDA IPC | Marlin W4A16 per rank + all-reduce (attention TP) or all-gather / reduce-scatter (attention DP), same served tokens | 0.99-1.05x at 4-1024 tokens per rank, 1.28-1.39x at 2048-4096 | 0.95-0.96x at 1 token (11 launches); TokenSpeed leaf `deep_gemm_sm120_mxfp4_mega_moe_apply`, opt-in `--moe-backend mega_moe` |
 | MXFP4 linear leaf (with quantization) | `deepgemm_sm120_mxfp4_linear` | FlashInfer quantize + best `mm_fp4` | 1.23x geomean, 60 of 63 wins | 0.90x q_b M=256 |
 | MN-major FP8 / k-grouped FP8 | DeepGEMM | explicit transpose + K-major kernel | 1.63x (B, M <= 64) / 1.11-2.06x | 0.97x (B operand) / 0.76x vs a torch loop at small K |
 | `fp8_einsum` (3 expressions) | batched launch | best of cuBLASLt BF16, torch loop, `torch.einsum` | 1.52x geomean (26 shapes) | 0.99x `bhd,bhr->hdr` h=8, b=128 (tie) |
@@ -70,7 +71,7 @@ End to end (in-process `Engine`):
 
 | Not supported | Hardware reason |
 |---|---|
-| Mega MoE at EP > 1 or with fused shared experts; mega gate; mega mHC | not a hardware limit (analysis 9.26). The SM100 kernels fuse around TMEM / UMMA / NVLink, but P2P works between GPUs 6 and 7 and the math maps to `mma.sync`. Not built because TokenSpeed has no SM120 caller (its MegaMoE path needs EP > 1, the V4/V4.1 experts do not fit one GPU, and it calls no mega gate or mHC) |
+| Mega MoE with fused shared experts; mega gate; mega mHC | not a hardware limit (analysis 9.26). The SM100 kernels fuse around TMEM / UMMA / NVLink, but the math maps to `mma.sync`. Not built because TokenSpeed has no caller (it runs V4's shared expert separately and calls no mega gate or mHC) |
 | FlashMLA DSV4/V4.1 and DSA, trtllm-gen DSA, `tokenspeed_mla`, `fast_hadamard_transform` wheel | `wgmma` / `tcgen05` kernels with no sm_120 cubin; replaced by SM120 `mma.sync` leaves |
 | MN-major FP4 operands | no sub-byte transposing `ldmatrix` (FP8 has `.b8`, BF16 the 16-bit form) |
 | FP8-output (quantized D) and custom epilogues | SM100 epilogues built on TMEM |
@@ -118,7 +119,7 @@ the installed build reports SM120 kernels (`deep_gemm.get_supported_arch_majors(
 ## 7. Open items
 
 - One FP4 tie with FlashInfer b12x: dense gate_up M=256 (0.98x), bound by L2 -> SM traffic (analysis 9.15).
-- Mega MoE (analysis 9.26): EP=2 over CUDA IPC (P2P works on GPUs 6/7), fused shared experts, the 1-token gap against Marlin (0.82x; fewer launches or a split-K grouped GEMM), mega gate and mega mHC (no TokenSpeed caller). Triton MXFP4 MoE hit an illegal memory access at V4.1 shapes (not investigated).
+- Mega MoE (analysis 9.26): the 1-token gap (0.82x at one rank, 0.95x at EP 2; fewer launches or a fused push + dispatch), the V4 EP 2 end-to-end run (blocked during task 21 by another user's job on GPUs 6/7), more than 2 ranks, fused shared experts, mega gate and mega mHC (no TokenSpeed caller). Done: EP 2 over CUDA IPC; the Triton MXFP4 MoE illegal memory access at V4.1 shapes (32-bit expert offsets, TokenSpeed `8afd973bc`).
 - V4.1 indexer: a multi-wave sparse MX kernel (the sparse kernel is one wave, about 85 us at any size); MXFP4 paged at 1.07 vs 1.23 TB/s for FP8; FP8 `index_v4` rows have no pool-only scorer (the runtime does not store them on SM120).
 - Attention: BF16 DSA / V4 above 42-48% of the tensor-pipe floor; V4 at 16 heads; decode of one DSA request (20 us BF16); a dequantizing tile in the CuTe DSL V4 kernel; host paths of `fp8_mqa_logits` (26 us) and DeepSelect (34 us) in a 128-token DSA chunk.
 - No real-checkpoint run: DeepSeek-V3/V3.2 TP8 needs 8 GPUs, V4.1 ran with dummy weights.
