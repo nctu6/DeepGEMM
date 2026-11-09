@@ -57,6 +57,10 @@ class QuantConfig:
     def is_fp4_fp4(self) -> bool:
         return self.is_fp4_a and self.is_fp4_b
 
+    def requires_k_major_b(self) -> bool:
+        # FP4 x FP4 everywhere, and any FP4 B on SM120 (there is no sub-byte transposing load)
+        return self.is_fp4_fp4() or (get_arch_major() == 12 and self.is_fp4_b)
+
     def get_recipes(self, is_wgrad: bool = False) -> Tuple[Tuple, Tuple, Tuple]:
         recipe, recipe_a, recipe_b = None, None, None
         if self.is_legacy():
@@ -83,6 +87,9 @@ class QuantConfig:
         if get_arch_major() == 10:
             quant_config_list.append(QuantConfig((128, 32, False, True)))
             quant_config_list.append(QuantConfig((32, 32, True, True)))
+        if get_arch_major() == 12:
+            # SM120: FP8 activations against FP4 weights (W4A8), both with 32-element UE8M0 scales
+            quant_config_list.append(QuantConfig((32, 32, False, True)))
         return quant_config_list
 
 
@@ -120,9 +127,10 @@ def is_sm90_like_fp8() -> bool:
     return get_arch_major() in (9, 12)
 
 
-def get_ue8m0_usage(kernel_type: KernelType) -> bool:
+def get_ue8m0_usage(kernel_type: KernelType, quant_config: Optional['QuantConfig'] = None) -> bool:
     if is_sm90_like_fp8():
-        return False
+        # SM120 FP4 operands (W4A8 included) run on the block-scaled kernel, which takes packed UE8M0 scales
+        return get_arch_major() == 12 and quant_config is not None and (quant_config.is_fp4_a or quant_config.is_fp4_b)
     return kernel_type.is_1d1d()
 
 
@@ -181,7 +189,7 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
                         yield emit(kernel_type, quant_config, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, out_dtype)
 
             # Backward
-            if quant_config is None or not quant_config.is_fp4_fp4():
+            if quant_config is None or not quant_config.requires_k_major_b():
                 for m in m_bwd_list:
                     for n, k in nk_list:
                         override_major = MajorTypeAB.MNMajor
@@ -240,7 +248,7 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
                         for n, k in n_k_list:
                             # MN-major B: SM100, and SM120 (`ldmatrix.trans.b8`); not SM90 FP8
                             for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
-                                if quant_config is not None and quant_config.is_fp4_fp4() and major_b.is_mn_major():
+                                if quant_config is not None and quant_config.requires_k_major_b() and major_b.is_mn_major():
                                     continue
                                 yield kernel_type, quant_config, num_groups, expected_m_per_group, n, k, major_a, major_b, use_psum_layout, ensure_zero_padding
 

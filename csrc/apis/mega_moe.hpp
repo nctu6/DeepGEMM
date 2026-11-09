@@ -10,6 +10,7 @@
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp4_mega_moe.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
@@ -270,6 +271,18 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_shared_experts,
                                num_tokens, num_topk,
+                               hidden, intermediate_hidden,
+                               activation_clamp, fast_math);
+    } else if (arch_major == 12) {
+        // SM120 (one rank, MXFP4 routed experts): no symmetric-memory dispatch or fused shared experts yet
+        DG_HOST_ASSERT(num_ranks == 1 and "SM120 mega MoE runs one rank");
+        DG_HOST_ASSERT(num_shared_experts == 0 and "SM120 mega MoE has no fused shared experts");
+        DG_HOST_ASSERT(weight_dtype == kPackedFP4 and "SM120 mega MoE takes MXFP4 routed weights");
+        DG_HOST_ASSERT(not is_localized(l1_weights) and "SM120 has no locality domains");
+        sm120_fp8_fp4_mega_moe(y, x, x_sf, topk_idx, topk_weights,
+                               l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
+                               cumulative_local_expert_recv_stats,
+                               num_experts_per_rank, num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math);
     } else {

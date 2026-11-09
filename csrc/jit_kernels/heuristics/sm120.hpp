@@ -138,9 +138,13 @@ struct SM120ArchSpec {
 
         // K block sizes, in bytes of an operand row (one swizzle atom): 128 everywhere, and for the block-scaled FP4
         // kernel also 64 (128 elements), which halves the stage so twice as many stages are in flight
+        // FP8 x FP4 (W4A8): only 64-byte B rows (128 elements, one 128-byte FP8 A row), so A fragments of both MMAs of a
+        // step fit in registers
         std::vector<int> block_k_candidates = {128};
         if (desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4)
             block_k_candidates.push_back(64);
+        if (is_mixed_fp4_b(desc))
+            block_k_candidates = {64};
 
         // Developer-only override for tuning sweeps, e.g. `DG_SM120_FORCE_LAYOUT=128x128` or `64x128x64`
         const auto forced = deep_jit::get_env<std::string>("DG_SM120_FORCE_LAYOUT");
@@ -178,7 +182,7 @@ struct SM120ArchSpec {
         // 64-byte ones for 64-wide FP8 tiles
         const auto swizzle_mode_a = desc.major_a == cute::UMMA::Major::MN ?
             get_swizzle_mode(layout.block_m, static_cast<int>(c10::elementSize(desc.a_dtype))) :
-            get_swizzle_mode(layout.block_k, get_smem_elem_size(desc, desc.a_dtype));
+            get_swizzle_mode(get_block_k_a(desc, layout), get_smem_elem_size(desc, desc.a_dtype));
         const auto swizzle_mode_b = desc.major_b == cute::UMMA::Major::MN ?
             get_swizzle_mode(layout.block_n, static_cast<int>(c10::elementSize(desc.b_dtype))) :
             get_swizzle_mode(layout.block_k, get_smem_elem_size(desc, desc.b_dtype));
@@ -190,6 +194,14 @@ struct SM120ArchSpec {
         };
     }
 
+    // FP8 activations against MXFP4 weights (W4A8)
+    static bool is_mixed_fp4_b(const GemmDesc& desc) {
+        return desc.a_dtype == torch::kFloat8_e4m3fn and desc.b_dtype == kPackedFP4;
+    }
+    // Bytes of an A row: `block_k` counts the bytes of a B row, and the FP8 A of W4A8 has twice as many
+    static int get_block_k_a(const GemmDesc& desc, const Layout& layout) {
+        return is_mixed_fp4_b(desc) ? layout.block_k * 2 : layout.block_k;
+    }
     // Bytes per `block_k` unit of a shared memory operand row
     static int get_smem_elem_size(const GemmDesc& desc, const at::ScalarType& dtype) {
         return is_1d1d_kernel(desc.kernel_type) ? 1 : static_cast<int>(c10::elementSize(dtype));
@@ -198,7 +210,7 @@ struct SM120ArchSpec {
     static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
         // Barriers, plus the split-K "last CTA" flag
         const int smem_barriers = kNumMaxStages * 8 * 2 + 16;
-        const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * get_smem_elem_size(desc, desc.a_dtype);
+        const int smem_a_per_stage = storage_config.load_block_m * get_block_k_a(desc, layout) * get_smem_elem_size(desc, desc.a_dtype);
         const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * get_smem_elem_size(desc, desc.b_dtype);
         // NOTES: the FP32 kernel reads SFA from global memory (L1/L2 cached), not staged. The block-scaled 1D1D
         // kernel TMA-loads the packed scale words of both operands with each stage (FP4 128-byte K block: 2 words per
@@ -207,7 +219,7 @@ struct SM120ArchSpec {
         if (desc.kernel_type == KernelType::Kernel1D1D) {
             // FP4: `block_k * 2` elements per row, one byte per `sf_gran_k` (MXFP4 32, NVFP4 16), 4 bytes per word
             DG_HOST_ASSERT(desc.sf_gran_k > 0);
-            const int num_sf_words = desc.a_dtype == kPackedFP4 ? layout.block_k * 2 / desc.sf_gran_k / 4 : 1;
+            const int num_sf_words = desc.b_dtype == kPackedFP4 ? layout.block_k * 2 / desc.sf_gran_k / 4 : 1;
             smem_sf_per_stage = align(num_sf_words * storage_config.load_block_m * 4, 128) +
                                 align(num_sf_words * storage_config.load_block_n * 4, 128);
         }
@@ -242,7 +254,7 @@ struct SM120ArchSpec {
     // Bytes along K of an operand row: packed FP4 holds two elements per byte, BF16 one per two bytes (the 1D1D
     // kernel's `block_k` counts bytes; for the FP8 1D2D kernel bytes and elements coincide)
     static int get_k_bytes(const GemmDesc& desc, const int& k) {
-        if (desc.a_dtype == kPackedFP4)
+        if (desc.b_dtype == kPackedFP4)
             return k / 2;
         return desc.a_dtype == torch::kBFloat16 ? k * 2 : k;
     }

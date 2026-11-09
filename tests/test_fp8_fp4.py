@@ -35,7 +35,7 @@ def test_gemm() -> None:
         out_opt    = 'FP32' if out_dtype == torch.float else 'BF16'
         acc_opt    = f'acc={int(accumulate)}'
         kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
-        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        use_ue8m0 = get_ue8m0_usage(kernel_type, quant_config)
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes(is_wgrad=(kernel_type.is_1d1d() and accumulate))
 
@@ -119,7 +119,7 @@ def test_m_grouped_gemm_contiguous() -> None:
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
         kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
-        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        use_ue8m0 = get_ue8m0_usage(kernel_type, quant_config)
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes()
 
@@ -182,7 +182,7 @@ def test_m_grouped_gemm_masked() -> None:
     # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
     for kernel_type, quant_config, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.float8_e4m3fn):
         kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
-        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        use_ue8m0 = get_ue8m0_usage(kernel_type, quant_config)
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes()
 

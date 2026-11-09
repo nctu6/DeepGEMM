@@ -152,11 +152,13 @@ def transform_weights_for_mega_moe(
     assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
     if isinstance(l1_weights, tuple):
         # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+        # NOTES: SM120 TMA-loads the scales into shared memory (no UTCCP), so they keep their row order
+        transpose_sf = (lambda sf: sf) if torch.cuda.get_device_capability()[0] == 12 else _transpose_sf_for_utccp
         l1_w = _interleave_weights(l1_weights[0])
-        l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
+        l1_sf = transpose_sf(_interleave_weights(l1_weights[1]))
         l1_transformed = (l1_w, l1_sf)
         # L2: only transpose SF for UTCCP
-        l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
+        l2_transformed = (l2_weights[0], transpose_sf(l2_weights[1]))
     else:
         # BF16: L1 interleave gate/up, L2 unchanged
         l1_transformed = _interleave_weights(l1_weights)

@@ -122,6 +122,38 @@ struct FP8BlockScaledMMA {
     }
 };
 
+/// Mixed FP8 (A, E4M3) x FP4 (B, E2M1) `m16n8k32`, `scale_vec::1X`. B is taken in 8-bit containers, the value in bits
+/// [5:2] of its byte (`spread_e2m1_into_bytes`; probed on hardware, `deepgemm-analysis.md` 9.26). Fragments and scale
+/// lanes are those of `FP8BlockScaledMMA`
+struct FP8xFP4BlockScaledMMA {
+    static constexpr uint32_t M = 16;
+    static constexpr uint32_t N = 8;
+    static constexpr uint32_t K = 32;
+    CUTLASS_DEVICE static void mma(const uint32_t* a, const uint32_t* b, float* d,
+                                   const uint32_t& sfa, const uint32_t& sfb) {
+        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+                     "%10, {0, 0}, %11, {0, 0};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                       "r"(b[0]), "r"(b[1]),
+                       "r"(sfa), "r"(sfb));
+    }
+};
+
+/// Four packed E2M1 values (16 bits, low nibble first) into the four 8-bit containers of the mixed MMA: byte `i` holds
+/// value `i` in bits [5:2]
+CUTLASS_DEVICE uint32_t spread_e2m1_into_bytes(const uint32_t& packed) {
+    // [b0, b0, b1, b1], then the low nibble of bytes 0 / 2 and the high nibble of bytes 1 / 3
+    const uint32_t doubled = __byte_perm(packed, 0, 0x1100);
+    return ((doubled & 0x000f000fu) | ((doubled >> 4) & 0x0f000f00u)) << 2;
+}
+
+/// Two consecutive 32-bit words of shared memory
+CUTLASS_DEVICE void ld_shared_v2(uint32_t& x, uint32_t& y, const uint32_t& smem_addr) {
+    asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];\n" : "=r"(x), "=r"(y) : "r"(smem_addr));
+}
+
 /// FP4 (E2M1, two values per byte, low nibble first) `m16n8k64`, `scale_vec::2X`: the low 16 bits of `sfa`/`sfb` hold
 /// two scale bytes, byte 0 for K 0-31 and byte 1 for K 32-63. The A/B fragments are loaded with the same `ldmatrix`
 /// pattern as FP8 (a 64-element FP4 K step is 32 bytes, like a 32-element FP8 K step)

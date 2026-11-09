@@ -31,6 +31,7 @@ public:
         deep_jit::cuda::LaunchOptions options;
 
         bool is_fp4, is_bf16;
+        bool is_mixed_fp4_b;   // FP8 A against packed FP4 B (W4A8)
         int gran_k;
         bool use_stream_k;
         bool early_pdl_trigger;
@@ -53,7 +54,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm120_fp8_fp4_gemm_1d1d_impl<
-        {}, {}, {},
+        {}, {}, {}, {},
         {}, {},
         {}, {}, {},
         {},
@@ -67,7 +68,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
-        args.is_fp4 ? "true" : "false", args.is_bf16 ? "true" : "false", args.gran_k,
+        args.is_fp4 ? "true" : "false", args.is_bf16 ? "true" : "false", args.is_mixed_fp4_b ? "true" : "false", args.gran_k,
         to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
@@ -120,6 +121,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
                                         const int& gran_k, const float& alpha) {
     const bool is_fp4 = a.scalar_type() == kPackedFP4;
     const bool is_bf16 = a.scalar_type() == torch::kBFloat16;
+    const bool is_mixed_fp4_b = not is_fp4 and b.scalar_type() == kPackedFP4;
     const auto config = sm120_make_config(desc, choice.layout);
     auto stream_k = SM120ArchSpec::StreamKConfig{};
     if (choice.use_stream_k)
@@ -138,11 +140,14 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
     // MN bytes
     const bool is_batched = desc.gemm_type == GemmType::Batched;
     const int elem_bytes = is_bf16 ? 2 : 1;
-    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == (desc.major_a == cute::UMMA::Major::K ? config.layout.block_k :
+    // FP8 x FP4: `block_k` is the B row (64 bytes); the A row holds as many FP8 elements, twice the bytes
+    const int block_k_a = is_mixed_fp4_b ? config.layout.block_k * 2 : config.layout.block_k;
+    DG_HOST_ASSERT(not is_mixed_fp4_b or config.layout.block_k == 64);
+    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == (desc.major_a == cute::UMMA::Major::K ? block_k_a :
                                                             std::min(128, config.layout.block_m * elem_bytes)));
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == (desc.major_b == cute::UMMA::Major::K ? config.layout.block_k :
                                                             std::min(128, config.layout.block_n * elem_bytes)));
-    const int tma_block_k = is_bf16 ? config.layout.block_k / 2 : config.layout.block_k;
+    const int tma_block_k = is_bf16 ? config.layout.block_k / 2 : block_k_a;
     // Batched: 3D maps (inner, outer, batch) over `[G, MN, K]` views, instead of groups stacked along the outer dimension
     const auto tensor_map_a = is_batched ?
         make_tma_batched_desc(desc.major_a, a, desc.m, desc.k, config.storage_config.load_block_m, tma_block_k,
@@ -153,6 +158,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
                         static_cast<int>(a.stride(get_non_contiguous_dim(desc.major_a))), num_groups_a,
                         config.storage_config.swizzle_a_mode, 0, false,
                         /* fp4_unpacked_smem */ false);
+    DG_HOST_ASSERT(not is_mixed_fp4_b or not is_batched);
     const auto tensor_map_b = is_batched ?
         make_tma_batched_desc(desc.major_b, b, desc.n, desc.k, config.storage_config.load_block_n, tma_block_k,
                               config.storage_config.swizzle_b_mode, /* fp4_unpacked_smem */ false) :
@@ -167,7 +173,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
     // K block of `block_k` bytes holds `block_k * 2` elements, i.e. `block_k * 2 / (gran_k * 4)` words (MXFP4: 2 for 128
     // bytes, 1 for 64; NVFP4: 4 and 2); an FP8 one needs 1 (128 elements, a quarter of a 128-granularity word
     // 64). BF16 has no scales: the kernel never reads the SF descriptors, which just repeat A's
-    const int num_sf_words_per_block = is_fp4 ? config.layout.block_k * 2 / (gran_k * 4) : 1;
+    const int num_sf_words_per_block = (is_fp4 or is_mixed_fp4_b) ? config.layout.block_k * 2 / (gran_k * 4) : 1;
     const auto tensor_map_sfa = is_bf16 ? tensor_map_a :
                                 make_tma_sf_desc(cute::UMMA::Major::MN, sfa, desc.m, desc.k,
                                                  config.storage_config.load_block_m, gran_k, num_groups_sfa, 0, 0, false,
@@ -196,6 +202,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
         },
         .is_fp4 = is_fp4,
         .is_bf16 = is_bf16,
+        .is_mixed_fp4_b = is_mixed_fp4_b,
         .gran_k = gran_k,
         .use_stream_k = stream_k.num_ctas > 0,
         .early_pdl_trigger = early_pdl_trigger,
@@ -311,24 +318,28 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
     // `desc.k` counts logical elements, so FP4 (packed two per byte) has `a.size(-1) * 2 == k`
     const bool is_fp4 = a_in.scalar_type() == kPackedFP4;
     const bool is_bf16 = a_in.scalar_type() == torch::kBFloat16;
-    DG_HOST_ASSERT(a_in.scalar_type() == b_in.scalar_type());
+    // Operands share a dtype, except for FP8 activations against MXFP4 weights (W4A8)
+    const bool is_mixed_fp4_b = not is_fp4 and b_in.scalar_type() == kPackedFP4;
+    DG_HOST_ASSERT(a_in.scalar_type() == b_in.scalar_type() or (is_mixed_fp4_b and a_in.scalar_type() == torch::kFloat8_e4m3fn));
     // MN-major operands: BF16 is read in-kernel with the 16-bit `ldmatrix.trans`; FP8 either in-kernel (the 8-bit
     // transposing `ldmatrix`) or through a host transpose (see `sm120_resolve_mn_major_fp8`); FP4 must be K-major, as there
     // is no sub-byte transposing load. An MN-major A has no groups, and a grouped MN-major B (`[G, K, N]`) must have whole K
     // blocks: TMA bounds-checks only the stacked `G * K` rows, so a tail block would read the next group's rows
-    if (is_fp4)
+    if (is_fp4 or is_mixed_fp4_b)
         DG_HOST_ASSERT(desc_in.major_a == cute::UMMA::Major::K and desc_in.major_b == cute::UMMA::Major::K and
                        "SM120 FP4 operands must be K-major (there is no sub-byte transposing load)");
     auto desc = desc_in;
     auto a = a_in, b = b_in;
     const bool is_batched = desc.gemm_type == GemmType::Batched;
-    if (not is_bf16 and not is_fp4 and not is_batched)
+    if (not is_bf16 and not is_fp4 and not is_mixed_fp4_b and not is_batched)
         sm120_resolve_mn_major_fp8(desc, a, b);
     DG_HOST_ASSERT(is_bf16 == (desc.kernel_type == KernelType::KernelNoSF));
     DG_HOST_ASSERT(gran_k_a == gran_k_b);
     // FP4: 32-element UE8M0 (MXFP4) or 16-element UE4M3 (NVFP4) scales. BF16 has no scales and passes a nominal 32
     if (is_fp4)
         DG_HOST_ASSERT(gran_k_a == 32 or gran_k_a == 16);
+    else if (is_mixed_fp4_b)
+        DG_HOST_ASSERT(gran_k_a == 32);
     else
         DG_HOST_ASSERT(is_bf16 ? gran_k_a == 32 : (gran_k_a == 32 or gran_k_a == 128));
     DG_HOST_ASSERT(is_bf16 or desc.sf_gran_k == gran_k_a);
