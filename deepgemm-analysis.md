@@ -2062,7 +2062,7 @@ rule out 2-CTA sharing of gathered rows for attention as well: a 64-row BF16 til
 **Verification.** DeepGEMM: build OK; `tests/test_fp8_fp4.py` (whole file, `DG_JIT_CHECK_NO_SPILLS=1`), `tests/test_mega_moe_sm120.py`,
 `tests/test_mega_moe_sm120_ep.py` (2 ranks, fresh cache) pass. TokenSpeed: kernel subsets (gemm, quantization, MXFP8, V4/V4.1
 attention, selection, recompile, SM120 leaf lists) pass; V4.1 runtime files + `runtime/moe` 603 passed; DP controller tests 48
-passed. The full kernel suite run is in the task 24 log line of the spec.
+passed; the full TokenSpeed kernel suite (selection files, `nvidia`, `ops`) 7904 passed, 2763 skipped, 0 failed (GPU 7).
 
 **Closed directions (task 24).** Looking for the V4.1 serving gap in Engram host reads (0.01-0.08 ms per step, overlapped), host
 gaps (0.1-0.2 ms per step) or DP-path CUDA graphs (decode graphs are captured on both paths); stream-K for the deterministic
