@@ -8,7 +8,7 @@ This file is the single source of truth for the effort. Update the status log
 (section 9) after every step. Re-read sections 2, 5 and 8 before starting any
 new work so we don't drift into one of the known dead ends.
 
-## Current state (2026-11-10, updated for task 24)
+## Current state (2026-11-10, updated for task 24 including item E)
 
 - **Supported on sm120:**
   - `fp8_gemm_nt`, m-grouped contiguous (incl. psum) and masked FP8 GEMMs, with FP32 1x128 / 128x128 scales.
@@ -44,7 +44,7 @@ new work so we don't drift into one of the known dead ends.
 - **Task 23 (2026-11-10, section 9.28):** the dense gate_up M=256 MXFP4 tie (DeepGEMM 19.2 us vs b12x 19.5-19.6 us, 1.02x in an isolated run, 0.98x in the sweep) is not won by thread-block cluster tile sharing. B-slice sharing over DSMEM across 2 and 4 CTAs works and is bitwise equal, but is 2.3-7.3x slower (45-146 us vs 20 us): distributed shared memory on SM120 writes at 5 GB/s per CTA, reads at about 33 GB/s, and adds 95 ns per remote load and 220 ns per remote mbarrier arrive to a 3-stage pipeline. The ceiling with free sharing is 1.13x. No kernel change; probe and patch are in `scripts/`.
 - **Task 24 (2026-11-10, section 9.29):** the real-V4.1 serving profile showed that both TokenSpeed paths spent most decode time in the dense 1x32 UE8M0 FP8 projections on a Triton kernel. TokenSpeed's new `deepgemm_sm120_mm_mxfp8` leaf runs them on the block-scaled 1D1D kernel (2.2-11.7x), batch invariant through deterministic mode, which now skips stream-K and the BLOCK_N=32 K-warp split on SM120 (`26444a3`, `get_deterministic_algorithms()`). MegaMoE's row scratch is one persistent per-device buffer the KV planner counts (`fefd9de`). With TokenSpeed's DP error-masking fix and the CuTe DSL V4 prefill core now reachable from V4.1 prefill: Marlin TP2 14.5-14.8K tok/s prefill and 10.4-10.7 ms TPOT (was 10.2-10.7K, 23-25 ms); MegaMoE DP2/EP2 18.1-18.6K tok/s (1.25x over Marlin) and 13.8-14.0 ms TPOT (was 11.8-13.3K, 48-50 ms; 1.31x behind Marlin: +2.6 ms per step is DP attention reading all dense weights per GPU, +2.3 ms is MegaMoE glue around GEMMs that tie Marlin). Util 0.93 works with 128 experts.
 - **Real weights (task 22, section 9.27):** the 157 GB V4 checkpoint cannot load in this TokenSpeed tree (upstream removed `DeepseekV4ForCausalLM` in `0c1bc3ed3`, #2310), so the MegaMoE end-to-end check ran on the real 476 GB V4.1 checkpoint with all 40 layers, real Engram, embeddings, norm and head, and its first 128 of 384 routed experts per layer (TokenSpeed `6d6702bae`, `num_checkpoint_experts`; a layer subset is impossible because the FlatKV packing is pinned to 40 layers). DP2/EP2 serving selects `deep_gemm_sm120_mxfp4_mega_moe_apply`. Against a float32 reference built from the same weights with the official `inference/model.py`, layers 0 and 2 have the same single-layer error on all three paths (2.76-2.81% and 3.70-3.90% relative L2: MegaMoE DP2/EP2, Marlin TP2, forced portable Triton TP2). The paths differ from each other by 0.7% at layer 0; the gap grows through 40 layers to about 50% (logits KL 0.56-0.64, top-1 62-69%), equally for every pair, so the 1/3-expert model amplifies rounding and the greedy texts cannot be compared. Speed at 2 x 2K tokens: Marlin TP2 10.2-10.5K tok/s prefill, 23.5 ms TPOT; MegaMoE DP2/EP2 3.8-3.95K tok/s, 34.2-34.5 ms; portable 3.5K tok/s, 31-33 ms (not profiled; the leaf benchmark of 9.26 ties or wins, so the gap is outside the MoE leaf). MegaMoE allocates its worst-case row scratch (about 2.6 GB at 8192 tokens per rank) on every call, outside the KV planner's budget, so `--gpu-memory-utilization 0.93` ran out of memory where 0.86 works. Real MLA: Moonlight-16B-A3B (32 GB, downloaded to scratch) answers correctly on SM120 after the transformers-5 RoPE fix `e4fc05813`. Its greedy decode matches the forced portable MLA decode for 17-48 tokens, splitting only at near-ties, and TPOT is 2.3-3.2x better at 3K context x 8. No DSA, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box.
-- **Open:** (1) The one FP4 tie with b12x, dense gate_up M=256 (0.98x; bound by L2 -> SM traffic, section 9.15; cluster tile sharing over DSMEM is slower, section 9.28). (2) Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs: EP4 MegaMoE or TP4, which an older tree served on GPUs 0-3 on 2026-10-28); the MegaMoE decode glue at small batch (2.3 ms per step at 2 requests, section 9.29; the scratch and the prefill gap are fixed). (3) The task 16-18 "still open" items (a multi-wave sparse MX indexer kernel, a dequantizing tile in the CuTe DSL V4 kernel, BF16 DSA/V4 above 42-48% of the tensor-pipe floor, V4 at 16 heads, one-request DSA decode; task 24 did not reach them). A wheel release is optional, since the source build replaces the pin. **Closed since this list was first written:** the UE8M0 FP8 regression of the FP4-only cost-model refit (fixed by the joint refit `eff4cea`, status log 2026-11-05: UE8M0 FP8 is at parity with the FP32-scale kernel again); NVFP4 (done, `eb61610`, 2026-11-05); the NVIDIA MXFP4 `mm` leaf (TokenSpeed `deepgemm_sm120_mxfp4_linear`, with the PDL quantizer and weight scales packed at load: 1.23x geomean, 60 of 63 wins against FlashInfer quantize + `mm_fp4`; design 7.8 and 8).
+- **Open:** (1) The one FP4 tie with b12x, dense gate_up M=256 (0.98x; bound by L2 -> SM traffic, section 9.15; cluster tile sharing over DSMEM is slower, section 9.28). (2) Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs: EP4 MegaMoE or TP4, which an older tree served on GPUs 0-3 on 2026-10-28); the MegaMoE decode glue at small batch (2.3 ms per step at 2 requests, section 9.29; the scratch and the prefill gap are fixed). (3) The task 16-18 "still open" items: a multi-wave sparse MX indexer kernel, a dequantizing tile in the CuTe DSL V4 kernel. Task 24 item E measured the attention ones and closed them (section 9.30): BF16 DSA/V4 stay at 42-48% of the tensor-pipe floor (per-tile chain and L2 gather, not the exchange), V4 at 16 heads stays on Triton, one-request DSA decode stays at 20 us BF16; the DSA launch planner was fixed (1.05x). MegaMoE decode glue: fusion is bounded at 0.36 ms per step. A wheel release is optional, since the source build replaces the pin. **Closed since this list was first written:** the UE8M0 FP8 regression of the FP4-only cost-model refit (fixed by the joint refit `eff4cea`, status log 2026-11-05: UE8M0 FP8 is at parity with the FP32-scale kernel again); NVFP4 (done, `eb61610`, 2026-11-05); the NVIDIA MXFP4 `mm` leaf (TokenSpeed `deepgemm_sm120_mxfp4_linear`, with the PDL quantizer and weight scales packed at load: 1.23x geomean, 60 of 63 wins against FlashInfer quantize + `mm_fp4`; design 7.8 and 8).
 
 ## 0. Environments
 
@@ -629,6 +629,7 @@ host still rejects them, so there is no silent wrong path):
 | 2026-11-09 | Real-weight checks (task 22) | **done (V4.1 real weights with 128 of 384 experts, Moonlight MLA); V4 and full models open** | V4 checkpoint not loadable (TokenSpeed has no `DeepseekV4ForCausalLM` since `0c1bc3ed3`). Real V4.1, 40 layers, first 128 experts (`num_checkpoint_experts`, TokenSpeed `6d6702bae`): DP2/EP2 picks `deep_gemm_sm120_mxfp4_mega_moe_apply`; the float32 reference gives the same single-layer error on every path (layer 0: 2.8%, layer 2: 3.7-3.9%); the paths differ by 0.7% at layer 0, amplified to about 50% by layer 39. Marlin TP2 is faster than MegaMoE DP2/EP2 end to end (prefill 10.3K vs 3.9K tok/s, TPOT 23.5 vs 34.4 ms; not profiled). MegaMoE scratch is outside the KV planner (OOM at util 0.93). Moonlight-16B MLA correct, TPOT 2.3-3.2x at 3K x 8; RoPE fix `e4fc05813`. Section 9.27. |
 | 2026-11-10 | Cluster tile sharing for the dense gate_up M=256 FP4 tie (task 23) | **closed, not won; nothing shipped** | Tie reproduced (GPU 7 idle, 3 runs: DeepGEMM 19.2 us, b12x 19.5-19.6 us, 1.02x). Built B-slice sharing across 2- and 4-CTA clusters in `sm120_fp8_fp4_gemm_1d1d` (`kClusterSize` template parameter, bitwise equal output, no spills) in two forms, push (bulk copy) and pull (`ld.shared::cluster`): 63.7 / 146 us (push, cluster 2 / 4) and 45.5 / 92 us (pull) against 20.0 us unshared. A DSMEM probe (`scripts/sm120_cluster_probe.cu`) shows why: pushes cap at 5 GB/s per CTA (bulk copy, `st.async` and plain stores alike), pulls at about 33 GB/s per CTA, a remote load takes 95 ns and a remote mbarrier round trip 440 ns, and the 3-stage pipeline cannot cover those hops. With the sharing hops removed (wrong data, cluster launch only) the kernel reaches 17.5-17.6 us, so the best case was 1.13x. Raster order does not apply (one wave). The kernel is unchanged; the variant is kept as `scripts/sm120_cluster_tile_sharing.patch`. Section 9.28. |
 | 2026-11-10 | V4.1 serving gap, MegaMoE scratch, DP error masking, CuTe V4 prefill selection (task 24) | **done for A-D (A: prefill won, TPOT structural + open MoE glue); E not attempted** | Profiled real V4.1 (40 layers, 128 experts, GPUs 6+7, torch profiler, graph-aware). Both paths spent most decode time in the dense 1x32 UE8M0 FP8 projections on the Triton block-FP8 kernel (Marlin TP2 21.5 ms of a 23.6 ms step; MegaMoE DP2 50.2 ms of kernel time, summed over two streams, in a 49.4 ms step). New TokenSpeed leaf `deepgemm_sm120_mm_mxfp8` on the block-scaled 1D1D kernel, weight scales packed once, activation quantized straight into the packed layout, batch invariant through deterministic mode (`26444a3`: no stream-K, no BLOCK_N=32 K-warp split): 2.2-11.7x over the Triton leaf on the six V4.1 projections. MegaMoE row scratch is one persistent per-device buffer grown by the warmup before the KV planner measures (`fefd9de`). End to end (2 x 2004 tokens, prefill graphs off): Marlin TP2 10.2-10.7K -> 14.5-14.8K tok/s, TPOT 23.0-25.1 -> 10.4-10.7 ms; MegaMoE DP2/EP2 11.8-13.3K -> 18.1-18.6K tok/s (1.25x over Marlin), TPOT 48.4-50.3 -> 13.8-14.0 ms (1.31x behind). TPOT gap per step: dense +2.6 ms (DP reads every dense weight on each GPU, structural), MoE glue +2.2 ms (two barriers, push, dispatch, gather, SwiGLU, return, combine; the two grouped GEMMs tie Marlin at 3.1 ms). Util 0.93 with 128 experts runs; 192 experts now fail at startup with the KV-planner message instead of an OOM mid-prefill. Section 9.29. |
+| 2026-11-10 | Attention headroom and MegaMoE glue (task 24, item E) | **done: planner shipped, the rest measured and closed** | TokenSpeed `3de153200`: `cute_dsl_dsa_mma_*` `plan_launch` models the launch in SM waves (a CTA fills an SM, one CTA more than SMs costs a second wave), picks 1/2/4/8 CTAs per token with the fewest `waves x chunks per CTA`: 1.05x (BF16) / 1.04x (E4M3) geomean over 140 decode shapes of 1-192 tokens, up to 1.63x, worst 0.97x (noise), bitwise equal rows, 1.02x at 128-2048 tokens. Ablations show the BF16 core is not exchange-bound (removing the whole partial-score exchange: 1.19x). Lost or not selectable: bulk `cp.async.bulk` gathers (0.9x), 1-stage ring x 2 CTAs/SM (0.55-0.82x), 16 DSA chunks (1.3-1.46x at 1-8 tokens, 0.8-0.9x at 4-64), 8-warp V4 CTA at 16 heads (0.76-1.10x of Triton), a wave planner for V4 (0.97x). MegaMoE glue measured at 25 us per layer on the critical path, fusion bound 9 us (0.36 ms, 2.6% of TPOT), not built. Section 9.30. |
 
 ## 9.5 Sparse MQA logits SM120 port plan (in progress, 2026-11-05)
 
@@ -2054,7 +2055,7 @@ with zero glue, TPOT would be about 11.8 ms, still behind TP2, so the target "Me
 met at 2 requests on 2 GPUs with attention DP. It flips with batch: the MoE GEMMs win from 2048 tokens per rank (9.26), and
 attention DP halves per-GPU attention work at large decode batches.
 
-**Item E (attention headroom) not attempted** in this task: the context went to A-D. Still open as listed in 9.22/9.23: BF16
+**Item E (attention headroom) was not reached in A-D; it is section 9.30.** Still open as listed in 9.22/9.23: BF16
 DSA/V4 CuTe cores at 42-48% of the floor (register-resident query with a key split, or a smaller ring), V4 at 16 heads (8-warp CTA
 or 2 tokens per CTA), decode of one DSA request bound by its 8 chunks. Task 23's DSMEM numbers (5 GB/s push, 33 GB/s pull per CTA)
 rule out 2-CTA sharing of gathered rows for attention as well: a 64-row BF16 tile is 64 KB, which would take about 2 us to pull.
@@ -2068,3 +2069,79 @@ passed; the full TokenSpeed kernel suite (selection files, `nvidia`, `ops`) 7904
 gaps (0.1-0.2 ms per step) or DP-path CUDA graphs (decode graphs are captured on both paths); stream-K for the deterministic
 MXFP8 leaf (it changes bits with the batch). **Still open:** MegaMoE glue at decode (2.3 ms per step at 2 requests), DP
 attention's structural dense-weight cost at small batch (+2.6 ms per step), item E.
+
+## 9.30 Task 24 item E: attention headroom and MegaMoE glue (2026-11-10)
+TokenSpeed `nctu6` from `9a20d3f57`, DeepGEMM `348c0d6` (`build312`, unchanged). RTX PRO 6000, benchmarks and kernel tests on GPU 7,
+runtime tests on GPU 6, CUDA-graph microseconds (best of 5). Scratch scripts were in `tokenspeed/tmp/e/` (deleted). One TokenSpeed
+commit, `3de153200` (launch planner). `ncu` is still blocked: the evidence is ablation, as in 9.22.
+**E1: what bounds the BF16 DSA/V4 CuTe core.** Task 17 blamed the channel-split partial-score exchange (store, barrier, 4-way sum) for
+the 42-48% of the floor. Ablating pieces of `_SparseMma` (wrong results, timing only), 128 heads, 2048-token prefill, BF16, 6.12 ms:
+| removed | time | note |
+|---|---|---|
+| the whole exchange (store, barrier, sum) | 5.11 ms | the ceiling of any better score layout is 1.19x |
+| score MMAs + their `ldmatrix` | 4.86 | |
+| PV MMAs | 5.28 | |
+| every MMA | 4.88 | the kernel is not tensor-bound |
+| the gathers (zero-fill, no L2 read) | 6.02 | no change: the gather is hidden |
+| gathers + exchange + every MMA | 2.58 | what is left: softmax, barriers, fold, per-CTA prologue |
+The same on decode 128 tokens and 64 heads give the same shape. With every MMA, exchange and MMA ablated the gather alone sets 4.81 ms
+(`cp.async`, 19.3 GB of rows read through L2 at 4.0 TB/s; the real kernel is at 3.15 TB/s). So the BF16 core is limited by two things
+that do not overlap well in a 99 KiB CTA with two warps per scheduler: the per-tile chain (wait, scores, exchange barrier, softmax,
+PV) and the L2 -> SM gather. A key split for BF16 (query in registers per warp, no exchange) can win at most the 17% of the exchange
+and needs the query (36 KiB for 32 heads) next to two 37 KiB stages: it does not fit. Deeper rings do not fit either (a third stage is
+37 KiB more).
+Tried and lost:
+- Bulk gathers: one `cp.async.bulk` (+ mbarrier) per 1152-byte row issued by the row's owner thread, absent rows zero-filled by the owner
+  (V of a skipped row has to be finite). Alone it gathers 1.27x faster (3.77 vs 4.81 ms with the MMAs ablated), but the real kernel is
+  1.12x slower (6.85 vs 6.13 ms; 8-warp 16-head V4 0.70-0.94x of Triton against 0.76-1.10x with `cp.async`), with or without
+  `fence.proxy.async`.
+- One-stage ring with two 8-warp CTAs per SM (16 heads, `min_blocks_per_mp=2`): 0.55-0.82x of the Triton leaf.
+**E2: V4 at 16 heads.** The core gained a `cwarps` parameter (4 or 8 warps per head group; 8 warps halve the accumulator to 32 registers
+and put two warps on each scheduler). 8 warps are bitwise-consistent with themselves and correct (max error 2e-3 against the Triton
+leaf, as the 4-warp CTA), but their 8-way score sum is not the 4-warp sum, so they could only serve 16-head models. Against
+`triton_dsv4_mma_prefill` (16 heads, sink, 640 rows; 4-warp / 8-warp CTA): 1 token 1.00x / 1.08x, 4 tokens 0.97 / 1.09, 16 tokens
+1.03 / 1.10, 64 tokens 0.83 / 0.93, 128 tokens 0.77 / 0.92, 512 tokens 0.90 / 1.02, 2048 tokens 0.77 / 0.86, window-only 2048 tokens
+0.64 / 0.76. The 8-warp CTA is a clear step up from the 4-warp one and still loses where the time is (large batches), and the leaf can
+only follow the head count, so 16 heads stay on Triton. Two tokens per CTA was not built: the ring would need two gathered tiles.
+**E3: one-request DSA decode (20.3 us BF16, 13.1 E4M3, 8 chunks).** The attention kernel is 19.2 us and the combine 2.0 us (profiler);
+with every MMA, exchange and gather ablated 10.6 us remain, so per-CTA latency (Q loads, 8 tile chains, epilogue) is the floor of a
+chunk. Fusing the combine into the last CTA would save at most the 2 us. The lever is the chunk count, which batch invariance ties to
+the width: 16 chunks (a CuTe-only constant, the Triton core keeps 8) with the same planner give one-request decode 1.30-1.46x faster
+(BF16 20.3 -> 14.2 us at 16-32 heads, 20.8 -> 16.3 at 128; E4M3 13.1 -> 9.8 / 13.3 -> 10.7) and 1.2-1.4x at 2-8 tokens, 0.99x
+unsplit (128-2048 tokens, the extra fold), but 0.8-0.9x at 4-64 tokens (every chunk state is stored: 16 states of 128 heads x 512 x 4 B
+per token) and a split cannot pre-fold a chunk run in a register tree without changing the fold order. Because the count cannot follow
+the batch, 16 chunks are not selected.
+**E3 spin-off: the launch planner (shipped, TokenSpeed `3de153200`).** The sweep over (block_h, splits, chunks) showed the old rule
+(target CTA counts of 2/3 and 2.75 SMs) often left a wave nearly empty: a CTA fills an SM, so 24-48 32-head programs with 8 splits are
+192-384 CTAs, a second wave costs a whole chunk run. Measured, BF16 32-head programs x splits (time us): 32 programs 140 / 82 / 47 / 52
+(1 / 2 / 4 / 8 splits, 32 / 64 / 128 / 256 CTAs), 24 programs 140 / 81 / 45 / 49, 20 programs 140 / 81 / 44 / 28.5, 48 programs 141 / 84
+/ 90 / 75.6, 96 programs 143 / 169 / 138 / 125. The new `plan_launch` (`dsa/_cute_dsl/sparse_mma.py`) picks 1, 2, 4 or 8 CTAs per
+token with the fewest `waves x chunks per CTA`, ties to fewer splits, accepts a split only against a 1.25x margin (16-head CTAs) or
+1.5x (32-head CTAs) over unsplit (stored states are not in the model; 16-head BF16 at 512 tokens with 4 splits is 0.76x), and starts
+32-head CTAs when they alone fill the SMs (the Triton rule's two-thirds point loses 1.07-1.14x at h32 t8, h64 t4, h128 t2). Over 140
+decode shapes (1-192 tokens at 16/24/32/40/64/96/128 heads, both dtypes): geomean 1.05x BF16 / 1.04x E4M3, worst 0.97x (a different
+split count with the same launch, noise), up to 1.63x (96-128 heads at 5-7 tokens, where 5-7 splits ran 2 chunks per CTA, and
+1.2-1.4x at 96-192 CTAs, which the old rule left unsplit); 44 points of 128-2048 tokens: 1.02x, worst 0.96x / 0.99x. Rows are bitwise
+equal across the old and new plans (0 differences in 368 points). The same wave model applied to the V4 core (4 chunks, 3 head counts x
+14 token counts x 2 head tiles x 1/2/4 splits, widths 640 and 128) loses (0.99x at width 640, 0.85-0.98x at 128 depending on the margin):
+the old V4 rule is within 1.01% of the best (tile, split) per point, so V4 is unchanged.
+Tests (`test_dsa_mma_sm120.py`): the plan at the boundary cases, a sweep of 1-699 tokens x 5 head counts (the plan has no more chunk
+times than unsplit), plus the existing split-count/head-tile bitwise tests and the recompile guards. Kernel set (DSA/V4/MLA files, kernel
+selection, V4.1 registration): 578 passed, 275 skipped; `test_dsa_mma_sm120.py` + `test_dsv4_mma_sm120.py` + SM120 leaf list 193
+passed; runtime DSA/V4/V4.1/dots3/GLM files (GPU 6): 1049 passed, 94 skipped.
+**E4: MegaMoE decode glue.** A graph-replayed call at 2 tokens per rank (V4.1 shapes, 5120 / 2304 / 384 experts, EP 2, GPUs 6+7, cold
+weights, PDL on) takes 195 us; the profiler timeline: input staging 2.2, push 2.1, barrier 3.0, dispatch 2.3, gather 4.0 (13.2 us before
+the first GEMM), GEMM 1 108.6, SwiGLU (starts under GEMM 1's PDL tail, about 2 us of its own), GEMM 2 56.4, return 16.4 (4 after GEMM 2),
+barrier 3.0, combine 3.1 (10.4 us after GEMM 2). The glue on the critical path is about 25 us per layer (13%); in the serving trace the
+barriers cost 10-13 us each (0.8-1.05 ms per step), the difference being the skew between the two ranks, which a fusion does not remove.
+Fusing push + barrier + dispatch + gather (one kernel after the stage) and return + barrier + combine would remove the launch gaps and the
+repeated PDL waits: about 5 + 4 us per layer, 0.36 ms per step, 2.6% of the 13.9 ms TPOT (and SwiGLU in the L1 epilogue less than
+2 us). That needs cross-CTA counters and a second barrier protocol per kernel with hang risks, for a gain below the TPOT run-to-run
+noise (13.8-14.0 ms), so it was measured and not built; the batch-invariance and graph-safety constraints are unchanged. The microbench
+(`scripts/sm120_mega_moe_ep_vs_marlin.py`, PDL on): mega 125 / 195 / 354 / 1067 us at 1 / 2 / 4 / 16 tokens per rank, Marlin all-gather +
+reduce-scatter 0.99-1.04x of it. No serving rerun: nothing changed.
+**Closed (don't retry without new evidence):** exchange-free BF16 scores as the fix for the 48% (ceiling 1.19x, no smem for it); bulk
+gathers; 1-stage ring x 2 CTAs; 16 DSA chunks; 8-warp V4 at 16 heads; a wave planner for V4; fusing the MegaMoE glue for TPOT (bound
+0.36 ms). **Open:** a CuTe-only chunk count that follows the width, if the store of chunk states could be made cheaper (bf16 states
+change the fold bits); a persistent or stream-K DSA kernel that keeps a CTA's tile chain busy across tokens (the per-CTA prologue and the
+2-warps-per-scheduler chain are the floor).
