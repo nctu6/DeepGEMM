@@ -66,6 +66,8 @@ End to end (in-process `Engine`):
 - Qwen3.8-27B-FP8 (the block-FP8 path of DeepSeek-V3): TPOT 1.18-1.55x better (design 7.4).
 - 4-layer V3.2, real dimensions, random weights, against forced `triton_dsa_*`: prefill 82-95x, TPOT 2.0-14.4x (analysis 9.18).
 - V4.1 topology with dummy weights on the native indexer: prefill 1.11-1.19x, TPOT 1.02-1.06x, same greedy tokens (analysis 9.21).
+- Real V4.1 checkpoint (all 40 layers, Engram, head; first 128 of 384 experts), task 22: every path has the same single-layer error against a float32 reference built from the same weights (2.8% layer 0, 3.7-3.9% layer 2). MegaMoE DP2/EP2 is slower end to end than Marlin TP2 (prefill 3.9K vs 10.3K tok/s, TPOT 34.4 vs 23.5 ms), not yet profiled (analysis 9.27).
+- Real MLA checkpoint (Moonlight-16B-A3B, one GPU): correct answers; TPOT 2.3-3.2x better than the portable MLA decode at 3K context x 8, a tie at short context (analysis 9.27).
 
 ## 4. What is not supported, and why
 
@@ -91,6 +93,7 @@ Latest run 2026-11-09 (task 20), DeepGEMM `fefe6a1` and TokenSpeed `c6cbc9b4b`.
 - The DeepGEMM source at the pinned commit builds like `install.sh` (`pip wheel`, nothing installed) and `test_deepgemm_sm120_gating.py` passes against it (11 passed).
 - compute-sanitizer (memcheck, synccheck): 0 errors on 22 test functions and a 16-case k-grouped FP8 run (task 15; not rerun in task 20).
 - End to end, greedy, in-process, all correct ("Paris", "2, 3, 5, 7, 11"): Qwen3.6-35B-A3B, Qwen3.5-122B-A10B-NVFP4 (TP2), Qwen3.8-27B-NVFP4, gemma-4-31B-it.
+- Real weights (task 22, analysis 9.27): V4.1 checkpoint on GPUs 6+7 with its first 128 experts. MegaMoE DP2/EP2 (`deep_gemm_sm120_mxfp4_mega_moe_apply` selected), Marlin TP2 and forced portable TP2 all have the same single-layer error against a float32 reference (layers 0 and 2). Moonlight-16B MLA answers correctly; its greedy decode matches the portable path up to near-ties, and two SM120 runs are bit-identical. New TokenSpeed tests: the V4.1 expert-subset loader and DeepSeek-V3 plain-RoPE configs (`e4fc05813`, `6d6702bae`). The V4 checkpoint does not load (TokenSpeed has no V4 model class since upstream `0c1bc3ed3`).
 - Environment-only failures: `test_locality_domain` (MLOPart), `test_mega_moe` (NVLink), the sanitizer's `test_legacy` entry (no triton in the venv).
 
 Test machine: aws-raichu, 8x RTX PRO 6000 Blackwell Server Edition (96 GB, 188 SMs), CUDA 13.2, driver 595.99.02, PCIe only. Tests and benchmarks ran on GPUs 6 and 7.
@@ -119,10 +122,10 @@ the installed build reports SM120 kernels (`deep_gemm.get_supported_arch_majors(
 ## 7. Open items
 
 - One FP4 tie with FlashInfer b12x: dense gate_up M=256 (0.98x), bound by L2 -> SM traffic (analysis 9.15).
-- Mega MoE (analysis 9.26): the 1-token gap (0.82x at one rank, 0.95x at EP 2; fewer launches or a fused push + dispatch), the V4 EP 2 end-to-end run (blocked during task 21 by another user's job on GPUs 6/7), more than 2 ranks, fused shared experts, mega gate and mega mHC (no TokenSpeed caller). Done: EP 2 over CUDA IPC; the Triton MXFP4 MoE illegal memory access at V4.1 shapes (32-bit expert offsets, TokenSpeed `8afd973bc`).
+- Mega MoE (analysis 9.26): the 1-token gap (0.82x at one rank, 0.95x at EP 2; fewer launches or a fused push + dispatch), the per-call row scratch (about 2.6 GB at 8192 tokens per rank) that the KV planner does not count (OOM at util 0.93), the DP2/EP2 serving gap against Marlin TP2 on real V4.1 weights (analysis 9.27), more than 2 ranks, fused shared experts, mega gate and mega mHC (no TokenSpeed caller). Done: EP 2 over CUDA IPC; the Triton MXFP4 MoE illegal memory access at V4.1 shapes (32-bit expert offsets, TokenSpeed `8afd973bc`).
 - V4.1 indexer: a multi-wave sparse MX kernel (the sparse kernel is one wave, about 85 us at any size); MXFP4 paged at 1.07 vs 1.23 TB/s for FP8; FP8 `index_v4` rows have no pool-only scorer (the runtime does not store them on SM120).
 - Attention: BF16 DSA / V4 above 42-48% of the tensor-pipe floor; V4 at 16 heads; decode of one DSA request (20 us BF16); a dequantizing tile in the CuTe DSL V4 kernel; host paths of `fp8_mqa_logits` (26 us) and DeepSelect (34 us) in a 128-token DSA chunk.
-- No real-checkpoint run: DeepSeek-V3/V3.2 TP8 needs 8 GPUs, V4.1 ran with dummy weights.
+- Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs). Done in task 22: real V4.1 with 128 experts on two GPUs, and real MLA on Moonlight-16B. V4 cannot load (no TokenSpeed model class). No V3.2, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box (analysis 9.27).
 - Three heavy tests (FP8 k-grouped, FP8 masked, `test_mqa_logits`) do not finish under compute-sanitizer in 15-40 min; no error before the limit.
 - `test_deepseek_v41_model[eager]` failed once in three full runs during task 14 and never reproduced (150+ runs, no known cause).
 - Nothing is pushed. TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107, so upstreaming needs that scope to change.
