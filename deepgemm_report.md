@@ -871,8 +871,11 @@ One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Trito
 | MN-major FP8 operands | DeepGEMM `fp8_fp4_gemm_nn/tn/tt` | explicit byte transpose + K-major kernel; Triton on the strided operand | 1.63x vs transpose (B operand, M <= 64) | 0.97-1.96x vs transpose; 1.65-4.6x vs Triton | 0.97x (low end of the B-operand range) | 7.7 |
 | k-grouped FP8 | DeepGEMM `k_grouped_fp8_gemm_tn/nt_contiguous` | per-group transpose + K-major kernel; torch BF16 loop | not recorded | 1.11-2.06x vs transpose; 0.76-1.00x vs the torch loop | 0.76x, small-K groups (4096x7168), where the torch loop wins | 7.7 |
 | `fp8_einsum` (3 expressions) | DeepGEMM batched launch | best of cuBLASLt BF16, per-head torch loop, `torch.einsum` | 1.52x (time ratio 0.66; 26 shapes) | worst 0.99x | 0.99x (time ratio 1.007), `bhd,bhr->hdr` h=8, b=128, a tie at the FP32 D-traffic bound | 7.7 |
+| BF16 `einsum` (`bhr,hdr->bhd`, `bhd,hdr->bhr`, deterministic mode) | DeepGEMM batched BF16 launch (task 18), bit-identical to a launch per head | per-head BF16 GEMM calls (the earlier route); cuBLASLt | 4.9x vs per-head (time ratio 0.21; 56 points: 4 head shapes x b = 1-8192 x 2 expressions); 1.06x vs cuBLASLt (time ratio 0.94) | 1.0-38x vs per-head (up to 38x at 128 heads, b <= 32); 0.81-1.38x vs cuBLASLt, 52 of 56 points within 3% or faster | 0.81x vs cuBLASLt, 16 heads, b = 1 (2.3 vs 1.9 us, launch-bound); h=128, b=8192 0.93x | analysis 9.24 |
 | MQA logits indexer (`fp8_mqa_logits`, paged) | DeepGEMM logits + `dsa_decode_topk` / `dsa_prefill_topk` | Triton DSA indexer leaves | not recorded | decode 3.4-19.3x, prefill 7.8-52x | 3.4x decode, 1 x 4K | 7.3 |
 | DeepSelect top-k (V3.2 prefill) | in-tree CuTe DSL, 93 KB on SM120 | Triton radix top-k | not recorded | 1.3-1.9x on the leaf; decode up to 2.7x on the top-k from 96 rows of 32K+ | selected only where it wins; at 16K or fewer than 48 rows it loses 1.4-2x and is not selected | analysis 9.16 |
+| V3.2 DSA prefill leaf, tiny and small chunks | `deep_gemm_dsa_prefill_topk` after task 18 (one preparation launch, DeepSelect with `index_base`; 118-124 us of host time per call instead of 360) | `triton_dsa_prefill_topk_fp8` | 1-512 tokens: 1.35-6.0x; 1024 tokens 21x; with prefixes 5.8-98x (12 shapes, back-to-back eager calls) | 1.35-98x | 1.35x, 128 tokens, no prefix (124 vs 168 us; it was 0.52x before, 277 vs 144 us) | analysis 9.24 |
+| Sharded `dsa_index_candidates` (DCP rank) | `deep_gemm_dsa_index_candidates` with DeepSelect over each row's owned length | the `torch.topk` leaf it replaced; `triton_dsa_index_candidates` | 1.95x vs `torch.topk` (54 points: 1-2048 rows x 16K-128K contexts x 2/4/8 ranks); 18x vs Triton | 1.25-4.7x vs `torch.topk`; 3-64x vs Triton | 1.25x, 8 rows, 128K context (2048 pages), 2 ranks | analysis 9.24 |
 | Paged MQA logits, MXFP4 rows | DeepGEMM `sm120_fp8_paged_mqa_logits` (block-scaled) | the same kernel on FP8 rows (no Triton/FlashInfer paged FP4 MQA exists) | not recorded | 1.02-1.74x (16 V4.1 decode shapes, 6 of 9.13) | 1.02x, 1 request x 1K rows (launch-bound) | analysis 9.21 |
 | V4.1 indexer, packed 68-byte rows (what SM120 serves) | `deep_gemm_sm120_dsv41_index_topk` | `triton_dsv41_index_topk` | not recorded | decode: Full 5.6-16x, source 7.7-33x, Reindex 2.2-22x; prefill: 11-46x, 22-88x, 6.8-22x | 2.2x, Reindex of 1-8 requests | analysis 9.21 |
 | V4.1 indexer, FP8 `index_v4` rows | `deep_gemm_sm120_dsv41_index_topk` | Triton leaves | not recorded | decode 2.3-7.2x, chunked prefill 1.4-5.1x | Reindex over long histories (0.54-0.99x, kept on Triton); the runtime does not store these rows on SM120 | analysis 9.16 |
@@ -882,6 +885,8 @@ One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Trito
 | MLA decode (Triton kernel) | TokenSpeed `triton_mla_mma_decode_with_kvcache` (still serves FP16 caches) | portable `triton_mla_decode_with_kvcache` (FlashInfer / `tokenspeed_mla` cannot run on SM120) | not recorded | 14-131x | 14x | analysis 9.19 |
 | V4 / V4.1 selected attention (prefill) | TokenSpeed `cute_dsl_dsv4_mma_prefill` (CuTe DSL, task 17; more than 16 heads) | `triton_dsv4_mma_prefill`, the best Triton kernel | 1.13x (117 points: 32/64/128 heads, 1-4096 tokens, 128/640/1152 rows) | 0.89-1.63x | 0.89x, window-only (128 rows) at 1-2 tokens, 7.2 vs 6.4 us (kept: a token-count rule would break batch invariance) | analysis 9.23 |
 | V4 / V4.1 selected attention (Triton kernel) | TokenSpeed `triton_dsv4_mma_prefill` (still serves 16 heads or fewer) | `triton_dsv4_prefill` (FlashMLA cannot run on SM120) | not recorded | 4-9x (and 1.24-1.31x more from 128 tokens since task 17) | 4x | analysis 9.19, 9.22 |
+| V4.1 selected attention, decode (swa FP8 + global FP4 rows) | TokenSpeed `triton_dsv41_mma_selected_attention` (task 18): the Triton dense kernel with the packed rows dequantized in its tile loop, bit-identical | the portable gather into a BF16 workspace + the same dense kernel | 1.66x (21 points: 16/64/128 heads x 1-256 tokens, 128 window + 512 compressed rows) | 1.01-3.67x | 1.01x, 128 heads, 128 tokens | analysis 9.24 |
+| V4 `dsv4_decode` (FP8 page-planar caches) | TokenSpeed `triton_dsv4_mma_decode`, registered for 16 heads from 32 tokens only | workspace route (`triton_dsv4_decode`, CuTe dense kernel above 16 heads) | 16 heads, 32-256 tokens: 1.08-2.28x | 1.08-2.28x there; 0.69-1.11x at 64 heads and 0.72-0.79x at 128 heads (not selected) | 0.69x, 64 heads, 4 tokens (not selected) | analysis 9.24 |
 | Hadamard 128 | TokenSpeed `triton_hadamard_transform_128_mma` | portable `triton_hadamard_transform_128` | not recorded | 0.9x at 1 token; 20-117x from 64 tokens | 0.9x at 1 token (2.1 vs 1.9 us, launch-bound); 2.7x at 8 tokens; 55x at 16K and 64K tokens (at the copy roofline) | analysis 9.19 |
 | mHC | DeepGEMM `tf32_hc_prenorm_gemm` leaves | Triton | not recorded | `mhc_pre` 1.5-13.6x, `mhc_mixes` 1.6-15x | 1.5x `mhc_pre` | 8 |
 
@@ -1267,9 +1272,9 @@ Other notes:
    rewrites). Closed since the last report: MN-major FP8 operands, k-grouped
    FP8, the MN-major `fp8_einsum` expressions (all heads in one launch), paged
    MQA head dim 32/64, and the 16x32 stream-K register spill (section 3.4).
-   The native BF16 einsum (deterministic mode only) still launches a GEMM per
-   head; the batched kernel path would serve it, but the default BF16 einsum
-   is cuBLASLt, so it was left alone.
+   The native BF16 einsum (deterministic mode only) now runs all heads in one
+   batched launch too (task 18, section 7.8); `bmk,bnk->mn` stays a loop over
+   its slices, which all accumulate into one FP32 D.
 5. **SM120 attention in CuTe DSL: done (task 17).** DSA cores 1.91x (E4M3)
    and 1.16x (BF16) over the Triton core, 63% / 48% of the tensor-pipe floor;
    V4 prefill 1.13x from 17 heads; MLA decode 1.46x (1.84x on 4/8-row
@@ -1286,8 +1291,17 @@ Other notes:
 7. **SM120 replacements for the capped SM100-only leaves** (task 14). Done:
    Hadamard, MLA decode, V4 selected attention, zero-RoPE DSA (section 8).
    CuTe DSL versions of all three attention kernels are done (item 5). Open:
-   a V4 decode kernel that reads the FP8 page-planar rows directly instead of a BF16
-   workspace.
+   the CuTe DSL V4 kernel with a dequantizing tile. The V4/V4.1 decode kernels
+   that read the packed rows directly instead of a BF16 workspace are done
+   (task 18): V4.1 decode 1.66x geomean, `dsv4_decode` only for 16 heads from
+   32 tokens, since above that the CuTe workspace route wins.
+8. **Task 18 follow-ups (done).** The V3.2 DSA prefill leaf is no longer
+   host-bound (118-124 us per call, ahead of the Triton leaf at every chunk
+   size, 1.35x at 128 tokens); the sharded index-candidate top-k uses DeepSelect
+   (1.25-4.7x); the BF16 einsum heads are one launch; the whisper graph-capture
+   flake was the cyclic GC freeing a dead CUDA graph inside a capture
+   (`gc_paused_for_capture`). Open: the host paths of `fp8_mqa_logits` (26 us)
+   and DeepSelect (34 us) are what is left of a 128-token DSA chunk.
 
 ## 11. Reproducing
 
