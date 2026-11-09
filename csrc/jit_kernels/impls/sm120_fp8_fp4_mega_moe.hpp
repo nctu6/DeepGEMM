@@ -1,6 +1,9 @@
 #pragma once
 #include <format>
 #include <functional>
+#include <map>
+#include <mutex>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <torch/python.h>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include "../../runtime/runtime.hpp"
@@ -205,6 +208,75 @@ static void sm120_mega_moe_grouped_gemm(const torch::Tensor& a, const torch::Ten
                                    psum_layout.data_ptr(), 1, num_experts, 1, num_experts, 32, 32, 1.0f, choice);
 }
 
+// Intermediate rows of `sm120_fp8_fp4_mega_moe`. A call used to allocate them with `torch::empty`, about 2.6 GB at the
+// worst routing of V4.1 (8192 tokens per rank, 2 ranks), so they came from the framework's caching allocator after the
+// KV planner had measured free memory. They live in one byte buffer per device instead: the first call (the serving
+// warmup, which runs the largest batch before the planner sizes the KV cache) allocates it, later calls reuse it, and a
+// larger call grows it. Calls on one device are ordered on one stream (the barrier epoch needs that anyway), so the
+// rows of consecutive calls may share memory. A grown buffer keeps its predecessor alive for graphs captured earlier.
+// Growing while a graph is being captured would hand the graph's private
+// pool to a static owner, so that is an error
+struct SM120MegaMoEScratch {
+    torch::Tensor pair_rows, row_pair, total_rows, psum_layout, row_weights;
+    torch::Tensor l1_acts, l1_acts_sf, l1_out, l2_acts, l2_acts_sf, l2_out;
+
+    static SM120MegaMoEScratch get(const torch::Device& device, const int64_t& num_pair_slots, const int64_t& num_rows,
+                                   const int64_t& num_local_experts, const int64_t& sf_stride, const int64_t& hidden,
+                                   const int64_t& intermediate_hidden) {
+        static std::mutex mutex;
+        static std::map<int, torch::Tensor> buffers;
+        static std::vector<torch::Tensor> retired;
+        const auto carve = [&](const torch::Tensor& base, int64_t& offset, at::IntArrayRef sizes, const at::ScalarType& dtype) {
+            int64_t numel = 1;
+            for (const auto& size: sizes)
+                numel *= size;
+            const int64_t bytes = numel * static_cast<int64_t>(c10::elementSize(dtype));
+            const int64_t begin = offset;
+            offset += align<int64_t>(bytes, 256);
+            if (not base.defined())
+                return torch::Tensor();
+            return base.narrow(0, begin, bytes).view(dtype).view(sizes);
+        };
+        const auto carve_all = [&](const torch::Tensor& base, int64_t& offset) {
+            SM120MegaMoEScratch s;
+            const auto make_sf = [&](const int64_t& k) {
+                return carve(base, offset, {k / 128, sf_stride}, torch::kInt);
+            };
+            s.pair_rows = carve(base, offset, {num_pair_slots}, torch::kInt);
+            s.row_pair = carve(base, offset, {num_rows}, torch::kInt);
+            s.total_rows = carve(base, offset, {1}, torch::kInt);
+            s.psum_layout = carve(base, offset, {num_local_experts}, torch::kInt);
+            s.row_weights = carve(base, offset, {num_rows}, torch::kFloat);
+            s.l1_acts = carve(base, offset, {num_rows, hidden}, torch::kFloat8_e4m3fn);
+            s.l1_acts_sf = make_sf(hidden);
+            s.l1_out = carve(base, offset, {num_rows, intermediate_hidden * 2}, torch::kBFloat16);
+            s.l2_acts = carve(base, offset, {num_rows, intermediate_hidden}, torch::kFloat8_e4m3fn);
+            s.l2_acts_sf = make_sf(intermediate_hidden);
+            s.l2_out = carve(base, offset, {num_rows, hidden}, torch::kBFloat16);
+            if (base.defined()) {
+                s.l1_acts_sf = s.l1_acts_sf.t().slice(0, 0, num_rows);
+                s.l2_acts_sf = s.l2_acts_sf.t().slice(0, 0, num_rows);
+            }
+            return s;
+        };
+
+        int64_t needed = 0;
+        carve_all(torch::Tensor(), needed);
+        std::lock_guard<std::mutex> lock(mutex);
+        auto& base = buffers[device.index()];
+        if (not base.defined() or base.nbytes() < static_cast<size_t>(needed)) {
+            DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None and
+                           "MegaMoE scratch has to reach its largest size before a CUDA graph is captured (run the warmup)");
+            // A graph captured earlier may still point into the old buffer, so keep it alive
+            if (base.defined())
+                retired.push_back(base);
+            base = torch::empty({needed}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+        }
+        int64_t offset = 0;
+        return carve_all(base, offset);
+    }
+};
+
 // `num_experts` is the global count; this rank owns the experts `[rank_idx * E / R, (rank_idx + 1) * E / R)` and holds
 // their weights. `y` has this rank's tokens (a rank may have none; it still serves its peers)
 static void sm120_fp8_fp4_mega_moe(const torch::Tensor& y, const torch::Tensor& sym_buffer,
@@ -241,24 +313,24 @@ static void sm120_fp8_fp4_mega_moe(const torch::Tensor& y, const torch::Tensor& 
     // Scales are MN-major (`[K / 128][sf_stride]` int32), with 16-byte aligned columns for TMA
     const int sf_stride = align(num_rows, 4);
     const auto options = y.options();
-    const auto int_options = options.dtype(torch::kInt);
     const int pair_stride = (is_multi_rank ? num_max_tokens_per_rank : num_tokens) * num_topk;
-    const auto pair_rows_tensor = torch::empty({std::max<int64_t>(1, static_cast<int64_t>(num_ranks) * pair_stride)}, int_options);
+    // Row scratch is one persistent allocation per device, grown to the largest call and kept (see `SM120MegaMoEScratch`)
+    const auto scratch = SM120MegaMoEScratch::get(
+        y.device(), std::max<int64_t>(1, static_cast<int64_t>(num_ranks) * pair_stride), num_rows, num_local_experts, sf_stride,
+        hidden, intermediate_hidden);
+    const auto& pair_rows_tensor = scratch.pair_rows;
     void* pair_rows = pair_rows_tensor.data_ptr();
-    const auto row_pair = torch::empty({num_rows}, int_options);
-    const auto total_rows = torch::empty({1}, int_options);
-    const auto psum_layout = torch::empty({num_local_experts}, int_options);
-    const auto row_weights = torch::empty({num_rows}, options.dtype(torch::kFloat));
-    const auto make_sf = [&](const int& k) {
-        return torch::empty({k / 128, sf_stride}, int_options).t().slice(0, 0, num_rows);
-    };
-    const auto l1_acts = torch::empty({num_rows, hidden}, options.dtype(torch::kFloat8_e4m3fn));
-    const auto l1_acts_sf = make_sf(hidden);
-    const auto l1_out = torch::empty({num_rows, intermediate_hidden * 2}, options.dtype(torch::kBFloat16));
-    const auto l2_acts = torch::empty({num_rows, intermediate_hidden}, options.dtype(torch::kFloat8_e4m3fn));
-    const auto l2_acts_sf = make_sf(intermediate_hidden);
+    const auto& row_pair = scratch.row_pair;
+    const auto& total_rows = scratch.total_rows;
+    const auto& psum_layout = scratch.psum_layout;
+    const auto& row_weights = scratch.row_weights;
+    const auto& l1_acts = scratch.l1_acts;
+    const auto& l1_acts_sf = scratch.l1_acts_sf;
+    const auto& l1_out = scratch.l1_out;
+    const auto& l2_acts = scratch.l2_acts;
+    const auto& l2_acts_sf = scratch.l2_acts_sf;
     // With several ranks the return kernel sends these rows to the combine buffer of each pair's source rank
-    const auto l2_out = torch::empty({num_rows, hidden}, options.dtype(torch::kBFloat16));
+    const auto& l2_out = scratch.l2_out;
     const int num_tokens_per_expert = ceil_div(num_est_tokens * num_topk, num_experts);
 
     const layout::SymBuffer<> sym(sym_buffer_ptrs, rank_idx);

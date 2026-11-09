@@ -99,6 +99,13 @@ def test(args):
         # Bitwise deterministic
         for _ in range(3):
             assert torch.equal(run(), y)
+        # The intermediate rows are a persistent per-device workspace: once a call has made it, a repeated call takes
+        # nothing from the framework's allocator (it used to be about 2.6 GB per call at V4.1 sizes, outside the KV planner)
+        torch.cuda.empty_cache()
+        reserved = torch.cuda.memory_reserved()
+        run()
+        if num_tokens >= 64:
+            assert torch.cuda.memory_reserved() - reserved < (1 << 20), 'mega MoE scratch is allocated on every call'
         diff = 0.0
         if num_tokens <= args.max_reference_tokens:
             y_ref = reference(x_fp8, x_sf_float, topk_idx, topk_weights, l1, l2, args.activation_clamp)
