@@ -25,6 +25,7 @@ from ._C import (
     set_pdl,
     get_pdl,
     use_deterministic_algorithms,
+    get_deterministic_algorithms,
 )
 
 # cuBLASLt Kernels

@@ -508,6 +508,35 @@ def test_mn_major_fp8_sm120() -> None:
     print(' > Passed\n')
 
 
+@test_filter(lambda: get_arch_major() == 12)
+def test_deterministic_is_batch_invariant_sm120() -> None:
+    # Without deterministic algorithms the few-tile shapes split K across CTAs (stream-K), and the split follows the batch,
+    # so a row's bits depend on the other rows. With them each output is one CTA's in-order K loop
+    print('Testing batch invariance of the SM120 block-scaled GEMM (deterministic algorithms):')
+    assert deep_gemm.get_deterministic_algorithms() is False
+    n, k, gran_k = 1280, 5120, 32
+    x = torch.randn((1024, k), device='cuda', dtype=torch.bfloat16)
+    w = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    qa, sfa = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=gran_k)
+    qb, sfb = per_token_cast_to_fp8(w, use_ue8m0=True, gran_k=gran_k)
+    sfb = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sfb)
+
+    def run(m: int) -> torch.Tensor:
+        sfa_m = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sfa[:m])
+        d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+        deep_gemm.fp8_gemm_nt((qa[:m], sfa_m), (qb, sfb), d, recipe=(1, 1, gran_k))
+        return d
+
+    deep_gemm.use_deterministic_algorithms(True)
+    try:
+        expected = run(1024)
+        for m in (1, 2, 3, 4, 8, 17, 64, 130, 257):
+            assert torch.equal(run(m), expected[:m]), f'rows differ at {m=}'
+    finally:
+        deep_gemm.use_deterministic_algorithms(False)
+    print(' > Passed\n')
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -521,3 +550,4 @@ if __name__ == '__main__':
     test_k_grouped_gemm_contiguous()
     test_mixed_ue8m0_and_fp32_scale_pair()
     test_mn_major_fp8_sm120()
+    test_deterministic_is_batch_invariant_sm120()

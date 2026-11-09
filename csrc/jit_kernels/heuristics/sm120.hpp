@@ -130,6 +130,10 @@ struct SM120ArchSpec {
         for (const int block_n: {32, 64, 128, 256}) {
             if (block_n == 32 and not is_1d1d_kernel(desc.kernel_type))
                 continue;
+            // The K-warp split sums two partial accumulators, an order the wider tiles do not use: with deterministic
+            // (batch invariant) algorithms every output must be one in-order K loop whatever the tile
+            if (block_n == 32 and heuristics_runtime->get_deterministic_algorithms())
+                continue;
             if (is_mn_major_b and block_n % 64 != 0)
                 continue;
             if (block_n % heuristics_runtime->get_block_n_multiple_of() == 0)
@@ -290,7 +294,11 @@ struct SM120ArchSpec {
     //    shortens that loop. With more tiles each CTA pays two pipeline fills: e.g. 64x128 at M = 128, N = 4608 ran
     //    23.9 vs. 16.4 us. (Folding stream-K into the fitted cost model mispicked more, as few measured shapes split)
     // `DG_SM120_FORCE_STREAM_K`: 0 never, 1 whenever it is a clear win, 2 (tests) whenever there are spare CTAs
+    // Deterministic algorithms are batch invariant: a split changes the order a partial sum is added in, and the split
+    // follows the number of tiles, i.e. the batch. Without it each output element is one CTA's in-order K loop
     static StreamKConfig get_stream_k_config(const GemmDesc& desc, const Layout& layout) {
+        if (heuristics_runtime->get_deterministic_algorithms())
+            return {};
         const auto split = get_stream_k_split(desc, layout);
         if (split.num_ctas == 0)
             return {};

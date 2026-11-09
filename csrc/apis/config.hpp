@@ -33,6 +33,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("use_deterministic_algorithms", [&](const bool enabled) {
         heuristics_runtime->use_deterministic_algorithms(enabled);
     });
+    m.def("get_deterministic_algorithms", [&]() {
+        return heuristics_runtime->get_deterministic_algorithms();
+    });
     m.def("set_ignore_compile_dims", [&](const bool& new_value) {
         heuristics_runtime->set_ignore_compile_dims(new_value);
     });
