@@ -40,12 +40,12 @@ table is design 7.8).
 |---|---|---|---|---|
 | FP8 dense GEMM | DeepGEMM 1D2D | best Triton / FlashInfer block-FP8 | 1.61x geomean (112 TP8 points), 0.94-4.0x; decode 1.2-4.0x, prefill at parity | 0.94x; 7 points at 0.94-0.99x (e.g. q_b M=2048/4096) |
 | MXFP4 GEMM | DeepGEMM 1D1D | FlashInfer MXFP4 (`cudnn` / `b12x`) | 1.40x geomean, 62 of 63 wins | 0.979x dense gate_up M=256 (L2-bound tie) |
-| MXFP4 GEMM | same | best Triton / FlashInfer block-FP8 | 1.07-9.1x; 1.3-2.0x over the best FP8 kernel | 1.07x (K = 256 `shared down`) |
+| MXFP4 GEMM | same | best Triton / FlashInfer block-FP8 | 1.5-11.4x (geomean 3.1x); 1.4-2.3x (geomean 1.8x) over the best FP8 kernel | 1.52x (K = 256 `shared down`, M = 4096); 0.94x vs the best FP8 kernel (`shared down`, M = 32) |
 | NVFP4 GEMM | same, 16-element scales | best FlashInfer NVFP4 | 1.223x geomean, 47 of 63 wins | 0.910x |
 | MXFP4 linear leaf (with quantization) | `deepgemm_sm120_mxfp4_linear` | FlashInfer quantize + best `mm_fp4` | 1.23x geomean, 60 of 63 wins | 0.90x q_b M=256 |
 | MN-major FP8 / k-grouped FP8 | DeepGEMM | explicit transpose + K-major kernel | 1.63x (B, M <= 64) / 1.11-2.06x | 0.97x (B operand) / 0.76x vs a torch loop at small K |
 | `fp8_einsum` (3 expressions) | batched launch | best of cuBLASLt BF16, torch loop, `torch.einsum` | 1.52x geomean (26 shapes) | 0.99x `bhd,bhr->hdr` h=8, b=128 (tie) |
-| BF16 `einsum` heads (task 18) | batched BF16 launch, bit-identical to per-head | per-head GEMM calls; cuBLASLt | 0.21x of the per-head time (56 points); 1.06x vs cuBLASLt, 52 of 56 within 3% or faster | 0.81x vs cuBLASLt, 16 heads, b = 1 |
+| BF16 `einsum` heads (task 18) | batched BF16 launch, bit-identical to per-head | per-head GEMM calls; cuBLASLt | 0.21x of the per-head time, 4.8x faster (56 points); 1.06x vs cuBLASLt, 52 of 56 within 3% or faster | 0.81x vs cuBLASLt, 16 heads, b = 1 |
 | V3.2 indexer (MQA logits + top-k) | DeepGEMM logits | Triton DSA indexer | decode 3.4-19.3x, prefill 7.8-52x | 3.4x decode, 1 x 4K |
 | V3.2 DSA prefill, tiny chunks (task 18) | `deep_gemm_dsa_prefill_topk`, host-light | `triton_dsa_prefill_topk_fp8` | 1.35-98x at 1-8192 tokens; 1.35x at 128 tokens (was 0.52x) | 1.35x, 128 tokens, no prefix |
 | `dsa_index_candidates` (task 18) | DeepSelect over owned length | `torch.topk` leaf; Triton | 1.95x geomean (1.25-4.7x, 54 points); 18x vs Triton | 1.25x, 8 rows, 128K context, 2 ranks |

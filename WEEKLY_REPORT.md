@@ -13,12 +13,12 @@ DeepGEMM and TokenSpeed; nothing is pushed.
 | Area | Result |
 |---|---|
 | Dense FP8 GEMM | 1.61x geomean over Triton / FlashInfer (112 shapes); decode 1.2-4.0x; end to end TPOT 1.18-1.55x on a 27B model |
-| FP4 GEMM | 1.40x geomean over FlashInfer MXFP4, 62 of 63 shapes; 1.3-2.0x over the best FP8 kernel |
+| FP4 GEMM | 1.40x geomean over FlashInfer MXFP4, 62 of 63 shapes; 1.4-2.3x over the best FP8 kernel, 1.5-11.4x over Triton / FlashInfer block-FP8 |
 | DeepSeek V4.1 indexer | Runs native with the existing 68-byte cache, 2.2-88x over Triton per pass |
 | DSA sparse attention (CuTe DSL) | 1.91x (E4M3) / 1.16x (BF16) over the Triton tensor-core kernel; 22-114x over the original |
 | V4 prefill / MLA decode (CuTe DSL) | V4 1.13x, MLA 1.46x over the Triton tensor-core kernels |
 | DSA prefill, tiny chunks | Now 1.35x faster than Triton at 128 tokens (was 0.52x); `dsa_index_candidates` 1.95x geomean |
-| BF16 einsum (batched heads) | 0.21x of the per-head time, bit-identical to the old route |
+| BF16 einsum (batched heads) | 0.21x of the per-head time (4.8x faster), bit-identical to the old route |
 | V4.1 decode, direct reader | 1.66x geomean, bit-identical to the old route |
 | Tests | Kernel suite 7769 passed, 0 failed; runtime suite 0 failed in all 10 directories |
 

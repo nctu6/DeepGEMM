@@ -40,9 +40,10 @@ hardware.
     shared gate_up (up to 2.6x).
   - The DSA indexer is 3.4-19x faster for decode and 7.8-52x faster for
     prefill.
-  - FP4 is a further 1.3-2.0x faster than the best FP8 kernel at nearly every
-    dense shape, and 1.07-9.1x faster than the best Triton/FlashInfer
-    block-FP8 kernel.
+  - FP4 is a further 1.4-2.3x faster (geomean 1.8x) than the best FP8 kernel at
+    every dense shape except K = 256 `shared down` (0.94-1.33x), and 1.5-11.4x
+    (geomean 3.1x) faster than the best Triton/FlashInfer block-FP8 kernel
+    (72 points, section 7.5).
   - End to end on a block-FP8 27B model, TPOT is 1.18-1.55x better.
 - **FP4 vs FlashInfer's MXFP4** (the faster of its `cudnn` and `b12x`
   backends, the two that run MXFP4 on SM120), DeepGEMM kernel against
@@ -691,9 +692,16 @@ parity: dense gate_up M=4096 406 vs 402 us.)
 | dense down 7168x2304 | 4096 | 253.8 | 207.6 | 204.3 | **105.6** | 1.93x |
 | shared down 7168x256 | 1 | 9.7 | 6.8 | 2.2 | **1.9** | 1.17x |
 
-FP4 is 1.3-2.0x faster than the best FP8 kernel at nearly every shape. The
-exception is `shared down` (K = 256, a single K block), where fixed
-per-launch cost dominates: 0.92-1.48x, slower than FP8 at M=32 and M=2048.
+The table above is the 2026-11-04 run (a subset of the rows). Rerun on 72 points
+(8 linears x 9 M, 2026-11-09, shipped build at `2e77a46`, same script and
+method, GPU 7): FP4 is 1.4-2.3x faster than the best FP8 kernel (the faster of
+the FP32-scale and UE8M0 kernels; geomean 1.8x) and 1.5-11.4x faster than the
+best Triton/FlashInfer block-FP8 kernel (geomean 3.1x; the smallest are
+`shared down` at large M, 1.5-1.6x, the largest `shared gate_up` decode,
+11x). The exception is `shared down` (K = 256, a single K block), where fixed
+per-launch cost dominates: 0.94-1.33x against the best FP8 kernel, a tie
+(0.94x) at M=32 and 1.0x at M=8. The ranges quoted before this run (1.6-2.0x,
+1.3-2.0x, 1.1-10.2x, 1.07-9.1x) came from the pre-refit runs and are superseded.
 This script runs with DeepGEMM's PDL off. The FlashInfer comparison below
 turns PDL on for both sides, as serving does, so its DeepGEMM times are lower
 (q_a/kv_a M=1: 6.8 vs 8.3 us).
@@ -857,14 +865,14 @@ One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Trito
 |---|---|---|---|---|---|---|
 | FP8 dense GEMM (FP32 1x128 / 128x128 scales) | DeepGEMM `sm120_fp8_gemm_1d2d` | best of Triton, FlashInfer block-FP8 | 1.61x (112 TP8 points) | 0.94-4.0x; decode 1.2-4.0x, prefill at parity | 0.94x, 7 points at 0.94-0.99x (q_b M=2048/4096, kv_b M=256, o_proj M=1024, shared gate_up M=4096, shared down M=4096/8192) | 7.2 |
 | FP4 GEMM (MXFP4) | DeepGEMM `sm120_fp8_fp4_gemm_1d1d` | FlashInfer MXFP4, faster of `cudnn` / `b12x` | 1.40x (63 points, 62 wins) | worst 0.979x | 0.979x dense gate_up M=256 (L2-bound tie) | 7.5, analysis 9.15 |
-| FP4 GEMM vs block-FP8 | same | best Triton / FlashInfer block-FP8 | not recorded | 1.07-9.1x | 1.07x (K = 256 `shared down`, large M) | 1 |
+| FP4 GEMM vs block-FP8 | same | best Triton / FlashInfer block-FP8 | 3.1x (72 points) | 1.5-11.4x | 1.52x (K = 256 `shared down`, M = 4096); vs the best FP8 kernel 0.94x (`shared down`, M = 32) | 7.5 |
 | NVFP4 GEMM | same, 16-element UE4M3 scales | best FlashInfer NVFP4 (`b12x`, `cute-dsl`, `cudnn`, cuBLASLt) | 1.223x (47 of 63 wins) | worst 0.910x; up to 3.4x against cuBLASLt on N=512 | 0.910x | 7.5, 7.6 |
 | MXFP4 linear leaf (activation quantization included) | TokenSpeed `deepgemm_sm120_mxfp4_linear` | FlashInfer quantize + best `mm_fp4` | 1.23x (60 of 63 wins) | worst 0.90x | 0.90x q_b M=256; 0.97x M=1 of o_proj and dense down | 8 |
 | BF16 GEMM | same 1D1D kernel without scales | cuBLASLt (stays the default for `bf16_gemm_nt`) | not measured | | | 7.5 |
 | MN-major FP8 operands | DeepGEMM `fp8_fp4_gemm_nn/tn/tt` | explicit byte transpose + K-major kernel; Triton on the strided operand | 1.63x vs transpose (B operand, M <= 64) | 0.97-1.96x vs transpose; 1.65-4.6x vs Triton | 0.97x (low end of the B-operand range) | 7.7 |
 | k-grouped FP8 | DeepGEMM `k_grouped_fp8_gemm_tn/nt_contiguous` | per-group transpose + K-major kernel; torch BF16 loop | not recorded | 1.11-2.06x vs transpose; 0.76-1.00x vs the torch loop | 0.76x, small-K groups (4096x7168), where the torch loop wins | 7.7 |
 | `fp8_einsum` (3 expressions) | DeepGEMM batched launch | best of cuBLASLt BF16, per-head torch loop, `torch.einsum` | 1.52x (time ratio 0.66; 26 shapes) | worst 0.99x | 0.99x (time ratio 1.007), `bhd,bhr->hdr` h=8, b=128, a tie at the FP32 D-traffic bound | 7.7 |
-| BF16 `einsum` (`bhr,hdr->bhd`, `bhd,hdr->bhr`, deterministic mode) | DeepGEMM batched BF16 launch (task 18), bit-identical to a launch per head | per-head BF16 GEMM calls (the earlier route); cuBLASLt | 4.9x vs per-head (time ratio 0.21; 56 points: 4 head shapes x b = 1-8192 x 2 expressions); 1.06x vs cuBLASLt (time ratio 0.94) | 1.0-38x vs per-head (up to 38x at 128 heads, b <= 32); 0.81-1.38x vs cuBLASLt, 52 of 56 points within 3% or faster | 0.81x vs cuBLASLt, 16 heads, b = 1 (2.3 vs 1.9 us, launch-bound); h=128, b=8192 0.93x | analysis 9.24 |
+| BF16 `einsum` (`bhr,hdr->bhd`, `bhd,hdr->bhr`, deterministic mode) | DeepGEMM batched BF16 launch (task 18), bit-identical to a launch per head | per-head BF16 GEMM calls (the earlier route); cuBLASLt | 4.8x vs per-head (time ratio 0.21; 56 points: 4 head shapes x b = 1-8192 x 2 expressions); 1.06x vs cuBLASLt (time ratio 0.94) | 1.0-38x vs per-head (up to 38x at 128 heads, b <= 32); 0.81-1.38x vs cuBLASLt, 52 of 56 points within 3% or faster | 0.81x vs cuBLASLt, 16 heads, b = 1 (2.3 vs 1.9 us, launch-bound); h=128, b=8192 0.93x | analysis 9.24 |
 | MQA logits indexer (`fp8_mqa_logits`, paged) | DeepGEMM logits + `dsa_decode_topk` / `dsa_prefill_topk` | Triton DSA indexer leaves | not recorded | decode 3.4-19.3x, prefill 7.8-52x | 3.4x decode, 1 x 4K | 7.3 |
 | DeepSelect top-k (V3.2 prefill) | in-tree CuTe DSL, 93 KB on SM120 | Triton radix top-k | not recorded | 1.3-1.9x on the leaf; decode up to 2.7x on the top-k from 96 rows of 32K+ | selected only where it wins; at 16K or fewer than 48 rows it loses 1.4-2x and is not selected | analysis 9.16 |
 | V3.2 DSA prefill leaf, tiny and small chunks | `deep_gemm_dsa_prefill_topk` after task 18 (one preparation launch, DeepSelect with `index_base`; 118-124 us of host time per call instead of 360) | `triton_dsa_prefill_topk_fp8` | 1-512 tokens: 1.35-6.0x; 1024 tokens 21x; with prefixes 5.8-98x (12 shapes, back-to-back eager calls) | 1.35-98x | 1.35x, 128 tokens, no prefix (124 vs 168 us; it was 0.52x before, 277 vs 144 us) | analysis 9.24 |
@@ -874,7 +882,7 @@ One row per op: the SM120 kernel (DeepGEMM or TokenSpeed) against the best Trito
 | V4.1 indexer, FP8 `index_v4` rows | `deep_gemm_sm120_dsv41_index_topk` | Triton leaves | not recorded | decode 2.3-7.2x, chunked prefill 1.4-5.1x | Reindex over long histories (0.54-0.99x, kept on Triton); the runtime does not store these rows on SM120 | analysis 9.16 |
 | DSA sparse attention | TokenSpeed `cute_dsl_dsa_mma_decode` / `_prefill` (CuTe DSL, task 17) | `triton_dsa_mma_*`, the best Triton core (FlashMLA / trtllm-gen cannot run on SM120) | E4M3 1.91x, BF16 1.16x (64 buckets: 16-128 heads, decode batch 1-128, prefill 128-8192) | 1.00-2.34x | 1.00x, BF16 16 heads (prefill 8192, decode batch 1) | 7.8.1, analysis 9.22 |
 | DSA sparse attention (Triton core) | TokenSpeed `triton_dsa_mma_decode` / `_prefill` | `triton_dsa_decode` / `_prefill` | 72x before task 17 (BF16 1.24x faster since) | 22-114x | 22x, BF16 decode, 16 heads, 1 request | 7.8.1 |
-| MLA decode | TokenSpeed `cute_dsl_mla_mma_decode_with_kvcache` (CuTe DSL, task 17; BF16 / E4M3 caches) | `triton_mla_mma_decode_with_kvcache`, the best Triton kernel | 1.46x (128 points: 16/128 heads, 1-128 requests, 1K-32K); 1.84x on 4/8-row blocks | 0.97-2.34x | 0.97x, BF16 16 heads, 2 x 1K (16 x 16K and up tie at the DRAM roofline) | analysis 9.23 |
+| MLA decode | TokenSpeed `cute_dsl_mla_mma_decode_with_kvcache` (CuTe DSL, task 17; BF16 / E4M3 caches) | `triton_mla_mma_decode_with_kvcache`, the best Triton kernel | 1.46x (128 points: 16/128 heads, 1-128 requests, 1K-32K); 1.84x on 4/8-row blocks (1.13-2.34x) | 0.97-2.31x | 0.97x, BF16 16 heads, 2 x 1K (16 x 16K and up tie at the DRAM roofline) | analysis 9.23 |
 | MLA decode (Triton kernel) | TokenSpeed `triton_mla_mma_decode_with_kvcache` (still serves FP16 caches) | portable `triton_mla_decode_with_kvcache` (FlashInfer / `tokenspeed_mla` cannot run on SM120) | not recorded | 14-131x | 14x | analysis 9.19 |
 | V4 / V4.1 selected attention (prefill) | TokenSpeed `cute_dsl_dsv4_mma_prefill` (CuTe DSL, task 17; more than 16 heads) | `triton_dsv4_mma_prefill`, the best Triton kernel | 1.13x (117 points: 32/64/128 heads, 1-4096 tokens, 128/640/1152 rows) | 0.89-1.63x | 0.89x, window-only (128 rows) at 1-2 tokens, 7.2 vs 6.4 us (kept: a token-count rule would break batch invariance) | analysis 9.23 |
 | V4 / V4.1 selected attention (Triton kernel) | TokenSpeed `triton_dsv4_mma_prefill` (still serves 16 heads or fewer) | `triton_dsv4_prefill` (FlashMLA cannot run on SM120) | not recorded | 4-9x (and 1.24-1.31x more from 128 tokens since task 17) | 4x | analysis 9.19, 9.22 |
