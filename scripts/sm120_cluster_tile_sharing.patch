@@ -1,0 +1,383 @@
+diff --git a/csrc/jit_kernels/heuristics/sm120.hpp b/csrc/jit_kernels/heuristics/sm120.hpp
+index 1509dc2..65230b1 100644
+--- a/csrc/jit_kernels/heuristics/sm120.hpp
++++ b/csrc/jit_kernels/heuristics/sm120.hpp
+@@ -99,6 +99,22 @@ struct SM120ArchSpec {
+         return desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.gemm_type == GemmType::Normal and
+                num_ctas * 10 <= desc.num_sms * 6;
+     }
++    // Cluster tile sharing of the 1D1D kernel (see `sm120_fp8_fp4_gemm_1d1d_impl`): the CTAs of a cluster take consecutive M
++    // blocks of one N block, each loads a `1 / size` slice of their common B tile and copies the peers' slices over
++    // distributed shared memory. Needs one tile per CTA (a single wave) with whole clusters of M blocks, K-major block-scaled
++    // operands, and slices that the two puller warps copy in 2 KB steps. `DG_SM120_CLUSTER` forces a size (0 or 1: off)
++    static int get_cluster_size(const GemmDesc& desc, const Layout& layout) {
++        if (desc.kernel_type != KernelType::Kernel1D1D or desc.gemm_type != GemmType::Normal or desc.major_b != cute::UMMA::Major::K)
++            return 1;
++        const int size = deep_jit::get_env<int>("DG_SM120_CLUSTER", 1);
++        if (size != 2 and size != 4)
++            return 1;
++        const int num_m_blocks = ceil_div(desc.get_expected_m(), layout.block_m);
++        const bool is_legal = num_m_blocks % size == 0 and get_num_tiles(desc, layout) <= desc.num_sms and
++                              desc.num_sms % size == 0 and layout.block_n % (8 * size) == 0 and
++                              (layout.block_n / size * layout.block_k) % 4096 == 0;
++        return is_legal ? size : 1;
++    }
+     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
+         // 1D2D: FP32 scales promoted on CUDA cores; 1D1D: packed UE8M0 scales applied by the block-scaled MMA
+         // NoSF: BF16 operands on the 1D1D kernel
+@@ -209,7 +225,8 @@ struct SM120ArchSpec {
+ 
+     static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
+         // Barriers, plus the split-K "last CTA" flag
+-        const int smem_barriers = kNumMaxStages * 8 * 2 + 16;
++        // (cluster tile sharing adds two barriers per stage)
++        const int smem_barriers = kNumMaxStages * 8 * (get_cluster_size(desc, layout) > 1 ? 4 : 2) + 16;
+         const int smem_a_per_stage = storage_config.load_block_m * get_block_k_a(desc, layout) * get_smem_elem_size(desc, desc.a_dtype);
+         const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * get_smem_elem_size(desc, desc.b_dtype);
+         // NOTES: the FP32 kernel reads SFA from global memory (L1/L2 cached), not staged. The block-scaled 1D1D
+diff --git a/csrc/jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp b/csrc/jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp
+index dae3999..6b726e0 100644
+--- a/csrc/jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp
++++ b/csrc/jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp
+@@ -35,6 +35,7 @@ public:
+         int gran_k;
+         bool use_stream_k;
+         bool early_pdl_trigger;
++        int cluster_size;      // CTAs per cluster sharing B tiles (1: no cluster)
+         void *grouped_layout, *d;
+         int ld_d;
+         int64_t d_stride_g;   // Batched: elements between the D of consecutive batches
+@@ -63,7 +64,7 @@ static void __instantiate_kernel() {{
+         {},
+         {}, {},
+         {}, {},
+-        {}, {}, {},
++        {}, {}, {}, {},
+         {}
+     >);
+ }};
+@@ -80,7 +81,7 @@ static void __instantiate_kernel() {{
+         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
+         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
+         args.use_stream_k ? "true" : "false", args.gemm_desc.with_accumulation ? "true" : "false",
+-        args.early_pdl_trigger ? "true" : "false",
++        args.early_pdl_trigger ? "true" : "false", args.cluster_size,
+         to_string(args.gemm_desc.cd_dtype)));
+ 
+         jit->launch(
+@@ -159,11 +160,13 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
+                         config.storage_config.swizzle_a_mode, 0, false,
+                         /* fp4_unpacked_smem */ false);
+     DG_HOST_ASSERT(not is_mixed_fp4_b or not is_batched);
++    // Cluster tile sharing: each CTA of a cluster loads a `1 / cluster_size` slice of the B tile and forwards it to the peers
++    const int cluster_size = stream_k.num_ctas > 0 ? 1 : SM120ArchSpec::get_cluster_size(desc, choice.layout);
+     const auto tensor_map_b = is_batched ?
+         make_tma_batched_desc(desc.major_b, b, desc.n, desc.k, config.storage_config.load_block_n, tma_block_k,
+                               config.storage_config.swizzle_b_mode, /* fp4_unpacked_smem */ false) :
+         make_tma_b_desc(desc.major_b, b, desc.n, desc.k,
+-                        config.storage_config.load_block_n,
++                        config.storage_config.load_block_n / cluster_size,
+                         tma_block_k,
+                         static_cast<int>(b.stride(get_non_contiguous_dim(desc.major_b))), num_groups_b,
+                         config.storage_config.swizzle_b_mode, 0, false,
+@@ -198,7 +201,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
+             .num_smem_bytes = config.pipeline_config.smem_size,
+             .grid_dim = dim3(num_ctas, 1, 1),
+             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+-            .cluster_dim = dim3(1, 1, 1),
++            .cluster_dim = dim3(cluster_size, 1, 1),
+         },
+         .is_fp4 = is_fp4,
+         .is_bf16 = is_bf16,
+@@ -206,6 +209,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
+         .gran_k = gran_k,
+         .use_stream_k = stream_k.num_ctas > 0,
+         .early_pdl_trigger = early_pdl_trigger,
++        .cluster_size = cluster_size,
+         .grouped_layout = grouped_layout,
+         .d = d.data_ptr(),
+         .ld_d = static_cast<int>(d.stride(-2)),
+diff --git a/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh b/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh
+index 09416d6..04b0fe7 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh
+@@ -21,6 +21,50 @@
+ 
+ namespace deep_gemm {
+ 
++// Thread-block cluster helpers (distributed shared memory) for the cluster tile sharing of `sm120_fp8_fp4_gemm_1d1d_impl`
++namespace sm120_cluster {
++
++/// The shared::cluster address, in CTA `rank` of the cluster, of the shared::cta address `smem_addr`
++CUTLASS_DEVICE uint32_t map_to_rank(const uint32_t& smem_addr, const uint32_t& rank) {
++    uint32_t result;
++    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(result) : "r"(smem_addr), "r"(rank));
++    return result;
++}
++
++/// Arrive on an mbarrier of a (possibly remote) CTA, releasing this thread's earlier shared memory reads at cluster scope
++CUTLASS_DEVICE void arrive_release_cluster(const uint32_t& cluster_barrier_addr) {
++    asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];" :: "r"(cluster_barrier_addr) : "memory");
++}
++
++/// Wait for a phase of a local mbarrier that remote CTAs arrive on (acquire at cluster scope)
++CUTLASS_DEVICE void wait_acquire_cluster(const uint32_t& barrier_addr, const uint32_t& parity) {
++    asm volatile("{\n\t"
++                 ".reg .pred p;\n\t"
++                 "WAIT_LOOP:\n\t"
++                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1;\n\t"
++                 "@!p bra WAIT_LOOP;\n\t"
++                 "}" :: "r"(barrier_addr), "r"(parity) : "memory");
++}
++
++/// 16 bytes of a peer's shared memory (a shared::cluster address)
++CUTLASS_DEVICE uint4 load_from_peer(const uint32_t& peer_addr) {
++    uint4 value;
++    asm volatile("ld.shared::cluster.v4.b32 {%0, %1, %2, %3}, [%4];"
++                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w) : "r"(peer_addr) : "memory");
++    return value;
++}
++
++CUTLASS_DEVICE void store_shared(const uint32_t& addr, const uint4& value) {
++    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" :: "r"(addr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w) : "memory");
++}
++
++/// Barrier over every thread of every CTA of the cluster, ordering their shared memory accesses
++CUTLASS_DEVICE void sync_all() {
++    asm volatile("barrier.cluster.arrive.release;\n\tbarrier.cluster.wait.acquire;" ::: "memory");
++}
++
++}  // namespace sm120_cluster
++
+ // SM120 block-scaled GEMM with packed scale factors ("1D1D"): FP4 (E2M1) with UE8M0 (MXFP4, 32-element groups) or UE4M3
+ // (NVFP4, 16-element groups) scales, FP8 (E4M3) with UE8M0 scales, and BF16 without scales.
+ //
+@@ -55,6 +99,13 @@ namespace deep_gemm {
+ // `GemmType::Batched` runs `kNumGroups` independent GEMMs `D[g] = A[g] @ B[g]^T` in one launch: A/B are loaded through 3D tensor
+ // maps with the batch as the outer dimension (so batches may be strided views, e.g. the heads of a `[b, h, d]` tensor), the
+ // scales are stacked along their outer dimension like grouped GEMMs', and D is offset by `d_stride_g` per batch
++// Cluster tile sharing (`kClusterSize` > 1, normal GEMMs): the `kClusterSize` CTAs of a cluster work on consecutive M blocks
++// of one N block, so they need the same B tile. TMA multicast is software-emulated on SM120 (it traps), so each CTA
++// instead TMA-loads a `BLOCK_N / kClusterSize`-row slice of B into its own shared memory and the peers copy it from there with
++// `ld.shared::cluster` (pushing into a peer is 5x slower on SM120: scripts/sm120_cluster_probe.cu). L2 -> SM traffic for B
++// drops by `kClusterSize`. A notifier warp tells the peers when its slice has landed, and two puller warps copy the peers'
++// slices into the same place of this CTA's stage. The stage barriers become cluster-wide: a stage is refilled only once every
++// CTA of the cluster has released it (each math warp arrives on the `empty` barrier of every CTA), because peers read it
+ // The TMA pipeline, scheduler, warp tiling, stream-K and epilogue are shared with `sm120_fp8_gemm_1d2d_impl`: with
+ // `kUseStreamK` (normal GEMMs whose tiles fill the GPU poorly, e.g. decoding with a long K), the
+ // `num_tiles x num_k_blocks` iteration space is split evenly over the CTAs, and a tile covered by several CTAs is
+@@ -69,6 +120,7 @@ template <bool kIsFP4, bool kIsBF16, bool kMixedFP4B, uint32_t kGranK,
+           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+           uint32_t kNumSMs, GemmType kGemmType,
+           bool kUseStreamK, bool kWithAccumulation, bool kEarlyPdlTrigger,
++          uint32_t kClusterSize,
+           typename cd_dtype_t>
+ CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, uint64_t d_stride_g, float alpha,
+@@ -122,6 +174,18 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+                      kGemmType == GemmType::MGroupedContiguousWithPsumLayout or
+                      kGemmType == GemmType::MGroupedMasked, "Unsupported GEMM type");
+     DG_STATIC_ASSERT(not kUseStreamK or kGemmType == GemmType::Normal, "Stream-K is only for normal GEMMs");
++    // Cluster tile sharing: every CTA of a cluster runs the same K loop over the same B rows (one tile per CTA, so no
++    // stream-K and a single task), and B slices are whole 8-row swizzle atoms
++    static constexpr bool kShareB = kClusterSize > 1;
++    static constexpr uint32_t kSliceRows = BLOCK_N / kClusterSize;
++    static constexpr uint32_t kSliceBytes = kSliceRows * BLOCK_K;
++    // Warps of the TMA warp group that copy the peers' slices: `kNumPullWarps` of them split a slice evenly
++    static constexpr uint32_t kNumPullWarps = 2;
++    DG_STATIC_ASSERT(kClusterSize == 1 or kClusterSize == 2 or kClusterSize == 4, "Invalid cluster size");
++    DG_STATIC_ASSERT(kSliceBytes % (kNumPullWarps * 2048) == 0, "A slice is copied in 2 KB steps by each puller warp");
++    DG_STATIC_ASSERT(not kShareB or (kGemmType == GemmType::Normal and not kUseStreamK and not kIsMNMajorB and
++                                     not kIsBF16 and BLOCK_N % (8 * kClusterSize) == 0),
++                     "Cluster tile sharing is for K-major B of normal block-scaled GEMMs, without stream-K");
+     DG_STATIC_ASSERT(kIsBF16 or kGranK == 32 or (kIsFP4 and kGranK == 16) or (not kIsFP4 and kGranK == 128),
+                      "FP4 takes 32- (UE8M0) or 16-element (UE4M3) scales; FP8 32 or 128 (UE8M0)");
+     static constexpr uint32_t kElemsPerBlock = kIsFP4B ? BLOCK_K * 2 : (kIsBF16 ? BLOCK_K / 2 : BLOCK_K);
+@@ -216,16 +280,31 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_BARRIER_OFFSET);
+     auto full_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
+     auto empty_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
+-    auto smem_is_last_split = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 2);
++    // Cluster mode, two more barriers per stage: this CTA's own slice of B has landed (the notifier waits on it), and the
++    // peers' slices are ready to be copied (the peers' notifiers arrive on it)
++    auto slice_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages * 2 + i; });
++    auto peer_ready_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages * 3 + i; });
++    auto smem_is_last_split = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * (kShareB ? 4 : 2));
++    const uint32_t cluster_rank = kShareB ? cute::block_rank_in_cluster() : 0;
+     if (warp_idx == kNumMathWarps + 1 and cute::elect_one_sync()) {
+         #pragma unroll
+         for (uint32_t i = 0; i < kNumStages; ++ i) {
+-            full_barriers[i]->init(1);
+-            empty_barriers[i]->init(kNumMathWarps);
++            // The producer, and in cluster mode the puller warps (once the peers' slices are in place)
++            full_barriers[i]->init(kShareB ? 1 + kNumPullWarps : 1);
++            // Every math warp of every CTA of the cluster releases a stage
++            empty_barriers[i]->init(kNumMathWarps * kClusterSize);
++            if constexpr (kShareB) {
++                slice_barriers[i]->init(1);
++                peer_ready_barriers[i]->init(kClusterSize - 1);
++            }
+         }
+         cutlass::arch::fence_barrier_init();
+     }
+-    __syncthreads();
++    // Peers push into this CTA's stages and arrive on its barriers: they must be initialized cluster-wide first
++    if constexpr (kShareB)
++        sm120_cluster::sync_all();
++    else
++        __syncthreads();
+ 
+     // Register reconfigurations
+     constexpr uint32_t kNumTMARegisters = kNumMathThreads == 128 ? 56 : 40;
+@@ -295,13 +374,60 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+         init_stream_k_range();
+ 
++        if constexpr (kShareB) {
++            // Notifier: once this CTA's slice of a stage has landed, tell the peers
++            if (warp_idx == kNumMathWarps + 2 and cute::elect_one_sync()) {
++                while (get_next_task(m_block_idx, n_block_idx)) {
++                    for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
++                        slice_barriers[stage_idx]->wait(phase);
++                        const uint32_t barrier_addr = mma::sm120::to_smem_addr(peer_ready_barriers[stage_idx]);
++                        #pragma unroll
++                        for (uint32_t peer = 1; peer < kClusterSize; ++ peer)
++                            sm120_cluster::arrive_release_cluster(sm120_cluster::map_to_rank(barrier_addr, (cluster_rank + peer) % kClusterSize));
++                    }
++                }
++            }
++            // Pullers: copy the peers' slices of a stage into this CTA's stage, then count as arrived on the full barrier
++            if (warp_idx == kNumMathWarps + 1 or warp_idx == kNumMathWarps + 3) {
++                constexpr uint32_t kBytesPerWarp = kSliceBytes / kNumPullWarps, kStep = 2048, kInFlight = 4;
++                const uint32_t pull_idx = warp_idx == kNumMathWarps + 1 ? 0 : 1;
++                while (get_next_task(m_block_idx, n_block_idx)) {
++                    for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
++                        sm120_cluster::wait_acquire_cluster(mma::sm120::to_smem_addr(peer_ready_barriers[stage_idx]), phase);
++                        #pragma unroll
++                        for (uint32_t peer = 1; peer < kClusterSize; ++ peer) {
++                            const uint32_t peer_rank = (cluster_rank + peer) % kClusterSize;
++                            const uint32_t local = mma::sm120::to_smem_addr(smem_b[stage_idx]) + peer_rank * kSliceBytes +
++                                                   pull_idx * kBytesPerWarp + lane_idx * 16;
++                            const uint32_t remote = sm120_cluster::map_to_rank(local, peer_rank);
++                            #pragma unroll
++                            for (uint32_t step = 0; step < kBytesPerWarp / kStep; ++ step) {
++                                uint4 values[kInFlight];
++                                #pragma unroll
++                                for (uint32_t i = 0; i < kInFlight; ++ i)
++                                    values[i] = sm120_cluster::load_from_peer(remote + step * kStep + i * 512);
++                                #pragma unroll
++                                for (uint32_t i = 0; i < kInFlight; ++ i)
++                                    sm120_cluster::store_shared(local + step * kStep + i * 512, values[i]);
++                            }
++                        }
++                        __syncwarp();
++                        if (lane_idx == 0)
++                            full_barriers[stage_idx]->arrive();
++                    }
++                }
++            }
++        }
++
+         if (warp_idx == kNumMathWarps and cute::elect_one_sync()) {
+             constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
+             // A 128-element FP8 K block uses a quarter of a 128-granularity scale word, so that word is re-fetched
+             const auto get_sf_block_idx = [](const uint32_t& k_block_idx) {
+                 return (kIsFP4B or kGranK == 32) ? k_block_idx : k_block_idx / 4;
+             };
+-            constexpr uint32_t kNumBTMABytes = SMEM_B_SIZE_PER_STAGE + kNumSFWords * BLOCK_N * 4;
++            // Bytes landing on the stage's full barrier: B and SFB; in cluster mode only SFB (this CTA's slice of B has its own
++            // barrier, and the peers' slices are copied by the puller warps)
++            constexpr uint32_t kNumBTMABytes = (kShareB ? 0 : SMEM_B_SIZE_PER_STAGE) + kNumSFWords * BLOCK_N * 4;
+             constexpr uint32_t kNumATMABytes = SMEM_A_SIZE_PER_STAGE + kNumSFWords * BLOCK_M * 4;
+             if constexpr (kPreissueWeights) {
+                 if (num_preissued_k_blocks > 0) {
+@@ -313,7 +439,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+                         // cannot complete the phase: the single arrival comes with A, after the wait
+                         auto& full_barrier = *full_barriers[k_block_idx];
+                         full_barrier.expect_transaction(kNumBTMABytes);
+-                        if constexpr (kIsMNMajorB) {
++                        if constexpr (kShareB) {
++                            slice_barriers[k_block_idx]->arrive_and_expect_tx(kSliceBytes);
++                            tma::copy<kElemsPerBlock, kSliceRows, kSwizzleBMode, b_dtype_t>(&tensor_map_b, slice_barriers[k_block_idx],
++                                     reinterpret_cast<b_dtype_t*>(smem_b[k_block_idx] + cluster_rank * kSliceBytes),
++                                     k_block_idx * kElemsPerBlock, n_idx + cluster_rank * kSliceRows);
++                        } else if constexpr (kIsMNMajorB) {
+                             tma::copy<BLOCK_N, kElemsPerBlock, kSwizzleBMode, ab_dtype_t>(&tensor_map_b, &full_barrier,
+                                      reinterpret_cast<ab_dtype_t*>(smem_b[k_block_idx]), n_idx, k_block_idx * kElemsPerBlock);
+                         } else {
+@@ -335,8 +466,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+             bool is_first_task = true;
+             while (get_next_task(m_block_idx, n_block_idx)) {
+                 for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
+-                    // Wait consumer release
+-                    empty_barriers[stage_idx]->wait(phase ^ 1);
++                    // Wait consumer release (in cluster mode: of every CTA of the cluster)
++                    if constexpr (kShareB)
++                        sm120_cluster::wait_acquire_cluster(mma::sm120::to_smem_addr(empty_barriers[stage_idx]), phase ^ 1);
++                    else
++                        empty_barriers[stage_idx]->wait(phase ^ 1);
+ 
+                     auto& full_barrier = *full_barriers[stage_idx];
+                     // NOTES: for FP4 the TMA K coordinate counts elements (16U4 data type), and the packed
+@@ -364,7 +498,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+                     } else {
+                         // A grouped B is `[G, N, K]` (K-major) or `[G, K, N]` (MN-major): the group offset goes to the outer
+                         // dimension, N or K respectively (as in the SM90 BF16 kernel)
+-                        if constexpr (kIsMNMajorB) {
++                        if constexpr (kShareB) {
++                            slice_barriers[stage_idx]->arrive_and_expect_tx(kSliceBytes);
++                            tma::copy<kElemsPerBlock, kSliceRows, kSwizzleBMode, b_dtype_t>(&tensor_map_b, slice_barriers[stage_idx],
++                                     reinterpret_cast<b_dtype_t*>(smem_b[stage_idx] + cluster_rank * kSliceBytes), k_idx,
++                                     n_block_idx * BLOCK_N + cluster_rank * kSliceRows);
++                        } else if constexpr (kIsMNMajorB) {
+                             tma::copy<BLOCK_N, kElemsPerBlock, kSwizzleBMode, ab_dtype_t, kIsBatchedMM>(&tensor_map_b, &full_barrier,
+                                      reinterpret_cast<ab_dtype_t*>(smem_b[stage_idx]),
+                                      scheduler.get_global_idx<false>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+@@ -458,8 +597,15 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+                 // the async proxy: the write must not overtake the reads
+                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                 __syncwarp();
+-                if (lane_idx == 0)
++                if constexpr (kShareB) {
++                    // Lane `r` releases the stage in CTA `r` (this one included): its producer refills it, and its forwarder
++                    // pushes into it
++                    if (lane_idx < kClusterSize)
++                        sm120_cluster::arrive_release_cluster(sm120_cluster::map_to_rank(
++                            mma::sm120::to_smem_addr(empty_barriers[stage_idx]), lane_idx));
++                } else if (lane_idx == 0) {
+                     empty_barriers[stage_idx]->arrive();
++                }
+             };
+ 
+             if (scheduler.is_computation_valid(m_block_idx, warp_m_idx * WARP_M)) {
+@@ -467,6 +613,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+                 for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
+                     // Wait TMA arrivals (operands and scales)
+                     full_barriers[stage_idx]->wait(phase);
++                    if constexpr (kShareB)
++                        slice_barriers[stage_idx]->wait(phase);
+ 
+                     // The packed scale words of this K-warp's steps, starting at the block's word of its first step
+                     const uint32_t first_k = warp_k_idx * kNumLocalKSteps;
+@@ -600,6 +748,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+                 #pragma unroll 1
+                 for (uint32_t k_block_idx = k_block_begin; k_block_idx < k_block_end; advance_pipeline(k_block_idx)) {
+                     full_barriers[stage_idx]->wait(phase);
++                    if constexpr (kShareB)
++                        slice_barriers[stage_idx]->wait(phase);
+                     empty_barrier_arrive();
+                 }
+             }
+@@ -798,6 +948,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d,
+             }
+         }
+     }
++
++    // A CTA must outlive the peer writes and barrier arrivals that target its shared memory
++    if constexpr (kShareB) {
++        __syncwarp();
++        sm120_cluster::sync_all();
++    }
+ #else
+     if (blockIdx.x == 0 and threadIdx.x == 0)
+         DG_DEVICE_ASSERT(false and "This kernel only support sm_120f");
