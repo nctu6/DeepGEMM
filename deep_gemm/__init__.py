@@ -99,6 +99,7 @@ def get_supported_arch_majors() -> tuple:
 # Mega kernels
 from .mega import (
     SymmBuffer,
+    get_mega_moe_max_ranks,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,

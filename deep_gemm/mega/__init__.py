@@ -15,6 +15,19 @@ except Exception as exception:
 from .. import _C
 
 
+# Ranks that `fp8_fp4_mega_moe` serves, by compute capability major. SM100 uses the NVLink symmetric buffers of
+# `layout::kNumMaxRanks` peers. SM120 (no NVLink) reaches up to 8 peers with CUDA IPC peer stores over PCIe
+_MEGA_MOE_MAX_RANKS = {10: 72, 12: 8}
+
+
+def get_mega_moe_max_ranks(arch_major: Optional[int] = None) -> int:
+    """The largest rank count `fp8_fp4_mega_moe` supports on a compute capability major (0 if it has no such kernel).
+    Builds before the multi-rank SM120 version lack this function, and callers can probe for it."""
+    if arch_major is None:
+        arch_major = torch.cuda.get_device_capability()[0]
+    return _MEGA_MOE_MAX_RANKS.get(arch_major, 0)
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,

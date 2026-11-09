@@ -43,6 +43,11 @@ get_symm_buffer_size_for_mega_moe(
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
+    // SM120 has no rings or fused shared experts: its buffer holds the inputs and what peers read
+    if (jit->device.get_arch_major() == 12)
+        return sm120_get_symm_buffer_size_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+                                                       hidden, intermediate_hidden, mma_type, num_shared_experts);
+
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
     const auto num_sms = get_num_sms_for_mega_moe();
@@ -274,15 +279,14 @@ static void fp8_fp4_mega_moe(
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math);
     } else if (arch_major == 12) {
-        // SM120 (one rank, MXFP4 routed experts): no symmetric-memory dispatch or fused shared experts yet
-        DG_HOST_ASSERT(num_ranks == 1 and "SM120 mega MoE runs one rank");
+        // SM120 (MXFP4 routed experts): dispatch and combine through peer loads of the symmetric buffers
         DG_HOST_ASSERT(num_shared_experts == 0 and "SM120 mega MoE has no fused shared experts");
         DG_HOST_ASSERT(weight_dtype == kPackedFP4 and "SM120 mega MoE takes MXFP4 routed weights");
         DG_HOST_ASSERT(not is_localized(l1_weights) and "SM120 has no locality domains");
-        sm120_fp8_fp4_mega_moe(y, x, x_sf, topk_idx, topk_weights,
+        sm120_fp8_fp4_mega_moe(y, sym_buffer, sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank,
                                l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
                                cumulative_local_expert_recv_stats,
-                               num_experts_per_rank, num_tokens, num_topk,
+                               num_experts, num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math);
     } else {
