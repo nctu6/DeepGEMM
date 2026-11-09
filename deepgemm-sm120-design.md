@@ -248,7 +248,9 @@ Files: `deep_gemm/include/deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh`,
 `deep_gemm/include/deep_gemm/mma/sm120.cuh`.
 
 **Contract.** Same as SM100's 1D1D path, so SM100 callers port unchanged.
-A and B are K-major (BF16 also takes MN-major, below), output is BF16 or FP32. Scales are int32 tensors, four UE8M0
+A and B are K-major (BF16 also takes MN-major, below), output is BF16 or FP32.
+Cluster tile sharing (several CTAs reading one B tile over DSMEM) was built and
+measured on this kernel and is not part of it: it is slower on SM120 (analysis 9.28). Scales are int32 tensors, four UE8M0
 bytes per word (byte `2^(b-127)`), shaped `[(G,) MN, ceil(K / (gran_k * 4))]`,
 MN-major and TMA-aligned. Modes:
 
@@ -778,6 +780,22 @@ slower than b12x on the other three shapes (q_b 8.0 vs 7.2 us, o_proj 10.6 vs 9.
 dense down 11.8 vs 10.4) and faster on this one (21.8 vs 22.6 us); the graph-mode
 wins above come from the launch chain, not from a faster mainloop. Details in `deepgemm-analysis.md` section 9.15.
 
+**Cluster tile sharing does not win it either (task 23).** An isolated rerun (three
+processes, GPU idle) gave DeepGEMM 19.2 us against b12x 19.5-19.6 us (1.02x). The
+CTAs of a 2- or 4-CTA cluster take consecutive M blocks of one N block and share
+their B tile: each loads a slice with its own TMA box and the peers get the rest
+over distributed shared memory, by push (bulk copy) or pull (`ld.shared::cluster`
+by a notifier and two puller warps), with cluster-wide stage barriers. Both are
+bitwise equal and spill-free, and are 45-146 us against 20 us. SM120 DSMEM writes
+run at 5 GB/s per CTA whatever the instruction (bulk copy, `st.async`, plain
+stores), reads at about 33 GB/s; a remote load is 95 ns and a remote mbarrier
+arrive about 220 ns, and with 3 stages in flight every added hop lengthens the
+chain. With the forwarding removed the kernel reaches 17.5-17.6 us, so the
+ceiling was 1.13x. A raster change does not apply (one wave, 17 MB of unique
+data in L2). The kernel is unchanged; `scripts/sm120_cluster_probe.cu` and
+`scripts/sm120_cluster_tile_sharing.patch` keep the measurements reproducible
+(analysis 9.28).
+
 What closed the earlier gaps (cuDNN used to win q_a/kv_a and shared gate_up
 decode by up to 1.3x):
 - **BLOCK_N = 32 tiles.** Thin-N decode gets twice the CTAs. Each K block's
@@ -922,6 +940,7 @@ The before/after cost table (per-bucket changes, 16 and 4 chunks, 16 warps) is i
 | MN-major FP4 operands | no sub-byte transposing `ldmatrix` (FP8 has `.b8`, BF16 the 16-bit form) |
 | Quantized-D (FP8 output) epilogues, custom epilogue classes | SM100 epilogues built on TMEM |
 | TMA multicast | emulated in software on SM120 (a multicast launch traps into `emulate_tma`), so FP4 at dense gate_up M=256 stays a tie |
+| Cluster tile sharing over DSMEM | works and is bitwise equal, but SM120 DSMEM writes run at 5 GB/s per CTA (reads about 33 GB/s) with 95 ns remote loads and 220 ns remote mbarrier arrives, which a 3-stage pipeline cannot hide: 45-146 us against 20 us at dense gate_up M=256 (section 3.4, analysis 9.28) |
 | Paged MQA with a head dim other than 32/64/128, block-scaled paged MQA with a head dim other than 128 or MXFP8 at 128 Q rows, SM100's varlen paged API | no kernel (MXFP8 at 128 Q rows spills in the 104 math registers); paged MXFP4 at head dim 128 is supported since task 16 |
 | `fp8_einsum` with accumulation `c` for `bhd,hdr->bhr` / `bhr,hdr->bhd` | SM120 FP8 bmm has no accumulation epilogue |
 
@@ -1255,8 +1274,9 @@ Other notes:
    M=128) now win by 1.06-1.12x (early PDL trigger, section 7.5). This one is
    bound by L2 -> SM traffic. Tried and dropped: tile choice, the cost-model
    refit, two CTAs per SM, stream-K at mid M, `DG_SM120_AUTOTUNE=1`, an L2
-   prefetch of B, an early or a never PDL trigger, and TMA multicast (emulated
-   in software on SM120).
+   prefetch of B, an early or a never PDL trigger, TMA multicast (emulated
+   in software on SM120), and sharing the B tile across a 2- or 4-CTA cluster
+   over DSMEM (task 23, section 3.4 and 7.5, analysis 9.28: 2.3-7.3x slower).
 2. **V4.1 indexer on SM120 in serving: done (task 16).** The block-scaled
    paged MQA kernel scores the 68-byte rows, so the runtime keeps its `v41`
    cache and serving selects the native leaf (2.2-88x over the Triton leaf on

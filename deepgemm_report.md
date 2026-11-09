@@ -40,7 +40,7 @@ table is design 7.8).
 | Op | SM120 kernel | Baseline | Result | Worst shape |
 |---|---|---|---|---|
 | FP8 dense GEMM | DeepGEMM 1D2D | best Triton / FlashInfer block-FP8 | 1.61x geomean (112 TP8 points), 0.94-4.0x; decode 1.2-4.0x, prefill at parity | 0.94x; 7 points at 0.94-0.99x (e.g. q_b M=2048/4096) |
-| MXFP4 GEMM | DeepGEMM 1D1D | FlashInfer MXFP4 (`cudnn` / `b12x`) | 1.40x geomean, 62 of 63 wins | 0.979x dense gate_up M=256 (L2-bound tie) |
+| MXFP4 GEMM | DeepGEMM 1D1D | FlashInfer MXFP4 (`cudnn` / `b12x`) | 1.40x geomean, 62 of 63 wins | 0.979x dense gate_up M=256 (L2-bound tie; cluster tile sharing tried, slower) |
 | MXFP4 GEMM | same | best Triton / FlashInfer block-FP8 | 1.5-11.4x (geomean 3.1x); 1.4-2.3x (geomean 1.8x) over the best FP8 kernel | 1.52x (K = 256 `shared down`, M = 4096); 0.94x vs the best FP8 kernel (`shared down`, M = 32) |
 | NVFP4 GEMM | same, 16-element scales | best FlashInfer NVFP4 | 1.223x geomean, 47 of 63 wins | 0.910x |
 | W4A8 grouped GEMM (task 21) | DeepGEMM 1D1D, FP8 x MXFP4 | same kernel, FP8 x FP8 on converted weights (bitwise equal) | 1.35-1.72x at decode / mid shapes, 1.07-1.10x small | 0.84x (4 x 4096 x 4096 x 2048, compute-bound) |
@@ -121,7 +121,7 @@ the installed build reports SM120 kernels (`deep_gemm.get_supported_arch_majors(
 
 ## 7. Open items
 
-- One FP4 tie with FlashInfer b12x: dense gate_up M=256 (0.98x), bound by L2 -> SM traffic (analysis 9.15).
+- One FP4 tie with FlashInfer b12x: dense gate_up M=256 (0.98x in the sweep, 1.02x isolated), bound by L2 -> SM traffic (analysis 9.15). Cluster tile sharing over DSMEM (task 23, analysis 9.28) is 2.3-7.3x slower, because DSMEM writes run at 5 GB/s per CTA and the hops lengthen the 3-stage pipeline; the ceiling with free sharing is 1.13x. Not shipped (probe and patch in `scripts/`).
 - Mega MoE (analysis 9.26): the 1-token gap (0.82x at one rank, 0.95x at EP 2; fewer launches or a fused push + dispatch), the per-call row scratch (about 2.6 GB at 8192 tokens per rank) that the KV planner does not count (OOM at util 0.93), the DP2/EP2 serving gap against Marlin TP2 on real V4.1 weights (analysis 9.27), more than 2 ranks, fused shared experts, mega gate and mega mHC (no TokenSpeed caller). Done: EP 2 over CUDA IPC; the Triton MXFP4 MoE illegal memory access at V4.1 shapes (32-bit expert offsets, TokenSpeed `8afd973bc`).
 - V4.1 indexer: a multi-wave sparse MX kernel (the sparse kernel is one wave, about 85 us at any size); MXFP4 paged at 1.07 vs 1.23 TB/s for FP8; FP8 `index_v4` rows have no pool-only scorer (the runtime does not store them on SM120).
 - Attention: BF16 DSA / V4 above 42-48% of the tensor-pipe floor; V4 at 16 heads; decode of one DSA request (20 us BF16); a dequantizing tile in the CuTe DSL V4 kernel; host paths of `fp8_mqa_logits` (26 us) and DeepSelect (34 us) in a 128-token DSA chunk.

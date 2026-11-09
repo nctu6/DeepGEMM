@@ -8,7 +8,7 @@ This file is the single source of truth for the effort. Update the status log
 (section 9) after every step. Re-read sections 2, 5 and 8 before starting any
 new work so we don't drift into one of the known dead ends.
 
-## Current state (2026-11-09, updated for task 22)
+## Current state (2026-11-10, updated for task 23)
 
 - **Supported on sm120:**
   - `fp8_gemm_nt`, m-grouped contiguous (incl. psum) and masked FP8 GEMMs, with FP32 1x128 / 128x128 scales.
@@ -41,8 +41,9 @@ new work so we don't drift into one of the known dead ends.
 - **Commits:** everything through DeepGEMM `62af89e` and TokenSpeed `e7f44649e` (tasks 1-20) is pushed to `origin/nctu6`. Task 21 is local, not pushed: DeepGEMM `5cf4862` (W4A8, one-rank mega MoE), `1a5c1cf` (EP across ranks), scripts `d2ac3c9` and `28971f8`, and the docs commits `d2bec7e`, `884b0ee` and after; TokenSpeed `4ad42e528`, `a2b701cc5`, `8afd973bc` (Triton MXFP4 fix), `695c15770` (SM120 MegaMoE leaf) and the README commit after it. Task 22: TokenSpeed `e4fc05813` (MLA RoPE fix), `6d6702bae` (V4.1 expert subset) and its docs commit, DeepGEMM docs only. `WEEKLY_REPORT.md` stays local (git-excluded).
 - **Install:** TokenSpeed carries DeepGEMM as a submodule (`DeepGEMM/`, branch `nctu6`). `scripts/install.sh` and `docker/Dockerfile.nvidia.unieai` build it from source and replace the published `tokenspeed-deepgemm` wheel. Both are tested on aws-raichu. See the "Submodule + install" rows in section 9.
 - **Mega MoE in TokenSpeed (task 21):** `deep_gemm_sm120_mxfp4_mega_moe_apply` is registered on SM120 for EP 2 (opt-in, `--moe-backend mega_moe` with attention DP); at the same served tokens it ties Marlin W4A16 plus its collective from 1 to 1024 tokens per rank (0.95-1.05x) and wins 1.28-1.39x from 2048 (section 9.26). The Triton MXFP4 MoE illegal memory access at V4.1 shapes was a 32-bit expert offset overflow, fixed in TokenSpeed `8afd973bc`.
+- **Task 23 (2026-11-10, section 9.28):** the dense gate_up M=256 MXFP4 tie (DeepGEMM 19.2 us vs b12x 19.5-19.6 us, 1.02x in an isolated run, 0.98x in the sweep) is not won by thread-block cluster tile sharing. B-slice sharing over DSMEM across 2 and 4 CTAs works and is bitwise equal, but is 2.3-7.3x slower (45-146 us vs 20 us): distributed shared memory on SM120 writes at 5 GB/s per CTA, reads at about 33 GB/s, and adds 95 ns per remote load and 220 ns per remote mbarrier arrive to a 3-stage pipeline. The ceiling with free sharing is 1.13x. No kernel change; probe and patch are in `scripts/`.
 - **Real weights (task 22, section 9.27):** the 157 GB V4 checkpoint cannot load in this TokenSpeed tree (upstream removed `DeepseekV4ForCausalLM` in `0c1bc3ed3`, #2310), so the MegaMoE end-to-end check ran on the real 476 GB V4.1 checkpoint with all 40 layers, real Engram, embeddings, norm and head, and its first 128 of 384 routed experts per layer (TokenSpeed `6d6702bae`, `num_checkpoint_experts`; a layer subset is impossible because the FlatKV packing is pinned to 40 layers). DP2/EP2 serving selects `deep_gemm_sm120_mxfp4_mega_moe_apply`. Against a float32 reference built from the same weights with the official `inference/model.py`, layers 0 and 2 have the same single-layer error on all three paths (2.76-2.81% and 3.70-3.90% relative L2: MegaMoE DP2/EP2, Marlin TP2, forced portable Triton TP2). The paths differ from each other by 0.7% at layer 0; the gap grows through 40 layers to about 50% (logits KL 0.56-0.64, top-1 62-69%), equally for every pair, so the 1/3-expert model amplifies rounding and the greedy texts cannot be compared. Speed at 2 x 2K tokens: Marlin TP2 10.2-10.5K tok/s prefill, 23.5 ms TPOT; MegaMoE DP2/EP2 3.8-3.95K tok/s, 34.2-34.5 ms; portable 3.5K tok/s, 31-33 ms (not profiled; the leaf benchmark of 9.26 ties or wins, so the gap is outside the MoE leaf). MegaMoE allocates its worst-case row scratch (about 2.6 GB at 8192 tokens per rank) on every call, outside the KV planner's budget, so `--gpu-memory-utilization 0.93` ran out of memory where 0.86 works. Real MLA: Moonlight-16B-A3B (32 GB, downloaded to scratch) answers correctly on SM120 after the transformers-5 RoPE fix `e4fc05813`. Its greedy decode matches the forced portable MLA decode for 17-48 tokens, splitting only at near-ties, and TPOT is 2.3-3.2x better at 3K context x 8. No DSA, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box.
-- **Open:** (1) The one FP4 tie with b12x, dense gate_up M=256 (0.98x; bound by L2 -> SM traffic, section 9.15). (2) Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs: EP4 MegaMoE or TP4, which an older tree served on GPUs 0-3 on 2026-10-28); MegaMoE's per-call scratch outside the KV planner, and the DP2/EP2 serving gap of section 9.27. (3) The task 16-18 "still open" items (a multi-wave sparse MX indexer kernel, a dequantizing tile in the CuTe DSL V4 kernel, BF16 DSA/V4 above 42-48% of the tensor-pipe floor). A wheel release is optional, since the source build replaces the pin. **Closed since this list was first written:** the UE8M0 FP8 regression of the FP4-only cost-model refit (fixed by the joint refit `eff4cea`, status log 2026-11-05: UE8M0 FP8 is at parity with the FP32-scale kernel again); NVFP4 (done, `eb61610`, 2026-11-05); the NVIDIA MXFP4 `mm` leaf (TokenSpeed `deepgemm_sm120_mxfp4_linear`, with the PDL quantizer and weight scales packed at load: 1.23x geomean, 60 of 63 wins against FlashInfer quantize + `mm_fp4`; design 7.8 and 8).
+- **Open:** (1) The one FP4 tie with b12x, dense gate_up M=256 (0.98x; bound by L2 -> SM traffic, section 9.15; cluster tile sharing over DSMEM is slower, section 9.28). (2) Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs: EP4 MegaMoE or TP4, which an older tree served on GPUs 0-3 on 2026-10-28); MegaMoE's per-call scratch outside the KV planner, and the DP2/EP2 serving gap of section 9.27. (3) The task 16-18 "still open" items (a multi-wave sparse MX indexer kernel, a dequantizing tile in the CuTe DSL V4 kernel, BF16 DSA/V4 above 42-48% of the tensor-pipe floor). A wheel release is optional, since the source build replaces the pin. **Closed since this list was first written:** the UE8M0 FP8 regression of the FP4-only cost-model refit (fixed by the joint refit `eff4cea`, status log 2026-11-05: UE8M0 FP8 is at parity with the FP32-scale kernel again); NVFP4 (done, `eb61610`, 2026-11-05); the NVIDIA MXFP4 `mm` leaf (TokenSpeed `deepgemm_sm120_mxfp4_linear`, with the PDL quantizer and weight scales packed at load: 1.23x geomean, 60 of 63 wins against FlashInfer quantize + `mm_fp4`; design 7.8 and 8).
 
 ## 0. Environments
 
@@ -625,6 +626,7 @@ host still rejects them, so there is no silent wrong path):
 | 2026-11-09 | Mega MoE / gate / mHC on SM120 (task 21) | **done (MoE, one rank); gate, mHC, EP=2 open** | None of the three needs hardware SM120 lacks: TMEM, UMMA, 2-CTA MMA and symmetric memory are how SM100 fuses them. GPUs 6 and 7 do peer access (`PIX`, 54 GB/s, kernel peer loads OK). New W4A8 path in the SM120 1D1D kernel (`kind::mxf8f6f4 e4m3.e2m1`, E2M1 in bits [5:2] of a byte, probed): bitwise equal to the FP8 path on converted weights, 1.4e-6 vs FP32, 1.35-1.72x faster at decode/mid shapes. `fp8_fp4_mega_moe` runs on one SM120 rank as dispatch + two W4A8 grouped GEMMs + SwiGLU + combine with the SM100 arithmetic (0 / 1.8e-10 vs a PyTorch replay). PSUM scheduler rebuilt after the grid-dependency wait (24 B spill gone). Against Marlin W4A16 (cold, graph): 0.82x at 1 token, 0.97-0.99x at 4-64, 1.01-1.09x at 256-1024, 1.59-1.87x at 4096-8192. TokenSpeed keeps the leaf off SM120: its MegaMoE path needs EP > 1 and V4/V4.1 experts do not fit one GPU. Section 9.26. |
 | 2026-11-09 | Mega MoE at EP=2 over CUDA IPC, Triton MXFP4 fix (task 21 continued) | **done (EP=2, TokenSpeed leaf, IMA fix); 1-token gap, gate, mHC open** | `fp8_fp4_mega_moe` serves several SM120 ranks (`1a5c1cf`): push (peer stores of top-k lists, FP8 rows and scales), epoch barrier (system-scope release/acquire, trap after `DG_SM120_COMM_TIMEOUT_S`), dispatch over every rank's pairs, local W4A8 GEMMs, return (peer stores of the L2 rows), barrier, combine in top-k order. Bitwise equal to one rank over all experts, 0-2e-11 vs PyTorch, graph replay, PDL, ranks without tokens; peer *loads* were 100-300x slower (0.5 ms gather, 1 ms combine) and are not used. V4/V4.1 at EP2 against Marlin W4A16 + its collective at the same served tokens: 0.95-1.05x at 1-1024 tokens per rank, 1.28-1.39x at 2048-4096. TokenSpeed registers `deep_gemm_sm120_mxfp4_mega_moe_apply` for EP 2 (`695c15770`). Triton MXFP4 IMA at V4.1: 32-bit `expert_id * rows * cols` wrapped past expert 182/364 (`8afd973bc`). Section 9.26. |
 | 2026-11-09 | Real-weight checks (task 22) | **done (V4.1 real weights with 128 of 384 experts, Moonlight MLA); V4 and full models open** | V4 checkpoint not loadable (TokenSpeed has no `DeepseekV4ForCausalLM` since `0c1bc3ed3`). Real V4.1, 40 layers, first 128 experts (`num_checkpoint_experts`, TokenSpeed `6d6702bae`): DP2/EP2 picks `deep_gemm_sm120_mxfp4_mega_moe_apply`; the float32 reference gives the same single-layer error on every path (layer 0: 2.8%, layer 2: 3.7-3.9%); the paths differ by 0.7% at layer 0, amplified to about 50% by layer 39. Marlin TP2 is faster than MegaMoE DP2/EP2 end to end (prefill 10.3K vs 3.9K tok/s, TPOT 23.5 vs 34.4 ms; not profiled). MegaMoE scratch is outside the KV planner (OOM at util 0.93). Moonlight-16B MLA correct, TPOT 2.3-3.2x at 3K x 8; RoPE fix `e4fc05813`. Section 9.27. |
+| 2026-11-10 | Cluster tile sharing for the dense gate_up M=256 FP4 tie (task 23) | **closed, not won; nothing shipped** | Tie reproduced (GPU 7 idle, 3 runs: DeepGEMM 19.2 us, b12x 19.5-19.6 us, 1.02x). Built B-slice sharing across 2- and 4-CTA clusters in `sm120_fp8_fp4_gemm_1d1d` (`kClusterSize` template parameter, bitwise equal output, no spills) in two forms, push (bulk copy) and pull (`ld.shared::cluster`): 63.7 / 146 us (push, cluster 2 / 4) and 45.5 / 92 us (pull) against 20.0 us unshared. A DSMEM probe (`scripts/sm120_cluster_probe.cu`) shows why: pushes cap at 5 GB/s per CTA (bulk copy, `st.async` and plain stores alike), pulls at about 33 GB/s per CTA, a remote load takes 95 ns and a remote mbarrier round trip 440 ns, and the 3-stage pipeline cannot cover those hops. With the sharing hops removed (wrong data, cluster launch only) the kernel reaches 17.5-17.6 us, so the best case was 1.13x. Raster order does not apply (one wave). The kernel is unchanged; the variant is kept as `scripts/sm120_cluster_tile_sharing.patch`. Section 9.28. |
 
 ## 9.5 Sparse MQA logits SM120 port plan (in progress, 2026-11-05)
 
@@ -1893,3 +1895,69 @@ TokenSpeed `nctu6` from `ff9181366` (new: `e4fc05813` MLA RoPE fix, `6d6702bae` 
 **Closed directions.** Layer-subset V4.1 runs (FlatKV packing pinned to 40 layers); Marlin at DP2/EP2 (not a supported V4.1 layout); 192 experts on two GPUs (KV does not fit at util 0.86; MegaMoE scratch OOM at 0.93); greedy-text comparisons of the reduced-expert V4.1 model across paths (chaotic: compare single layers against the float reference instead).
 
 **Still open.** MegaMoE scratch outside the KV planner; the MegaMoE DP2/EP2 serving gap against Marlin TP2 (profile it); the CuTe DSL V4 prefill core not being picked in these runs; the full-model runs above; the `DataParallelController` error masking.
+
+## 9.28 Task 23: cluster tile sharing for the dense gate_up M=256 FP4 tie (2026-11-10)
+**Goal.** Win dense gate_up M=256 (N=4608, K=7168, MXFP4) over FlashInfer's b12x by at least 1.03x. Section 9.15 left it a tie
+bound by L2 -> SM tile traffic, with TMA multicast emulated (it traps), so this task tried the other way to read a tile once for
+several CTAs: thread-block clusters with distributed shared memory (DSMEM), which launch and run on SM120 (13.1 used 2- and 4-CTA
+clusters).
+**Reproduction.** `scripts/sm120_fp4_vs_flashinfer.py --only "dense gate_up" --ms 256` (CUDA graph over 512 MB of weight copies, PDL
+on both sides, interleaved best-of-5), GPU 7 idle, three processes: b12x 19.6 / 19.6 / 19.5 us, DeepGEMM 19.2 / 19.2 / 19.2 us (1.02x;
+the 63-point sweep of 9.15 had it at 0.979x, both inside run noise). DeepGEMM layout: tile 64x128 (2 x 4 warps of 32x32, 8 math
+warps), 4 x 36 = 144 CTAs (77% of 188 SMs, so the late PDL trigger), 28 K blocks of 128-byte rows (A 8 KB + B 16 KB + scales per
+stage), 3 stages in 78.6 KB. 144 CTAs x 28 blocks x 24 KB = 99 MB of tile traffic, of which B is 66 MB (16.5 MB read by each of the 4
+M blocks) and A 33 MB.
+**(c) Raster / swizzle: does not apply.** The scheduler already maps `blockIdx` to `m = i % 4`, `n = i / 4` (groups of 8 or 16 along
+the primary axis). With one tile per CTA all 144 tiles are resident at once, the unique data (17.4 MB) is L2-resident, and order
+changes neither the L2 -> SM bytes nor the DRAM bytes. Raster only matters with more than one wave.
+**DSMEM probe** (`scripts/sm120_cluster_probe.cu`, standalone, clocks warmed up, 2.37 GHz):
+| measurement | result |
+|---|---|
+| push 4 KB, `cp.async.bulk.shared::cluster.shared::cta` + mbarrier | 5.0 GB/s per CTA; the issuing thread is blocked 1.5K cycles (650 ns) per 4 KB |
+| push via `st.async` (v4) from a warp | 5.0 GB/s |
+| push via plain `st.shared::cluster.v4` + one release arrive | 5.0-5.1 GB/s |
+| 1, 2 and 3 warps pushing at once; 1 KB to 16 KB per push | the same 5 GB/s per CTA in total (the time grows with the bytes) |
+| 144 CTAs (36 clusters of 4) pushing to a ring neighbour | 4.7 GB/s per CTA, 0.68 TB/s aggregate |
+| pull: `ld.shared::cluster.v4` of a peer's 4 KB (8 loads in flight per lane) | 25-27 GB/s with one warp, 32.7 GB/s with 2 or 3 warps; 4.7 TB/s aggregate over 144 CTAs |
+| dependent remote load | 225 cycles (95 ns) |
+| remote mbarrier arrive + wait, ping-pong between two CTAs | 1050 cycles (440 ns) per round trip, about 220 ns one way |
+| max active clusters (65.6 KB of smem) | 94 of 2, 46 of 4, 22 of 8 (so a 36-cluster grid is one wave) |
+The kernel needs about 45 GB/s of B and A per CTA to hold its present speed (24.6 KB per 1300 cycles), so a push path at 5 GB/s
+cannot carry even the half of B that cluster 2 would forward (8 KB per block, about 17 GB/s), and a pull path would run at about half
+of its 33 GB/s cap with 16 KB of loads in flight, which the 40-register TMA warps cannot hold.
+**Kernel variants** (`sm120_fp8_fp4_gemm_1d1d_impl`, `kClusterSize` in {1, 2, 4}, host rule and `DG_SM120_CLUSTER` override; the CTAs of
+a cluster take consecutive M blocks of one N block, which the scheduler already makes consecutive `blockIdx`; each loads a
+`BLOCK_N / kClusterSize`-row slice of B with its own TMA box and the peers supply the rest; the empty barriers become cluster-wide,
+every math warp arrives on every CTA's barrier with `mbarrier.arrive.release.cluster`, and the producer waits with acquire
+semantics at cluster scope; barrier init and exit are cluster-synchronized):
+- *Push.* A forwarder warp waits for its slice to land and copies it into each peer's stage with a bulk copy that completes a
+  transaction on the peer's full barrier.
+- *Pull.* A notifier warp arrives on the peers' `peer_ready` barrier once its slice has landed; two puller warps then copy the peers'
+  slices with `ld.shared::cluster` into the same offset of their own stage and arrive on the full barrier (count 1 + 2).
+Both are bitwise equal to the unshared kernel and have no spills (`DG_JIT_CHECK_NO_SPILLS=1`).
+**Timing** (`tmp/cl.py` style harness: m=256, graph over 512 MB of weights, PDL, interleaved best of 5, GPU 7; unshared = 20.0 us):
+| shape (m=256) | unshared | push, cluster 2 / 4 | pull, cluster 2 / 4 |
+|---|---|---|---|
+| N=4608, K=7168 (the tie) | 19.97 | 63.7 / 146.4 | 45.5 / 92.4 |
+| N=1152, K=7168 | 10.22 | 51.4 / 108.7 | |
+| N=4608, K=1536 | 6.42 | 16.6 / 33.2 | |
+| N=256, K=7168 | 4.61 | 20.2 / 29.1 | |
+The loss is a fixed cost per K block (push 1.6 us at cluster 2 and 4.5 at cluster 4; pull 0.9 and 2.6 us), the same with 36 CTAs
+(N=1152) as with 144, so it is latency in the pipeline, not bandwidth contention.
+**Ceiling.** With the forwarding removed (each CTA loads only its slice and uses the stale rest: wrong results, but the same
+cluster launch and traffic) the kernel takes 17.62 us at cluster 2 and 17.52 us at cluster 4 against 19.99 us: sharing B cannot give
+more than 1.13-1.14x, and cluster 4 is no better than 2 (A traffic and latency then limit). Reaching 1.03x over b12x would need
+nearly all of that ceiling, i.e. a sharing path that adds almost no latency to the stage chain.
+**Why it cannot pay.** The mainloop is a latency-bandwidth product: 3 stages of 24.6 KB (73.8 KB) in flight over a 1.65 us chain per
+stage is the 45 GB/s per CTA above. Sharing removes L2 traffic (the ceiling run shows the chain shrinking by 12%) but adds hops to
+that chain: the slice's TMA must land, a notify crosses the cluster (220 ns), the peer pulls (95 ns latency per round plus the
+copy) and re-signals, before the math warps may start. At 3 stages every extra 0.1 us of chain costs 0.03 us per K block; the
+measured per-block cost implies a chain longer by about 2.7 us (pull) to 4.7 us (push) at cluster 2, which is 0.9-1.6 us per block. More stages are impossible (99 KB of smem), and
+the copy is a 5 GB/s (push) or 33 GB/s (pull) pipe, not the SM-to-SM network of a data-center part.
+**Not shipped.** The kernel, host code and heuristic are as in `c0d46c6` (no `kClusterSize`), so the 63-point sweep, the NVFP4 sweep,
+the determinism and `tests/test_fp8_fp4.py` results of 9.15 and 9.25 stand. The pull variant is kept as
+`scripts/sm120_cluster_tile_sharing.patch` (applies to `c0d46c6`; `DG_SM120_CLUSTER=2` or `4` selects it) together with the probe.
+**Closed directions (task 23).** B-slice sharing across 2- or 4-CTA clusters over DSMEM, by push (bulk copy, `st.async`, plain
+stores) or pull (`ld.shared::cluster`); a raster order for L2 reuse in the single-wave case. Don't retry without a change in the
+hardware's DSMEM write rate (about 5 GB/s per CTA) and remote-hop latency (95-220 ns), or more than about 8 stages in flight. TMA
+multicast (software-emulated, traps) stays closed from 9.15. **Still open:** nothing new for this shape; it remains a 1.00-1.02x tie.
