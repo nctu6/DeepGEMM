@@ -2,8 +2,7 @@
 
 Long form: [`deepgemm-sm120-design.md`](deepgemm-sm120-design.md) (designs, bugs, every table; the
 section numbers below like "design 7.8" point there). Status log, dead ends and per-task
-measurements: [`deepgemm-analysis.md`](deepgemm-analysis.md) ("analysis 9.x"). One-page summary for
-managers: [`WEEKLY_REPORT.md`](WEEKLY_REPORT.md).
+measurements: [`deepgemm-analysis.md`](deepgemm-analysis.md) ("analysis 9.x").
 
 ## 1. Purpose and status
 
