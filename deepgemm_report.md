@@ -80,11 +80,12 @@ kernel fits without a redesign (design section 2). Details of each item: design 
 
 ## 5. Verification
 
-Latest run 2026-11-09 (task 18). The DeepGEMM surface was rerun 2026-11-08 (task 15); `test_einsum` again 2026-11-09.
-- TokenSpeed kernel suite: 7769 passed, 2770 skipped, 0 failed (GPU 7).
-- TokenSpeed runtime suite, 0 failed in every directory: cache 137, distributed 638, entrypoints 40, execution 195, layers 370, models 565, moe 72, sampling 144, diffusion 53, top-level files 6782.
-- DeepGEMM (`DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache): `test_fp8_fp4` (6 functions), `test_bf16` (7), `test_einsum` (8), `test_layout` (3), `test_hyperconnection` (1), `test_attention` (2; 159 SM120 cases with the MX formats) pass; `sm120_mqa_check.py` 46 cases, `sm120_blockscale_check.py --mode all --grouped` 170 cases, `sm120_paged_mqa_blockscale_check.py` 51 cases; `test_lazy_init` on GPUs 6 and 7 (3 tests).
-- compute-sanitizer (memcheck, synccheck): 0 errors on 22 test functions and a 16-case k-grouped FP8 run.
+Latest run 2026-11-09 (task 20), DeepGEMM `fefe6a1` and TokenSpeed `c6cbc9b4b`.
+- TokenSpeed kernel suite: 7770 passed, 2770 skipped, 0 failed (GPU 7).
+- TokenSpeed runtime suite, 0 failed in every directory (8997 passed): cache 137, diffusion 53, distributed 638, entrypoints 40, execution 195, layers 370, models 565, moe 72, sampling 144, top-level files 6783.
+- DeepGEMM (`DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache, GPU 7): `test_fp8_fp4`, `test_bf16`, `test_einsum`, `test_layout` (one skip: packed k-grouped scales are SM100 only), `test_hyperconnection` and `test_attention` exit 0; `sm120_mqa_check.py` 46 cases, `sm120_blockscale_check.py --mode all --grouped` 170 cases and `sm120_paged_mqa_blockscale_check.py` 51 cases all OK; `test_lazy_init` on GPUs 6 and 7 (3 tests) OK.
+- The DeepGEMM source at the pinned commit builds like `install.sh` (`pip wheel`, nothing installed) and `test_deepgemm_sm120_gating.py` passes against it (11 passed).
+- compute-sanitizer (memcheck, synccheck): 0 errors on 22 test functions and a 16-case k-grouped FP8 run (task 15; not rerun in task 20).
 - End to end, greedy, in-process, all correct ("Paris", "2, 3, 5, 7, 11"): Qwen3.6-35B-A3B, Qwen3.5-122B-A10B-NVFP4 (TP2), Qwen3.8-27B-NVFP4, gemma-4-31B-it.
 - Environment-only failures: `test_locality_domain` (MLOPart), `test_mega_moe` (NVLink), the sanitizer's `test_legacy` entry (no triton in the venv).
 

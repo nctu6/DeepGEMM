@@ -1,12 +1,12 @@
-# SM120 work: weekly report (tasks 1-18, through 2026-11-09)
+# SM120 work: weekly report (tasks 1-20, through 2026-11-09)
 
 ## Goal and status
 
 Goal: DeepGEMM fully supports SM120 (RTX PRO 6000 Blackwell), it beats the Triton / FlashInfer
-fallbacks, and TokenSpeed has no SM120 issues. Status: tasks 1-18 are done. Every kernel suite
+fallbacks, and TokenSpeed has no SM120 issues. Status: tasks 1-20 are done (20 is the final verification). Every kernel suite
 passes, four models give correct end-to-end output, and each op below runs faster than its
-fallback except a few ties noted under open items. All commits are local on branch `nctu6` in
-DeepGEMM and TokenSpeed; nothing is pushed.
+fallback except a few ties noted under open items. Commits through DeepGEMM `0301a69` and TokenSpeed
+`8229f4181` (tasks 1-15) are pushed; those of tasks 16-20 are local on branch `nctu6` in both repos.
 
 ## Highlights
 
@@ -41,8 +41,8 @@ DeepGEMM and TokenSpeed; nothing is pushed.
 
 ## Verification
 
-- TokenSpeed kernel suite 7769 passed, 2770 skipped, 0 failed; runtime suite 0 failed in every directory.
-- DeepGEMM SM120 tests pass with the register-spill check on and a fresh JIT cache; compute-sanitizer reports 0 errors on 22 test functions.
+- Final run (task 20, DeepGEMM `fefe6a1`, TokenSpeed `c6cbc9b4b`): TokenSpeed kernel suite 7770 passed, 2770 skipped, 0 failed; runtime suite 8997 passed, 0 failed in all 10 directories.
+- DeepGEMM SM120 tests (6 test files, 46 + 170 + 51 check cases, `test_lazy_init`) pass with the register-spill check on and a fresh JIT cache; the source at the pinned commit builds like `install.sh` and passes the TokenSpeed gating tests; compute-sanitizer reported 0 errors on 22 test functions (task 15).
 - Correct greedy output end to end on Qwen3.6-35B-A3B, Qwen3.5-122B-A10B-NVFP4 (TP2), Qwen3.8-27B-NVFP4 and gemma-4-31B-it.
 
 ## Open items
@@ -51,6 +51,6 @@ DeepGEMM and TokenSpeed; nothing is pushed.
 - No real-checkpoint runs for V3.2 TP8 (needs 8 GPUs) or V4.1 (ran with dummy weights).
 - Further attention headroom: BF16 DSA / V4 at 42-48% of the tensor-pipe floor, V4 at 16 heads, a multi-wave sparse indexer kernel.
 - One test failure seen once and never reproduced (`test_deepseek_v41_model[eager]`); three heavy tests are too slow to finish under compute-sanitizer.
-- Pushing the local commits and bumping the TokenSpeed `DeepGEMM` pin.
+- Pushing the local commits (the TokenSpeed `DeepGEMM` pin already points at the last DeepGEMM commit).
 
 Details: [`deepgemm_report.md`](deepgemm_report.md), [`deepgemm-sm120-design.md`](deepgemm-sm120-design.md), [`deepgemm-analysis.md`](deepgemm-analysis.md).
