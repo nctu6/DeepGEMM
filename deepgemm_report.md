@@ -9,11 +9,11 @@ measurements: [`deepgemm-analysis.md`](deepgemm-analysis.md) ("analysis 9.x").
 Upstream DeepGEMM only runs on Hopper and datacenter Blackwell (`wgmma`, `tcgen05`/TMEM). This work
 adds SM120 (compute capability 12.0, consumer and workstation Blackwell) with new kernels built on
 TMA, mbarrier pipelines and `mma.sync`, plus arch-12 host paths, so TokenSpeed can serve
-DeepSeek-style models on RTX PRO 6000. Tasks 1-26 and 29-31 are done: the GEMMs, the indexer kernels and the
+DeepSeek-style models on RTX PRO 6000. Tasks 1-26 and 29-33 are done: the GEMMs, the indexer kernels and the
 TokenSpeed attention leaves run on SM120 and beat the Triton / FlashInfer fallbacks everywhere
-except a few ties and losses listed below. Tasks 1-26 are pushed to `origin/nctu6` in both
-repos (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit); task 29's commits are local
-(DeepGEMM `343d194`, TokenSpeed `d4d972fe0`..`b9de919e5`, the pin is not bumped yet).
+except a few ties and losses listed below. Tasks 1-28 are pushed to `origin/nctu6` in both
+repos (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit); the commits of tasks 29-33
+are local and not pushed (DeepGEMM `343d194` code and docs commits, TokenSpeed `d4d972fe0` onward, the pin follows the DeepGEMM head).
 
 ## 2. What is supported on SM120
 
@@ -92,11 +92,11 @@ kernel fits without a redesign (design section 2). Details of each item: design 
 
 ## 5. Verification
 
-Latest run 2026-11-10 (task 26, analysis 9.32), DeepGEMM code head `b6247c2` and TokenSpeed `0d2f40c5b` (pin `b6247c2`); the commits after them are docs only, and task 27 added only docs and the pin bump to the docs head.
-- TokenSpeed kernel suite: 7898 passed, 2770 skipped, 0 failed (GPU 7).
-- TokenSpeed runtime suite, 0 failed in every directory (9003 passed): cache 137, diffusion 53, distributed 638, entrypoints 40, execution 195, layers 370, models 567, moe 72, sampling 144, top-level files 6787.
-- DeepGEMM (`DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache, GPU 7): `test_fp8_fp4`, `test_bf16`, `test_einsum`, `test_layout` (one skip: packed k-grouped scales are SM100 only), `test_hyperconnection`, `test_attention` and `test_mega_moe_sm120` exit 0; `test_mega_moe_sm120_ep.py` (2 ranks, GPUs 6+7) is bitwise equal to one rank; `sm120_mqa_check.py` 46 cases, `sm120_blockscale_check.py --mode all --grouped` 170 cases and `sm120_paged_mqa_blockscale_check.py` 51 cases all OK; `test_lazy_init` on GPUs 6 and 7 (3 tests) OK.
-- The DeepGEMM source at the pinned commit builds like `install.sh` (`pip wheel`, nothing installed) and `test_deepgemm_sm120_gating.py` passes against it (11 passed).
+Latest run 2026-11-10 (task 33, analysis 9.37), DeepGEMM code head `343d194` (docs-only commits after it) and TokenSpeed `05937a09b` (pin on the final DeepGEMM head in the commit after it). Earlier run: task 26, analysis 9.32.
+- TokenSpeed kernel suite: 7952 passed, 2764 skipped, 0 failed (GPU 7, `PATH` with `/usr/local/cuda/bin`; `test_numerics.py` + `test_triton_adapter.py` 24 passed). With two GPUs visible, `nvidia/ops/communication` 155 passed (including `test_projection_tp[tp2]`, fixed in task 33) and `test_mega_moe_sm120_token_layouts.py` (2 ranks) passes.
+- TokenSpeed runtime suite, 0 failed in every directory (9007 passed): cache 137, diffusion 53, distributed 638, entrypoints 40, execution 195, layers 374, models 567, moe 72, sampling 144, top-level files 6787.
+- DeepGEMM (`DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache, GPUs 6 and 7): `test_fp8_fp4`, `test_bf16`, `test_einsum`, `test_layout`, `test_hyperconnection`, `test_attention` and `test_mega_moe_sm120` (with `test_scratch_is_sized_once`) exit 0; `test_mega_moe_sm120_ep.py` (2 ranks, GPUs 6+7) is bitwise equal to one rank; `sm120_mqa_check.py`, `sm120_blockscale_check.py --mode all --grouped` (170 cases) and `sm120_paged_mqa_blockscale_check.py` (51 cases) all OK; `test_lazy_init --num-processes 2` (3 tests) OK.
+- The DeepGEMM source at the pinned commit builds like `install.sh` (`pip wheel`, nothing installed) and `test_deepgemm_sm120_gating.py` passes against it (11 passed; task 26 run, not repeated in task 33 beyond the kernel suite, which includes the gating test against the local build).
 - compute-sanitizer (memcheck, synccheck): 0 errors on 22 test functions and a 16-case k-grouped FP8 run (task 15; not rerun in task 20).
 - End to end, greedy, in-process, all correct ("Paris", "2, 3, 5, 7, 11"): Qwen3.6-35B-A3B, Qwen3.5-122B-A10B-NVFP4 (TP2), Qwen3.8-27B-NVFP4, gemma-4-31B-it.
 - Real weights (task 22, analysis 9.27): V4.1 checkpoint on GPUs 6+7 with its first 128 experts. MegaMoE DP2/EP2 (`deep_gemm_sm120_mxfp4_mega_moe_apply` selected), Marlin TP2 and forced portable TP2 all have the same single-layer error against a float32 reference (layers 0 and 2). Moonlight-16B MLA answers correctly; its greedy decode matches the portable path up to near-ties, and two SM120 runs are bit-identical. New TokenSpeed tests: the V4.1 expert-subset loader and DeepSeek-V3 plain-RoPE configs (`e4fc05813`, `6d6702bae`). The V4 checkpoint does not load (TokenSpeed has no V4 model class since upstream `0c1bc3ed3`).
@@ -134,7 +134,7 @@ the installed build reports SM120 kernels (`deep_gemm.get_supported_arch_majors(
 - Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs). Done in task 22: real V4.1 with 128 experts on two GPUs, and real MLA on Moonlight-16B. V4 cannot load (no TokenSpeed model class). No V3.2, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box (analysis 9.27).
 - Three heavy tests (FP8 k-grouped, FP8 masked, `test_mqa_logits`) do not finish under compute-sanitizer in 15-40 min; no error before the limit.
 - `test_deepseek_v41_model[eager]` failed once in three full runs during task 14 and never reproduced. Task 25 (analysis 9.31) closed it as not reproducible: sanitizers (memcheck, racecheck, initcheck, synccheck) clean, poisoned allocations and stream delays change no bit, about 1400 eager runs and 46 whole-file runs pass; the original failure text is lost, so a recurrence needs its output kept.
-- Everything is pushed to `origin/nctu6` (task 27). TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107, so upstreaming needs that scope to change.
+- Tasks 1-28 are pushed to `origin/nctu6`; tasks 29-33 are local until the user pushes. `test_projection_tp` runs only tp2 here (tp4 / tp8 need 4 and 8 NVLink GPUs). TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107, so upstreaming needs that scope to change.
 
 ## 8. Where to read more
 
