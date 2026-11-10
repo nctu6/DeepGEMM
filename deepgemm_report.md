@@ -11,9 +11,9 @@ adds SM120 (compute capability 12.0, consumer and workstation Blackwell) with ne
 TMA, mbarrier pipelines and `mma.sync`, plus arch-12 host paths, so TokenSpeed can serve
 DeepSeek-style models on RTX PRO 6000. Tasks 1-26 and 29-33 are done: the GEMMs, the indexer kernels and the
 TokenSpeed attention leaves run on SM120 and beat the Triton / FlashInfer fallbacks everywhere
-except a few ties and losses listed below. Tasks 1-28 are pushed to `origin/nctu6` in both
-repos (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit); the commits of tasks 29-33
-are local and not pushed (DeepGEMM `343d194` code and docs commits, TokenSpeed `d4d972fe0` onward, the pin follows the DeepGEMM head).
+except a few ties and losses listed below. Tasks 1-33 are pushed to `origin/nctu6` in both
+repos (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit); use
+`git log origin/nctu6` for the exact heads.
 
 ## 2. What is supported on SM120
 
@@ -134,7 +134,7 @@ the installed build reports SM120 kernels (`deep_gemm.get_supported_arch_majors(
 - Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs). Done in task 22: real V4.1 with 128 experts on two GPUs, and real MLA on Moonlight-16B. V4 cannot load (no TokenSpeed model class). No V3.2, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box (analysis 9.27).
 - Three heavy tests (FP8 k-grouped, FP8 masked, `test_mqa_logits`) do not finish under compute-sanitizer in 15-40 min; no error before the limit.
 - `test_deepseek_v41_model[eager]` failed once in three full runs during task 14 and never reproduced. Task 25 (analysis 9.31) closed it as not reproducible: sanitizers (memcheck, racecheck, initcheck, synccheck) clean, poisoned allocations and stream delays change no bit, about 1400 eager runs and 46 whole-file runs pass; the original failure text is lost, so a recurrence needs its output kept.
-- Tasks 1-28 are pushed to `origin/nctu6`; tasks 29-33 are local until the user pushes. `test_projection_tp` runs only tp2 here (tp4 / tp8 need 4 and 8 NVLink GPUs). TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107, so upstreaming needs that scope to change.
+- Tasks 1-33 are pushed to `origin/nctu6` in both repos. `test_projection_tp` runs only tp2 here (tp4 / tp8 need 4 and 8 NVLink GPUs). TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107, so upstreaming needs that scope to change.
 
 ## 8. Where to read more
 
