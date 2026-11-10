@@ -88,10 +88,10 @@ kernel fits without a redesign (design section 2). Details of each item: design 
 
 ## 5. Verification
 
-Latest run 2026-11-09 (task 20), DeepGEMM `fefe6a1` and TokenSpeed `c6cbc9b4b`.
-- TokenSpeed kernel suite: 7770 passed, 2770 skipped, 0 failed (GPU 7).
-- TokenSpeed runtime suite, 0 failed in every directory (8997 passed): cache 137, diffusion 53, distributed 638, entrypoints 40, execution 195, layers 370, models 565, moe 72, sampling 144, top-level files 6783.
-- DeepGEMM (`DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache, GPU 7): `test_fp8_fp4`, `test_bf16`, `test_einsum`, `test_layout` (one skip: packed k-grouped scales are SM100 only), `test_hyperconnection` and `test_attention` exit 0; `sm120_mqa_check.py` 46 cases, `sm120_blockscale_check.py --mode all --grouped` 170 cases and `sm120_paged_mqa_blockscale_check.py` 51 cases all OK; `test_lazy_init` on GPUs 6 and 7 (3 tests) OK.
+Latest run 2026-11-10 (task 26), DeepGEMM `b6247c2` and TokenSpeed `0d2f40c5b`.
+- TokenSpeed kernel suite: 7898 passed, 2770 skipped, 0 failed (GPU 7).
+- TokenSpeed runtime suite, 0 failed in every directory (9003 passed): cache 137, diffusion 53, distributed 638, entrypoints 40, execution 195, layers 370, models 567, moe 72, sampling 144, top-level files 6787.
+- DeepGEMM (`DG_JIT_CHECK_NO_SPILLS=1`, fresh JIT cache, GPU 7): `test_fp8_fp4`, `test_bf16`, `test_einsum`, `test_layout` (one skip: packed k-grouped scales are SM100 only), `test_hyperconnection`, `test_attention` and `test_mega_moe_sm120` exit 0; `test_mega_moe_sm120_ep.py` (2 ranks, GPUs 6+7) is bitwise equal to one rank; `sm120_mqa_check.py` 46 cases, `sm120_blockscale_check.py --mode all --grouped` 170 cases and `sm120_paged_mqa_blockscale_check.py` 51 cases all OK; `test_lazy_init` on GPUs 6 and 7 (3 tests) OK.
 - The DeepGEMM source at the pinned commit builds like `install.sh` (`pip wheel`, nothing installed) and `test_deepgemm_sm120_gating.py` passes against it (11 passed).
 - compute-sanitizer (memcheck, synccheck): 0 errors on 22 test functions and a 16-case k-grouped FP8 run (task 15; not rerun in task 20).
 - End to end, greedy, in-process, all correct ("Paris", "2, 3, 5, 7, 11"): Qwen3.6-35B-A3B, Qwen3.5-122B-A10B-NVFP4 (TP2), Qwen3.8-27B-NVFP4, gemma-4-31B-it.
