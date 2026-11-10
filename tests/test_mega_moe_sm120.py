@@ -118,6 +118,48 @@ def test(args):
         buffer.destroy()
 
 
+def test_scratch_is_sized_once(args):
+    # With one rank the rows follow the call's tokens. A serving warmup counts up, and each size used to grow the
+    # persistent scratch and keep every predecessor alive. The first call now takes the capacity of the worst routing of
+    # `num_max_tokens`, and no later call (any size, any tile height) takes more
+    hidden, intermediate, num_experts, num_topk = args.hidden, args.intermediate_hidden, args.num_experts, args.num_topk
+    max_tokens = 2048
+    group = dist.group.WORLD
+    buffer = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, max_tokens, num_topk, hidden, intermediate,
+                                                    mma_type='fp8xfp4')
+    weights = []
+    for n, k in ((intermediate * 2, hidden), (hidden, intermediate)):
+        w = torch.randn((num_experts, n, k), dtype=torch.bfloat16, device='cuda')
+        data = torch.empty((num_experts, n, k // 2), dtype=torch.int8, device='cuda')
+        sf = torch.empty((num_experts, n, k // 32), dtype=torch.float, device='cuda')
+        for i in range(num_experts):
+            data[i], sf[i] = per_token_cast_to_fp4(w[i], use_ue8m0=True, gran_k=32)
+        weights.append((data, deep_gemm.transform_sf_into_required_layout(sf, n, k, (1, 32), num_experts)))
+    t_l1, t_l2 = deep_gemm.transform_weights_for_mega_moe(*weights)
+
+    def run(num_tokens):
+        x_fp8, x_sf = per_token_cast_to_fp8(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda'),
+                                            use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        topk_idx = torch.stack([torch.randperm(num_experts, device='cuda')[:num_topk] for _ in range(num_tokens)])
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens].copy_(x_sf)
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].fill_(1.0 / num_topk)
+        y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        deep_gemm.fp8_fp4_mega_moe(y, t_l1, t_l2, buffer, activation_clamp=args.activation_clamp, fast_math=False)
+        torch.cuda.synchronize()
+
+    run(1)
+    torch.cuda.empty_cache()
+    allocated = torch.cuda.memory_allocated()
+    for num_tokens in (7, 64, 300, 1000, max_tokens):
+        run(num_tokens)
+        torch.cuda.empty_cache()
+        assert torch.cuda.memory_allocated() - allocated < (1 << 20), f'{num_tokens=} grew the mega MoE scratch'
+    buffer.destroy()
+    print(' > the mega MoE scratch is sized by the first call', flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='SM120 mega MoE (one rank)')
     parser.add_argument('--num-tokens', type=int, nargs='+', default=[1, 7, 64, 300])
@@ -128,4 +170,6 @@ if __name__ == '__main__':
     parser.add_argument('--activation-clamp', type=float, default=10.0)
     parser.add_argument('--masked-ratio', type=float, default=0.1)
     parser.add_argument('--max-reference-tokens', type=int, default=512)
-    test(parser.parse_args())
+    args = parser.parse_args()
+    test(args)
+    test_scratch_is_sized_once(args)

@@ -214,13 +214,17 @@ static void sm120_mega_moe_grouped_gemm(const torch::Tensor& a, const torch::Ten
 // warmup, which runs the largest batch before the planner sizes the KV cache) allocates it, later calls reuse it, and a
 // larger call grows it. Calls on one device are ordered on one stream (the barrier epoch needs that anyway), so the
 // rows of consecutive calls may share memory. A grown buffer keeps its predecessor alive for graphs captured earlier.
+// A call asks for the capacity of its worst routing (`num_max_tokens_per_rank` tokens, every pair on the local experts,
+// the tallest tile), not for its own rows: with one rank the rows follow the call's tokens, and a warmup that
+// counts up would otherwise grow the buffer at every size and keep every predecessor alive
 // Growing while a graph is being captured would hand the graph's private
 // pool to a static owner, so that is an error
 struct SM120MegaMoEScratch {
     torch::Tensor pair_rows, row_pair, total_rows, psum_layout, row_weights;
     torch::Tensor l1_acts, l1_acts_sf, l1_out, l2_acts, l2_acts_sf, l2_out;
 
-    static SM120MegaMoEScratch get(const torch::Device& device, const int64_t& num_pair_slots, const int64_t& num_rows,
+    static SM120MegaMoEScratch get(const torch::Device& device, const int64_t& capacity_pair_slots, const int64_t& capacity_rows,
+                                   const int64_t& num_pair_slots, const int64_t& num_rows,
                                    const int64_t& num_local_experts, const int64_t& sf_stride, const int64_t& hidden,
                                    const int64_t& intermediate_hidden) {
         static std::mutex mutex;
@@ -237,7 +241,8 @@ struct SM120MegaMoEScratch {
                 return torch::Tensor();
             return base.narrow(0, begin, bytes).view(dtype).view(sizes);
         };
-        const auto carve_all = [&](const torch::Tensor& base, int64_t& offset) {
+        const auto carve_all = [&](const torch::Tensor& base, int64_t& offset, const int64_t& num_pair_slots,
+                                   const int64_t& num_rows, const int64_t& sf_stride) {
             SM120MegaMoEScratch s;
             const auto make_sf = [&](const int64_t& k) {
                 return carve(base, offset, {k / 128, sf_stride}, torch::kInt);
@@ -261,7 +266,7 @@ struct SM120MegaMoEScratch {
         };
 
         int64_t needed = 0;
-        carve_all(torch::Tensor(), needed);
+        carve_all(torch::Tensor(), needed, capacity_pair_slots, capacity_rows, align<int64_t>(capacity_rows, 4));
         std::lock_guard<std::mutex> lock(mutex);
         auto& base = buffers[device.index()];
         if (not base.defined() or base.nbytes() < static_cast<size_t>(needed)) {
@@ -273,7 +278,7 @@ struct SM120MegaMoEScratch {
             base = torch::empty({needed}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
         }
         int64_t offset = 0;
-        return carve_all(base, offset);
+        return carve_all(base, offset, num_pair_slots, num_rows, sf_stride);
     }
 };
 
@@ -315,8 +320,12 @@ static void sm120_fp8_fp4_mega_moe(const torch::Tensor& y, const torch::Tensor& 
     const auto options = y.options();
     const int pair_stride = (is_multi_rank ? num_max_tokens_per_rank : num_tokens) * num_topk;
     // Row scratch is one persistent allocation per device, grown to the largest call and kept (see `SM120MegaMoEScratch`)
+    const int64_t capacity_pairs = static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * std::min(num_topk, num_local_experts);
+    const int64_t capacity_rows = SM120MegaMoESymLayout::max_num_rows(capacity_pairs, num_local_experts,
+                                                                      std::max<int>(SM120MegaMoESymLayout::kMaxBlockM, forced_block_m));
     const auto scratch = SM120MegaMoEScratch::get(
-        y.device(), std::max<int64_t>(1, static_cast<int64_t>(num_ranks) * pair_stride), num_rows, num_local_experts, sf_stride,
+        y.device(), std::max<int64_t>(1, static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * num_topk), capacity_rows,
+        std::max<int64_t>(1, static_cast<int64_t>(num_ranks) * pair_stride), num_rows, num_local_experts, sf_stride,
         hidden, intermediate_hidden);
     const auto& pair_rows_tensor = scratch.pair_rows;
     void* pair_rows = pair_rows_tensor.data_ptr();
