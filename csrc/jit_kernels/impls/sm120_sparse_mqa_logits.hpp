@@ -37,17 +37,13 @@ static void launch_sm120_sparse_mqa_logits(const bool is_paged, const int sparse
     const auto tensor_map_weights = make_tma_2d_desc(weights, align<int>(num_heads, 8), num_q_tokens, align<int>(num_heads, 8), kBlockQ,
                                                      static_cast<int>(weights.stride(0)), 0);
 
-    // Shared memory, matching the kernel's layout
-    const int num_kv_blocks_per_split = split_kv / sparse_block_kv;
-    int smem = kBlockQ * num_heads * row_bytes;                 // Q
-    smem += split_kv * row_bytes;                               // KV
-    smem += align<int>(kBlockQ * num_heads * 4, 128);           // SF-Q (128-aligned TMA dest)
-    smem += align<int>(split_kv * 4, 128);                      // SF-KV
-    smem += align<int>(static_cast<int>(kBlockQ) * align<int>(num_heads, 8) * 2, 16); // weights
-    smem += num_kv_blocks_per_split * static_cast<int>(sizeof(KVBlockInfo));
-    smem += align<int>(static_cast<int>(sizeof(KVSplitHeader)), 16);
-    smem += 16;                                                 // one barrier (16B aligned)
-    smem = align(smem, 1024);
+    // Shared memory: two KV buffers, so the gather of the next split overlaps the MMAs of this one, when they fit (the
+    // FP8 tile does not), else one
+    const auto get_smem = [&](const int num_stages) {
+        return static_cast<int>(Sm120SparseSmem(num_heads, sparse_block_kv, split_kv, num_stages, row_bytes).total_bytes);
+    };
+    const int num_stages = get_smem(2) <= jit->device.get_num_smem_bytes() ? 2 : 1;
+    const int smem = get_smem(num_stages);
     DG_HOST_ASSERT(smem <= jit->device.get_num_smem_bytes());
 
     const auto qk_dtype_name = is_fp4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t";
@@ -63,17 +59,20 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {}, {}
     >);
 }};
-)", num_heads, sparse_block_kv, split_kv, num_sms, is_fp4 ? "true" : "false", is_paged ? "true" : "false"));
+)", num_heads, sparse_block_kv, split_kv, num_stages, is_fp4 ? "true" : "false", is_paged ? "true" : "false"));
 
     const uint32_t page_stride_bytes = is_paged ? static_cast<uint32_t>(fused_kv_cache.stride(0)) : 0;
     const uint32_t page_kv = is_paged ? static_cast<uint32_t>(fused_kv_cache.size(1)) : 0;
     const uint32_t num_kv_tokens = is_paged ? 0 : static_cast<uint32_t>(kv.size(0));
+    // The kernel splits a physical block index into page and block by shifts
+    DG_HOST_ASSERT(not is_paged or (page_kv % sparse_block_kv == 0 and
+                   ((page_kv / sparse_block_kv) & (page_kv / sparse_block_kv - 1)) == 0));
 
     jit->launch(
         kernel, {
             .num_smem_bytes = smem,
             .grid_dim = dim3(num_sms, 1, 1),
-            .block_dim = dim3(256, 1, 1),
+            .block_dim = dim3(512, 1, 1),
         },
         static_cast<uint32_t>(logits.stride(0)), logits.data_ptr(),
         metadata.data_ptr<uint8_t>(),

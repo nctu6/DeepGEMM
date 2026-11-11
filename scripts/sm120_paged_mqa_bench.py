@@ -6,13 +6,15 @@ import deep_gemm
 from deep_gemm.utils import ceil_div, per_custom_dims_cast_to_fp8, per_token_cast_to_fp4, per_token_cast_to_fp8
 
 
-def make_case(batch_size, next_n, num_heads, head_dim, ctx, block_kv=64, fmt='fp8'):
+def make_case(batch_size, next_n, num_heads, head_dim, ctx, block_kv=64, fmt='fp8', sequential=False):
     q = torch.randn(batch_size, next_n, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
     weights = torch.randn(batch_size * next_n, num_heads, device='cuda', dtype=torch.float)
     context_lens = torch.full((batch_size, next_n), ctx, device='cuda', dtype=torch.int)
     max_blocks = ceil_div(ctx, block_kv)
     num_blocks = batch_size * max_blocks
-    block_table = torch.randperm(num_blocks, device='cuda', dtype=torch.int).view(batch_size, max_blocks).contiguous()
+    # Random pages model a long-running allocator; sequential ones one request per contiguous run
+    order = torch.arange(num_blocks, device='cuda', dtype=torch.int) if sequential else torch.randperm(num_blocks, device='cuda', dtype=torch.int)
+    block_table = order.view(batch_size, max_blocks).contiguous()
     kv = torch.randn(num_blocks * block_kv, head_dim, device='cuda', dtype=torch.bfloat16)
     if fmt == 'fp8':
         q_in = (q.to(torch.float8_e4m3fn), None)
@@ -58,8 +60,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dims', type=int, nargs='+', default=[128, 64, 32])
     parser.add_argument('--fmts', nargs='+', default=['fp8'])
+    parser.add_argument('--sms', type=int, default=0, help='run the kernel on this many SMs')
+    parser.add_argument('--sequential', action='store_true', help='contiguous pages per request instead of a random permutation')
     parser.add_argument('--v41', action='store_true', help='V4.1 decode shapes: 32 heads, 1-128 requests, 1K-32K rows')
     args = parser.parse_args()
+    if args.sms:
+        deep_gemm.set_num_sms(args.sms)
     torch.manual_seed(0)
     shapes = ((32, 1, 64, 8192), (32, 2, 64, 8192), (64, 1, 32, 8192), (128, 1, 64, 4096), (8, 1, 64, 32768), (64, 2, 32, 4096))
     if args.v41:
@@ -70,7 +76,7 @@ if __name__ == '__main__':
             for fmt in args.fmts:
                 if fmt != 'fp8' and d != 128:
                     continue
-                kwargs, row_bytes = make_case(b, nn, h, d, c, fmt=fmt)
+                kwargs, row_bytes = make_case(b, nn, h, d, c, fmt=fmt, sequential=args.sequential)
                 t = bench(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs))
                 kv_bytes = b * c * row_bytes
                 times.append(t)

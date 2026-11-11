@@ -82,7 +82,8 @@ def main():
     failed = False
     for fmt in ('mxfp8', 'mxfp4'):
         for num_heads in (8, 32):
-            for (sq, kv, bkv, nmsb) in [(9, 2048, 8, 128), (64, 4096, 8, 512), (9, 1024, 16, 128)]:
+            # The last two end inside a sparse block, so the gather clips the tensor's tail
+            for (sq, kv, bkv, nmsb) in [(9, 2048, 8, 128), (64, 4096, 8, 512), (9, 1024, 16, 128), (9, 2051, 8, 128), (9, 1021, 16, 128)]:
                 for uaks in (False, True):
                     failed |= not check(num_heads, fmt, sq, kv, bkv, nmsb, use_unaligned_ks=uaks)
     print('FAILED' if failed else 'ALL OK')

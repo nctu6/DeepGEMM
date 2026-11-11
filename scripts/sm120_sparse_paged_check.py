@@ -1,7 +1,7 @@
 """SM120 paged sparse MQA logits check (MXFP8 + MXFP4), dequantized-reference oracle.
 
-Mirrors the paged branch of tests/test_attention.py::test_sparse_mqa_logits with a single request, so the
-block table and sparse gather are easy to reason about. Validates the kIsPaged path of the SM120 kernel.
+Mirrors the paged branch of tests/test_attention.py::test_sparse_mqa_logits with a few requests of shuffled pages.
+Validates the kIsPaged path of the SM120 kernel.
 
   sm120_remote.sh dg scripts/sm120_sparse_paged_check.py
 """
@@ -17,7 +17,10 @@ from test_attention import (make_sparse_kv_block_indices, to_mqa_weights,  # noq
                             kv_cache_cast_to_mxfp4, kv_cache_cast_to_mxfp8)
 
 
-def check(num_heads, fmt, num_q_tokens, context_len, sparse_block_kv, num_max_sparse_blocks, page_kv=64, seed=0):
+def check(num_heads, fmt, num_q_tokens, context_len, sparse_block_kv, num_max_sparse_blocks, page_kv=64, seed=0,
+          tokens_per_request=None):
+    """`tokens_per_request` queries share a request (consecutive), each request has its own shuffled pages: 1 is the
+    decode layout (every query its own request, single-token Q blocks), the default one request for all queries."""
     head_dim = 128
     is_mxfp4 = fmt == 'mxfp4'
     cast = per_token_cast_to_fp4 if is_mxfp4 else per_token_cast_to_fp8
@@ -25,9 +28,11 @@ def check(num_heads, fmt, num_q_tokens, context_len, sparse_block_kv, num_max_sp
     elem_dim = head_dim // 2 if is_mxfp4 else head_dim
     torch.manual_seed(seed)
 
-    # Single request: every q-token shares one context length. Paged q layout is [num_q_tokens, 1, num_heads, d].
+    # Every q-token has the same context length. Paged q layout is [num_q_tokens, 1, num_heads, d].
+    tokens_per_request = tokens_per_request or num_q_tokens
+    num_requests = ceil_div(num_q_tokens, tokens_per_request)
     context_lens = [context_len] * num_q_tokens
-    request_indices = [0] * num_q_tokens
+    request_indices = [i // tokens_per_request for i in range(num_q_tokens)]
     context_starts = [0] * num_q_tokens
 
     q_fp, q_sf = cast(torch.randn((num_q_tokens, 1, num_heads, head_dim), device='cuda', dtype=torch.bfloat16).view(-1, head_dim),
@@ -37,8 +42,9 @@ def check(num_heads, fmt, num_q_tokens, context_len, sparse_block_kv, num_max_sp
     sparse_indices, num_sparse_blocks = make_sparse_kv_block_indices(
         context_lens, request_indices, sparse_block_kv, num_max_sparse_blocks, seed, context_starts)
 
-    # Paged KV cache: one request, ceil(context_len / page_kv) pages
-    num_pages = ceil_div(context_len, page_kv)
+    # Paged KV cache: ceil(context_len / page_kv) pages per request
+    pages_per_request = ceil_div(context_len, page_kv)
+    num_pages = pages_per_request * num_requests
     page_bytes = page_kv * (elem_dim + 4)
     page_stride_bytes = ceil_div(page_bytes, 128) * 128
     kv_storage = torch.empty((num_pages, page_stride_bytes), device='cuda', dtype=torch.uint8)
@@ -50,8 +56,10 @@ def check(num_heads, fmt, num_q_tokens, context_len, sparse_block_kv, num_max_sp
 
     indices = torch.tensor(request_indices, device='cuda', dtype=torch.int32)
     context_lens_tensor = torch.tensor(context_lens, device='cuda', dtype=torch.int32)
-    # Identity page pool for a single request: logical page i -> physical page i
-    block_table = torch.arange(num_pages, device='cuda', dtype=torch.int32)[None, :].expand(num_q_tokens, -1).contiguous()
+    # Each request owns a shuffled run of pages: logical page i of request r -> a physical page of its run
+    run_table = torch.stack([torch.randperm(pages_per_request, device='cuda', dtype=torch.int32) + r * pages_per_request
+                             for r in range(num_requests)])
+    block_table = run_table[indices.long()].contiguous()
 
     metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
         context_lens_tensor, block_table, indices, page_kv, sparse_indices, q[0].dtype, sparse_block_kv)
@@ -60,10 +68,11 @@ def check(num_heads, fmt, num_q_tokens, context_len, sparse_block_kv, num_max_sp
         num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv)
 
     # Dequantized reference: KV tokens are the cast-back cache, laid out [num_pages*page_kv, head_dim]
-    kv_deq = kv_back.view(num_pages * page_kv, head_dim).float()[:context_len]
+    kv_all = kv_back.view(num_pages, page_kv, head_dim).float()
     q_deq = (cast_back_from_fp4 if is_mxfp4 else cast_back_from_fp8)(
         q_fp, q_sf, gran_k=32, use_packed_ue8m0=True).view(num_q_tokens, num_heads, head_dim).float()
-    scores = torch.einsum('qhd,td->qht', q_deq, kv_deq).relu_()
+    kv_deq = kv_all[block_table.long()].view(num_q_tokens, pages_per_request * page_kv, head_dim)[:, :context_len]
+    scores = torch.einsum('qhd,qtd->qht', q_deq, kv_deq).relu_()
     ref_full = (scores * weights[:, :, None].float()).sum(1)   # [q, context_len]
 
     kv_offsets = torch.arange(sparse_block_kv, device='cuda', dtype=torch.int32)
@@ -77,7 +86,7 @@ def check(num_heads, fmt, num_q_tokens, context_len, sparse_block_kv, num_max_sp
     diff = (1 - 2 * (x * y).sum() / (x * x + y * y).sum()).item() if x.numel() else 0.0
     ok = diff < 1e-3
     print(f'[{fmt:6}] H={num_heads:2} SQ={num_q_tokens:4} ctx={context_len:6} bkv={sparse_block_kv} '
-          f'nmsb={num_max_sparse_blocks} page={page_kv}: n={sp.numel()} diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
+          f'nmsb={num_max_sparse_blocks} page={page_kv} req={num_requests}: n={sp.numel()} diff={diff:.2e}  {"ok" if ok else "FAIL"}', flush=True)
     return ok
 
 
@@ -88,6 +97,12 @@ def main():
         for num_heads in (8, 32):
             for (sq, ctx, bkv, nmsb) in [(9, 2048, 8, 128), (64, 4096, 8, 512), (9, 1024, 16, 128)]:
                 failed |= not check(num_heads, fmt, sq, ctx, bkv, nmsb)
+            # Decode layout (single-token Q blocks of distinct requests), request pairs, a pool wider than a CTA's share,
+            # and a page of 128 rows (blocks per page 16)
+            failed |= not check(num_heads, fmt, 7, 4096, 8, 256, tokens_per_request=1)
+            failed |= not check(num_heads, fmt, 12, 3000, 8, 256, tokens_per_request=2)
+            failed |= not check(num_heads, fmt, 300, 2048, 8, 128, tokens_per_request=100)
+            failed |= not check(num_heads, fmt, 9, 2048, 16, 128, page_kv=128, tokens_per_request=3)
     print('FAILED' if failed else 'ALL OK')
     sys.exit(1 if failed else 0)
 

@@ -153,4 +153,34 @@ struct alignas(8) QBlockInfo {
             kv_split_base(kv_split_base), num_kv_splits(num_kv_splits) {}
 };
 
+// Shared memory map of the SM120 sparse kernel (no TMEM: the KV tile is gathered into ldmatrix-swizzled shared memory).
+// Two Q buffers let the next Q block load while the current one is read, and `num_stages` KV buffers let the gather of the
+// next split overlap the MMAs of this one:
+//   [Q x2][KV x stages][SF-Q x2][SF-KV x stages][weights x2][KV block infos x stages][barriers x2]
+// TMA destinations (Q, SF-Q, weights) are 128-byte aligned, the swizzled tiles 1024-byte aligned. The host builds it from
+// the runtime shape and the kernel from its template arguments, so both agree on the size.
+struct Sm120SparseSmem {
+    uint32_t num_weight_elems, q_bytes, kv_bytes, sf_q_bytes, sf_kv_bytes, weight_bytes, info_bytes;
+    uint32_t q_offset, kv_offset, sf_q_offset, sf_kv_offset, weight_offset, info_offset, barrier_offset, total_bytes;
+
+    CUTLASS_HOST_DEVICE constexpr Sm120SparseSmem(const uint32_t num_heads, const uint32_t sparse_block_kv,
+                                                  const uint32_t split_kv, const uint32_t num_stages,
+                                                  const uint32_t row_bytes):
+            num_weight_elems(math::constexpr_align(num_heads, 8u)),
+            q_bytes(kBlockQ * num_heads * row_bytes),
+            kv_bytes(split_kv * row_bytes),
+            sf_q_bytes(math::constexpr_align(kBlockQ * num_heads * 4u, 128u)),
+            sf_kv_bytes(math::constexpr_align(split_kv * 4u, 128u)),
+            weight_bytes(math::constexpr_align(kBlockQ * num_weight_elems * 2u, 128u)),
+            info_bytes(math::constexpr_align(split_kv / sparse_block_kv * static_cast<uint32_t>(sizeof(KVBlockInfo)), 16u)),
+            q_offset(0),
+            kv_offset(math::constexpr_align(2 * q_bytes, 1024u)),
+            sf_q_offset(kv_offset + num_stages * kv_bytes),
+            sf_kv_offset(sf_q_offset + 2 * sf_q_bytes),
+            weight_offset(sf_kv_offset + num_stages * sf_kv_bytes),
+            info_offset(weight_offset + 2 * weight_bytes),
+            barrier_offset(info_offset + num_stages * info_bytes),
+            total_bytes(math::constexpr_align(barrier_offset + 2 * 16u, 1024u)) {}
+};
+
 } // namespace deep_gemm::layout::sparse_mqa_logits

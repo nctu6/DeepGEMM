@@ -338,4 +338,75 @@ CUTLASS_DEVICE void warp_mma_16xNxHd_block_scaled_ss(const uint32_t& a_base, con
     }
 }
 
+/// The B operand (N rows of `kHeadDim` values) of `warp_mma_16xNxHd_block_scaled_ss`, loaded once into registers so that a
+/// warp can run many 16-row A tiles against it (the sparse MQA kernel scores five KV tiles per Q block and split)
+template <uint32_t N, uint32_t kHeadDim, bool kIsFP4>
+struct BlockScaledBFragments {
+    static constexpr uint32_t kRowBytes = kHeadDim / (kIsFP4 ? 2 : 1);
+    static constexpr uint32_t kNumSteps = kRowBytes / 32;
+    static constexpr uint32_t kNumBTiles = N / 8;
+    uint32_t frag[kNumSteps][kNumBTiles][2];
+    uint32_t sf[kNumSteps][kNumBTiles];   // the scale bits of each MMA step and column tile
+};
+
+template <uint32_t N, uint32_t kHeadDim, bool kIsFP4>
+CUTLASS_DEVICE void load_block_scaled_b(const uint32_t& b_base, const uint32_t* b_sf, const uint32_t b_sf_stride,
+                                        BlockScaledBFragments<N, kHeadDim, kIsFP4>& b) {
+    DG_STATIC_ASSERT(N % 16 == 0, "Invalid N");
+    DG_STATIC_ASSERT(kHeadDim == 128, "Block-scaled MQA head dim must be 128");
+    using Frags = BlockScaledBFragments<N, kHeadDim, kIsFP4>;
+    const uint32_t lane_idx = threadIdx.x % 32, g = lane_idx / 4;
+    const uint32_t b_ld_row = (lane_idx >> 4) * 8 + (lane_idx & 7);
+    const uint32_t b_ld_chunk = (lane_idx >> 3) & 1;
+    #pragma unroll
+    for (uint32_t c = 0; c < Frags::kNumBTiles; ++ c) {
+        const uint32_t word = b_sf[c * 8 + g];
+        #pragma unroll
+        for (uint32_t k = 0; k < Frags::kNumSteps; ++ k)
+            b.sf[k][c] = kIsFP4 ? (word >> (16 * (k % 2))) & 0xffffu : (word >> (8 * (k % 4))) & 0xffu;
+    }
+    (void) b_sf_stride;
+    #pragma unroll
+    for (uint32_t k = 0; k < Frags::kNumSteps; ++ k) {
+        #pragma unroll
+        for (uint32_t j = 0; j < N / 16; ++ j)
+            ldmatrix_x4(b.frag[k][j * 2][0], b.frag[k][j * 2][1], b.frag[k][j * 2 + 1][0], b.frag[k][j * 2 + 1][1],
+                        b_base + get_swizzle_offset<Frags::kRowBytes>(b_ld_row + j * 16, k * 2 + b_ld_chunk));
+    }
+}
+
+/// `warp_mma_16xNxHd_block_scaled_ss` against B fragments loaded by `load_block_scaled_b` (same results, bit for bit)
+template <uint32_t N, uint32_t kHeadDim, bool kIsFP4>
+CUTLASS_DEVICE void warp_mma_16xNxHd_block_scaled_rs(const uint32_t& a_base, const uint32_t& a_row,
+                                                     const uint32_t* a_sf, const uint32_t a_sf_stride,
+                                                     const BlockScaledBFragments<N, kHeadDim, kIsFP4>& b,
+                                                     float* accum) {
+    using MMA = cute::conditional_t<kIsFP4, FP4BlockScaledMMA, FP8BlockScaledMMA>;
+    using Frags = BlockScaledBFragments<N, kHeadDim, kIsFP4>;
+    const uint32_t lane_idx = threadIdx.x % 32, g = lane_idx / 4, t = lane_idx % 4;
+    const uint32_t a_ld_row = a_row + ((lane_idx >> 3) & 1) * 8 + (lane_idx & 7);
+    const uint32_t a_ld_chunk = lane_idx >> 4;
+    const uint32_t a_sf_word_0 = a_sf[a_row + g], a_sf_word_1 = a_sf[a_row + g + 8];
+    (void) a_sf_stride;
+    #pragma unroll
+    for (uint32_t i = 0; i < N / 8 * 4; ++ i)
+        accum[i] = 0;
+    #pragma unroll
+    for (uint32_t k = 0; k < Frags::kNumSteps; ++ k) {
+        const auto scale = [&](const uint32_t& words) -> uint32_t {
+            if constexpr (kIsFP4)
+                return (words >> (16 * (k % 2))) & 0xffffu;
+            else
+                return (words >> (8 * (k % 4))) & 0xffu;
+        };
+        const uint32_t sfa = scale((t & 1) ? a_sf_word_1 : a_sf_word_0);
+        uint32_t a_frag[4];
+        ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                    a_base + get_swizzle_offset<Frags::kRowBytes>(a_ld_row, k * 2 + a_ld_chunk));
+        #pragma unroll
+        for (uint32_t c = 0; c < Frags::kNumBTiles; ++ c)
+            MMA::mma(a_frag, b.frag[k][c], accum + c * 4, sfa, b.sf[k][c]);
+    }
+}
+
 } // namespace deep_gemm::mma::sm120
