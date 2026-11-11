@@ -91,10 +91,12 @@ def bench_leaf(tokens: int, prefix: int, heads: int, iters: int, do_profile: boo
             index_k_cache=cache, page_size=PAGE, candidate_lens_cpu=cpu,
         )
 
-    seg = {"prepare": 0, "mqa_logits_call": 0, "deepselect_call": 0, "nan_to_num+mark": 0}
+    seg = {"prepare": 0, "max_seqlen_k (.item())": 0, "mqa_logits_call": 0, "mark": 0, "deepselect_supports": 0,
+           "deepselect_call": 0}
     pc = time.perf_counter_ns
     real_mqa, real_sel, real_prep = dsa_dg.deep_gemm.fp8_mqa_logits, dsa_dg.deepselect_local_topk, prefill_prepare.dsa_prefill_prepare
     real_mark = dsa_dg.mark_forced_initial_local_logits
+    real_supports, real_resolve = dsa_dg.deepselect_supports, dsa_dg._resolve_prefill_tile_max_seqlen_k
 
     def timed(name, fn):
         def run(*a, **k):
@@ -111,7 +113,9 @@ def bench_leaf(tokens: int, prefix: int, heads: int, iters: int, do_profile: boo
     dsa_dg.deep_gemm.fp8_mqa_logits = timed("mqa_logits_call", real_mqa)
     dsa_dg.deepselect_local_topk = timed("deepselect_call", real_sel)
     prefill_prepare.dsa_prefill_prepare = timed("prepare", real_prep)
-    dsa_dg.mark_forced_initial_local_logits = timed("nan_to_num+mark", real_mark)
+    dsa_dg.mark_forced_initial_local_logits = timed("mark", real_mark)
+    dsa_dg.deepselect_supports = timed("deepselect_supports", real_supports)
+    dsa_dg._resolve_prefill_tile_max_seqlen_k = timed("max_seqlen_k (.item())", real_resolve)
     try:
         for _ in range(50):
             leaf()
@@ -130,9 +134,13 @@ def bench_leaf(tokens: int, prefix: int, heads: int, iters: int, do_profile: boo
         dsa_dg.deepselect_local_topk = real_sel
         prefill_prepare.dsa_prefill_prepare = real_prep
         dsa_dg.mark_forced_initial_local_logits = real_mark
+        dsa_dg.deepselect_supports = real_supports
+        dsa_dg._resolve_prefill_tile_max_seqlen_k = real_resolve
     print(f"leaf tokens {tokens} prefix {prefix} heads {heads}: host median per call {statistics.median(totals) / 1e3:.1f} us")
     for k, v in seg.items():
-        print(f"  {k:20s} mean {v / iters / 1e3:7.2f} us")
+        print(f"  {k:24s} mean {v / iters / 1e3:7.2f} us")
+    rest = statistics.mean(totals) - sum(seg.values()) / iters
+    print(f"  {'rest of the leaf':24s} mean {rest / 1e3:7.2f} us  (input checks, output allocation, slicing, nan_to_num_, loop)")
     # Wall time of back-to-back calls (the GPU is not idle-bound at these sizes only if the host is slower)
     for _ in range(3):
         leaf()
