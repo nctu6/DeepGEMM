@@ -14,6 +14,7 @@
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
+#include <deep_gemm/impls/sm120_mega_moe_epilogue.cuh>
 #include "../heuristics/sm120.hpp"
 
 #include "runtime_utils.hpp"
@@ -44,6 +45,10 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_sfa;
         CUtensorMap tensor_map_sfb;
+        // Fused epilogue of the mega MoE: its kind, math mode and what it reads and writes
+        SM120MegaMoEEpilogue epilogue = SM120MegaMoEEpilogue::None;
+        bool epilogue_fast_math = false;
+        SM120MegaMoEEpilogueArgs epilogue_args = {};
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -64,6 +69,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {}, {},
+        SM120MegaMoEEpilogue({}), {},
         {}
     >);
 }};
@@ -81,6 +87,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
         args.use_stream_k ? "true" : "false", args.gemm_desc.with_accumulation ? "true" : "false",
         args.early_pdl_trigger ? "true" : "false",
+        static_cast<uint32_t>(args.epilogue), args.epilogue_fast_math ? "true" : "false",
         to_string(args.gemm_desc.cd_dtype)));
 
         jit->launch(
@@ -88,9 +95,17 @@ static void __instantiate_kernel() {{
             args.grouped_layout, args.d, static_cast<uint32_t>(args.ld_d), static_cast<uint64_t>(args.d_stride_g), args.alpha,
             args.workspace, args.counters,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.tensor_map_a, args.tensor_map_b, args.tensor_map_sfa, args.tensor_map_sfb
+            args.tensor_map_a, args.tensor_map_b, args.tensor_map_sfa, args.tensor_map_sfb,
+            args.epilogue_args
         );
     }
+};
+
+// A fused epilogue of the mega MoE (`kind` `None`: store D)
+struct SM120GemmEpilogue {
+    SM120MegaMoEEpilogue kind = SM120MegaMoEEpilogue::None;
+    bool fast_math = false;
+    SM120MegaMoEEpilogueArgs args = {};
 };
 
 // A tile layout plus a stream-K choice: what the autotuner selects between
@@ -118,7 +133,7 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
                                         void* grouped_layout,
                                         const int& num_groups_a, const int& num_groups_b,
                                         const int& num_groups_sfa, const int& num_groups_sfb,
-                                        const int& gran_k, const float& alpha) {
+                                        const int& gran_k, const float& alpha, const SM120GemmEpilogue& epilogue) {
     const bool is_fp4 = a.scalar_type() == kPackedFP4;
     const bool is_bf16 = a.scalar_type() == torch::kBFloat16;
     const bool is_mixed_fp4_b = not is_fp4 and b.scalar_type() == kPackedFP4;
@@ -217,6 +232,9 @@ static void sm120_fp8_fp4_gemm_1d1d_run(const std::string& tag,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
+        .epilogue = epilogue.kind,
+        .epilogue_fast_math = epilogue.fast_math,
+        .epilogue_args = epilogue.args,
     });
 }
 
@@ -314,7 +332,8 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
                                            const int& num_groups_sfa, const int& num_groups_sfb,
                                            const int& gran_k_a, const int& gran_k_b,
                                            const float& alpha,
-                                           const std::optional<SM120BlockScaledChoice>& forced_choice = std::nullopt) {
+                                           const std::optional<SM120BlockScaledChoice>& forced_choice = std::nullopt,
+                                           const SM120GemmEpilogue& epilogue = {}) {
     // `desc.k` counts logical elements, so FP4 (packed two per byte) has `a.size(-1) * 2 == k`
     const bool is_fp4 = a_in.scalar_type() == kPackedFP4;
     const bool is_bf16 = a_in.scalar_type() == torch::kBFloat16;
@@ -358,7 +377,7 @@ static void sm120_fp8_fp4_gemm_1d1d_launch(const std::string& tag,
 
     const auto run = [&](const SM120BlockScaledChoice& choice) {
         sm120_fp8_fp4_gemm_1d1d_run(tag, desc, choice, a, sfa, b, sfb, d, grouped_layout,
-                                    num_groups_a, num_groups_b, num_groups_sfa, num_groups_sfb, gran_k_a, alpha);
+                                    num_groups_a, num_groups_b, num_groups_sfa, num_groups_sfb, gran_k_a, alpha, epilogue);
     };
     // NOTES: tuning runs the GEMM several times into `d`, which is overwritten by the final launch below
     run(forced_choice.has_value() ? forced_choice.value() : sm120_block_scaled_choice(desc, run));

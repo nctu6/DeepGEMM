@@ -83,7 +83,7 @@ for name, (H, I, E, K) in SHAPES.items():
         ids64 = topk_ids.to(torch.int64)
         y = torch.empty(T, H, dtype=torch.bfloat16, device='cuda')
         def mega():
-            stage_mxfp4_mega_moe_inputs(x, topk_weights, ids64, buf.x[:T], buf.x_sf[:T], buf.topk_idx[:T], buf.topk_weights[:T])
+            stage_mxfp4_mega_moe_inputs(x, topk_weights, ids64, buf.x[:T], buf.x_sf[:T], buf.topk_idx[:T], buf.topk_weights[:T], 0, E)
             deep_gemm.fp8_fp4_mega_moe(y, t_l1, t_l2, buf, activation_clamp=10.0, fast_math=True)
         marlin = lambda: marlin_mxfp4_precomputed_moe_apply(plan, x, marlin_w, None, topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32))
         triton_fn = lambda: triton_mxfp4_precomputed_moe_apply(plan, x, triton_w, None, topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32))

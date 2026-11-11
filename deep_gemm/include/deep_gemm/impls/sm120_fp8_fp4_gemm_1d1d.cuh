@@ -14,6 +14,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/impls/sm120_mega_moe_epilogue.cuh>
 #include <deep_gemm/mma/sm120.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -69,6 +70,7 @@ template <bool kIsFP4, bool kIsBF16, bool kMixedFP4B, uint32_t kGranK,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumSMs, GemmType kGemmType,
           bool kUseStreamK, bool kWithAccumulation, bool kEarlyPdlTrigger,
+          SM120MegaMoEEpilogue kEpilogue, bool kEpilogueFastMath,
           typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, uint64_t d_stride_g, float alpha,
@@ -77,7 +79,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfb) {
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
+                             const SM120MegaMoEEpilogueArgs epilogue) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
     static constexpr bool kIsNVFP4 = kIsFP4 and kGranK == 16;
     using MMA = cute::conditional_t<kIsBF16, mma::sm120::BF16MMA,
@@ -122,6 +125,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                      kGemmType == GemmType::MGroupedContiguousWithPsumLayout or
                      kGemmType == GemmType::MGroupedMasked, "Unsupported GEMM type");
     DG_STATIC_ASSERT(not kUseStreamK or kGemmType == GemmType::Normal, "Stream-K is only for normal GEMMs");
+    DG_STATIC_ASSERT(kEpilogue == SM120MegaMoEEpilogue::None or
+                     (kGemmType == GemmType::MGroupedContiguousWithPsumLayout and not kUseStreamK and not kWithAccumulation and
+                      cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and BLOCK_N % 64 == 0 and kMixedFP4B),
+                     "Fused epilogues are for the mega MoE's grouped W4A8 GEMMs");
     DG_STATIC_ASSERT(kIsBF16 or kGranK == 32 or (kIsFP4 and kGranK == 16) or (not kIsFP4 and kGranK == 128),
                      "FP4 takes 32- (UE8M0) or 16-element (UE4M3) scales; FP8 32 or 128 (UE8M0)");
     static constexpr uint32_t kElemsPerBlock = kIsFP4B ? BLOCK_K * 2 : (kIsBF16 ? BLOCK_K / 2 : BLOCK_K);
@@ -212,7 +219,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
     constexpr uint32_t SMEM_REDUCE_OFFSET = SMEM_SFB_OFFSET + kNumStages * SMEM_SFB_SIZE_PER_STAGE;
     constexpr uint32_t SMEM_REDUCE_SIZE = kNumKWarps > 1 ? math::constexpr_align(kNumAccum * kNumReduceThreads * 4u, 128u) : 0;
     auto smem_reduce = reinterpret_cast<float*>(smem_buffer + SMEM_REDUCE_OFFSET);
-    constexpr uint32_t SMEM_BARRIER_OFFSET = SMEM_REDUCE_OFFSET + SMEM_REDUCE_SIZE;
+    // Fused epilogues: SwiGLU rounds a tile to BF16 in shared memory (rows padded by 16 bytes against bank conflicts), up to
+    // 64 rows at a time
+    static constexpr uint32_t kEpilogueRows = BLOCK_M < 64 ? BLOCK_M : 64;
+    static constexpr uint32_t kEpilogueRowStride = BLOCK_N + 8;
+    constexpr uint32_t SMEM_EPILOGUE_OFFSET = SMEM_REDUCE_OFFSET + SMEM_REDUCE_SIZE;
+    constexpr uint32_t SMEM_EPILOGUE_SIZE = kEpilogue == SM120MegaMoEEpilogue::SwiGLU ?
+        math::constexpr_align(kEpilogueRows * kEpilogueRowStride * 2u, 128u) : 0;
+    constexpr uint32_t SMEM_BARRIER_OFFSET = SMEM_EPILOGUE_OFFSET + SMEM_EPILOGUE_SIZE;
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_BARRIER_OFFSET);
     auto full_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
@@ -727,6 +741,98 @@ sm120_fp8_fp4_gemm_1d1d_impl(int* grouped_layout, cd_dtype_t* d, uint32_t ld_d, 
                         }
                     }
                 }
+            }
+            if constexpr (kEpilogue == SM120MegaMoEEpilogue::SwiGLU) {
+                // The tile as SM100's epilogue sees it: accumulators rounded to BF16 (gate and up interleaved in groups of 8
+                // columns), kept in shared memory, 64 rows at a time. Then per row and 16-byte segment: clamp in BF16,
+                // SwiGLU in FP32 with non-contracted round-to-nearest operations, times the pair's top-k weight, and a
+                // UE8M0 scale per 32 outputs (8 neighboring segments) for the FP8 cast
+                auto smem_tile = reinterpret_cast<nv_bfloat16*>(smem_buffer + SMEM_EPILOGUE_OFFSET);
+                constexpr uint32_t kSegsPerRow = BLOCK_N / 8;
+                const uint32_t num_outputs = shape_n / 2;
+                #pragma unroll
+                for (uint32_t group = 0; group < BLOCK_M / kEpilogueRows; ++ group) {
+                    if (warp_m_idx * WARP_M / kEpilogueRows == group) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumMTiles; ++ i) {
+                            #pragma unroll
+                            for (uint32_t half = 0; half < 2; ++ half) {
+                                const uint32_t row = warp_m_idx * WARP_M + i * 16 + group_row + half * 8 - group * kEpilogueRows;
+                                #pragma unroll
+                                for (uint32_t j = 0; j < kNumNTiles; ++ j) {
+                                    const uint32_t idx = (i * kNumNTiles + j) * 4 + half * 2;
+                                    const auto value = __float22bfloat162_rn({alpha * accum[idx], alpha * accum[idx + 1]});
+                                    *reinterpret_cast<nv_bfloat162*>(smem_tile + row * kEpilogueRowStride + warp_n_idx * WARP_N + j * 8 + group_col * 2) = value;
+                                }
+                            }
+                        }
+                    }
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 3);
+                    for (uint32_t unit = threadIdx.x; unit < kEpilogueRows * kSegsPerRow; unit += kNumMathThreads) {
+                        const uint32_t row_local = unit / kSegsPerRow, seg = unit % kSegsPerRow;
+                        const uint32_t tile_row = group * kEpilogueRows + row_local;
+                        const uint32_t row = m_global_base + tile_row;
+                        const bool is_row_used = m_local_base + tile_row < shape_m and epilogue.row_pair[row] >= 0;
+                        // Lane `l` of a pair of neighbors holds 8 columns: even lanes gate, odd lanes up
+                        const uint4 mine = *reinterpret_cast<const uint4*>(smem_tile + row_local * kEpilogueRowStride + seg * 8);
+                        uint4 other;
+                        other.x = __shfl_xor_sync(0xffffffff, mine.x, 1);
+                        other.y = __shfl_xor_sync(0xffffffff, mine.y, 1);
+                        other.z = __shfl_xor_sync(0xffffffff, mine.z, 1);
+                        other.w = __shfl_xor_sync(0xffffffff, mine.w, 1);
+                        const bool is_gate_lane = seg % 2 == 0;
+                        const uint4 gate_vec = is_gate_lane ? mine : other, up_vec = is_gate_lane ? other : mine;
+                        // Even lanes take the first 4 of the 8 outputs of the pair, odd lanes the last 4
+                        const uint32_t half_idx = seg % 2;
+                        const uint32_t gate_words[2] = {half_idx ? gate_vec.z : gate_vec.x, half_idx ? gate_vec.w : gate_vec.y};
+                        const uint32_t up_words[2] = {half_idx ? up_vec.z : up_vec.x, half_idx ? up_vec.w : up_vec.y};
+                        const float weight = is_row_used ? epilogue.row_weights[row] : 0.0f;
+                        float values[4];
+                        float amax = 0;
+                        #pragma unroll
+                        for (uint32_t k = 0; k < 2; ++ k) {
+                            auto bf16_gate = *reinterpret_cast<const nv_bfloat162*>(&gate_words[k]);
+                            auto bf16_up = *reinterpret_cast<const nv_bfloat162*>(&up_words[k]);
+                            if (not isinf(epilogue.activation_clamp)) {
+                                const auto clamp = __float2bfloat16_rn(epilogue.activation_clamp);
+                                bf16_gate = __hmin2(bf16_gate, {clamp, clamp});
+                                bf16_up = __hmax2(bf16_up, {__hneg(clamp), __hneg(clamp)});
+                                bf16_up = __hmin2(bf16_up, {clamp, clamp});
+                            }
+                            const float2 gate = __bfloat1622float2(bf16_gate), up = __bfloat1622float2(bf16_up);
+                            const float gates[2] = {gate.x, gate.y}, ups[2] = {up.x, up.y};
+                            #pragma unroll
+                            for (uint32_t l = 0; l < 2; ++ l) {
+                                const float neg_gate_exp = kEpilogueFastMath ? __expf(-gates[l]) : expf(-gates[l]);
+                                const float denom = __fadd_rn(1.0f, neg_gate_exp);
+                                const float silu = kEpilogueFastMath ? __fmul_rn(gates[l], math::fast_rcp(denom)) : gates[l] / denom;
+                                values[k * 2 + l] = __fmul_rn(__fmul_rn(silu, ups[l]), weight);
+                                amax = fmaxf(amax, fabsf(values[k * 2 + l]));
+                            }
+                        }
+                        // Amax of 32 outputs = 8 lanes
+                        #pragma unroll
+                        for (uint32_t offset = 1; offset < 8; offset <<= 1)
+                            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+                        const uint32_t sf_exp = math::get_ue8m0_sf_exp(amax);
+                        const float sf_inv = math::get_ue8m0_sf_inv<float>(sf_exp);
+                        const auto fp8x4 = __nv_fp8x4_e4m3(make_float4(__fmul_rn(values[0], sf_inv), __fmul_rn(values[1], sf_inv),
+                                                                       __fmul_rn(values[2], sf_inv), __fmul_rn(values[3], sf_inv)));
+                        if (is_row_used) {
+                            const uint32_t out_col = n_block_idx * (BLOCK_N / 2) + seg * 4;
+                            reinterpret_cast<__nv_fp8x4_e4m3*>(epilogue.l2_acts + static_cast<uint64_t>(row) * num_outputs + out_col)[0] = fp8x4;
+                            // One scale byte per 32 outputs, four per word of the next GEMM's `[N / 2 / 128][sf_stride]` scales
+                            if (seg % 8 == 0) {
+                                const uint32_t sf_group = out_col / 32;
+                                reinterpret_cast<uint8_t*>(epilogue.l2_acts_sf)[(static_cast<uint64_t>(sf_group / 4) * epilogue.sf_stride + row) * 4 + sf_group % 4] =
+                                    static_cast<uint8_t>(sf_exp);
+                            }
+                        }
+                    }
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 3);
+                }
+                // The tile is done: the next one
+                continue;
             }
             #pragma unroll
             for (uint32_t i = 0; i < kNumMTiles; ++ i) {

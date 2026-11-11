@@ -12,9 +12,9 @@
 #include "../heuristics/sm120.hpp"
 #include "sm120_fp8_fp4_gemm_1d1d.hpp"
 namespace deep_gemm {
-// SM120 `fp8_fp4_mega_moe` on one or more ranks: push, barrier, dispatch, gather, the two m-grouped FP8 x FP4 GEMMs,
-// SwiGLU, return, barrier and combine as a sequence of kernels with the SM100 numerics (see `sm120_fp8_fp4_mega_moe.cuh`
-// for the steps and why). Ranks write into each other's symmetric buffers with peer stores over CUDA IPC (PCIe P2P on
+// SM120 `fp8_fp4_mega_moe` on one or more ranks: push, barrier, dispatch (with the gather), the two m-grouped FP8 x FP4
+// GEMMs (SwiGLU in the first one's epilogue), return, barrier and combine as a sequence of kernels with the SM100
+// numerics (see `sm120_fp8_fp4_mega_moe.cuh` for the steps and why). Ranks write into each other's symmetric buffers with peer stores over CUDA IPC (PCIe P2P on
 // SM120 workstations). Calls that share a buffer must be ordered on one stream per rank (the barrier epoch is in it).
 // With several ranks the intermediate rows are sized for the worst routing of `num_max_tokens_per_rank` on every rank
 
@@ -88,9 +88,11 @@ sm120_get_symm_buffer_size_for_mega_moe(const int& num_ranks, const int& num_exp
 
 class SM120MegaMoERuntime final {
 public:
-    static constexpr int kDispatchThreads = 1024, kNumWarps = 8, kCombineThreads = 128;
-    static deep_jit::cuda::LaunchOptions options(const int& num_blocks, const int& num_threads) {
-        return {.num_smem_bytes = 0, .grid_dim = dim3(num_blocks, 1, 1), .block_dim = dim3(num_threads, 1, 1),
+    static constexpr int kDispatchWarps = 16, kNumWarps = 8, kCombineThreads = 128;
+    // Pairs of the routing one dispatch CTA copies (the layout is counted again in every CTA, so a few CTAs serve a decode batch)
+    static constexpr int kPairsPerDispatchBlock = 8;
+    static deep_jit::cuda::LaunchOptions options(const dim3& grid, const int& num_threads) {
+        return {.num_smem_bytes = 0, .grid_dim = grid, .block_dim = dim3(num_threads, 1, 1),
                 .cluster_dim = dim3(1, 1, 1)};
     }
     // A grid-stride kernel: any grid gives the same result, so size it for the expected work
@@ -102,7 +104,7 @@ public:
         return "#include <deep_gemm/impls/sm120_fp8_fp4_mega_moe.cuh>\nusing namespace deep_gemm;\n";
     }
     template <typename... Args>
-    static void launch(const std::string& name, const std::string& instantiation, const int& num_blocks, const int& num_threads,
+    static void launch(const std::string& name, const std::string& instantiation, const dim3& num_blocks, const int& num_threads,
                        Args&&... args) {
         const auto kernel = jit->compile(name, std::format(R"({}
 static void __instantiate_kernel() {{
@@ -125,34 +127,19 @@ static void __instantiate_kernel() {{
         launch("sm120_mega_moe_barrier", std::format("sm120_mega_moe_barrier<{}>", num_ranks), 1, 32,
                sym, ctrl, static_cast<uint32_t>(num_tokens), timeout_cycles);
     }
-    static void dispatch(const int& num_ranks, const int& num_local_experts, const int& num_topk, const int& block_m,
-                         const layout::SymBuffer<>& sym, const void* topk_idx, const void* recv_topk_idx, const void* ctrl,
-                         void* pair_rows, const int& pair_stride, const torch::Tensor& row_pair, const torch::Tensor& psum_layout,
-                         int* expert_stats, const torch::Tensor& total_rows, const int& num_tokens, const int& num_max_tokens) {
+    static void dispatch(const int& num_ranks, const int& num_local_experts, const int& hidden, const int& num_topk, const int& block_m,
+                         const int& num_blocks, const layout::SymBuffer<>& sym, const void* x, const void* x_sf, const void* topk_weights,
+                         const void* topk_idx, const void* recv_x, const void* recv_x_sf, const void* recv_topk_weights,
+                         const void* recv_topk_idx, const void* ctrl, void* pair_rows, const int& pair_stride,
+                         const torch::Tensor& row_pair, const torch::Tensor& psum_layout, int* expert_stats,
+                         const torch::Tensor& total_rows, const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
+                         const torch::Tensor& row_weights, const int& sf_stride, const int& num_tokens, const int& num_max_tokens) {
         launch("sm120_mega_moe_dispatch",
-               std::format("sm120_mega_moe_dispatch<{}, {}, {}, {}, {}>", num_ranks, num_local_experts, num_topk, block_m, kDispatchThreads),
-               1, kDispatchThreads, sym, topk_idx, recv_topk_idx, ctrl, pair_rows, static_cast<uint32_t>(pair_stride),
-               row_pair.data_ptr(), psum_layout.data_ptr(), expert_stats, total_rows.data_ptr(),
-               static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_max_tokens));
-    }
-    static void gather(const int& num_ranks, const int& hidden, const int& num_topk, const int& num_blocks,
-                       const layout::SymBuffer<>& sym, const void* x, const void* x_sf, const void* topk_weights,
-                       const void* recv_x, const void* recv_x_sf, const void* recv_topk_weights,
-                       const torch::Tensor& row_pair, const torch::Tensor& total_rows,
-                       const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf, const torch::Tensor& row_weights,
-                       const int& sf_stride, const int& num_max_tokens) {
-        launch("sm120_mega_moe_gather", std::format("sm120_mega_moe_gather<{}, {}, {}, {}>", num_ranks, hidden, num_topk, kNumWarps),
-               num_blocks, kNumWarps * 32, sym, x, x_sf, topk_weights, recv_x, recv_x_sf, recv_topk_weights,
-               row_pair.data_ptr(), total_rows.data_ptr(), l1_acts.data_ptr(), l1_acts_sf.data_ptr(), row_weights.data_ptr(),
-               static_cast<uint32_t>(sf_stride), static_cast<uint32_t>(num_max_tokens));
-    }
-    static void swiglu(const int& intermediate_hidden, const bool& fast_math, const int& num_blocks,
-                       const torch::Tensor& l1_out, const torch::Tensor& row_weights, const torch::Tensor& row_pair,
-                       const torch::Tensor& total_rows, const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
-                       const float& activation_clamp, const int& sf_stride) {
-        launch("sm120_mega_moe_swiglu", std::format("sm120_mega_moe_swiglu<{}, {}, {}>", intermediate_hidden, kNumWarps, fast_math ? "true" : "false"),
-               num_blocks, kNumWarps * 32, l1_out.data_ptr(), row_weights.data_ptr(), row_pair.data_ptr(), total_rows.data_ptr(),
-               l2_acts.data_ptr(), l2_acts_sf.data_ptr(), activation_clamp, static_cast<uint32_t>(sf_stride));
+               std::format("sm120_mega_moe_dispatch<{}, {}, {}, {}, {}, {}>", num_ranks, num_local_experts, hidden, num_topk, block_m, kDispatchWarps),
+               num_blocks, kDispatchWarps * 32, sym, x, x_sf, topk_weights, topk_idx, recv_x, recv_x_sf, recv_topk_weights, recv_topk_idx, ctrl,
+               pair_rows, static_cast<uint32_t>(pair_stride), row_pair.data_ptr(), psum_layout.data_ptr(), expert_stats,
+               total_rows.data_ptr(), l1_acts.data_ptr(), l1_acts_sf.data_ptr(), row_weights.data_ptr(),
+               static_cast<uint32_t>(sf_stride), static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_max_tokens));
     }
     static void send_rows(const int& num_ranks, const int& hidden, const int& num_topk, const int& num_blocks,
                           const layout::SymBuffer<>& sym, const torch::Tensor& l2_out, const torch::Tensor& row_pair,
@@ -164,7 +151,7 @@ static void __instantiate_kernel() {{
                         const void* rows_base, const void* topk_idx, const void* pair_rows, const torch::Tensor& y, const int& num_tokens) {
         launch("sm120_mega_moe_combine",
                std::format("sm120_mega_moe_combine<{}, {}, {}, {}, {}>", num_ranks, num_local_experts, hidden, num_topk, kCombineThreads),
-               num_tokens, kCombineThreads, rows_base, topk_idx, pair_rows, y.data_ptr());
+               dim3(num_tokens, ceil_div(hidden / 8, kCombineThreads)), kCombineThreads, rows_base, topk_idx, pair_rows, y.data_ptr());
     }
 };
 
@@ -178,13 +165,15 @@ static int sm120_get_block_m_for_mega_moe(const int& num_tokens, const int& num_
     return 128;
 }
 
-// The m-grouped FP8 x FP4 GEMM of one layer over the expert runs (PSUM layout)
+// The m-grouped FP8 x FP4 GEMM of one layer over the expert runs (PSUM layout), with the layer's epilogue: L1 (SwiGLU)
+// leaves the FP8 input rows of L2 instead of D, and L2 at one rank (Combine) sums each token's rows into `y`
 static void sm120_mega_moe_grouped_gemm(const torch::Tensor& a, const torch::Tensor& sfa,
                                         const torch::Tensor& b, const torch::Tensor& sfb,
                                         const torch::Tensor& d, const torch::Tensor& psum_layout,
                                         const int& num_experts, const int& m, const int& n, const int& k,
-                                        const int& block_m, const int& num_tokens_per_expert) {
-    const auto desc = GemmDesc {
+                                        const int& block_m, const int& num_tokens_per_expert,
+                                        const SM120GemmEpilogue& epilogue) {
+    auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedContiguousWithPsumLayout,
         .kernel_type = KernelType::Kernel1D1D,
         .m = m, .n = n, .k = k, .num_groups = num_experts,
@@ -203,9 +192,10 @@ static void sm120_mega_moe_grouped_gemm(const torch::Tensor& a, const torch::Ten
     // FP8 x FP4 takes 64-byte B rows; 128-column tiles (one weight read per expert run and N tile)
     const int block_n = deep_jit::get_env<int>("DG_SM120_MEGA_BLOCK_N", 128);
     DG_HOST_ASSERT(SM120ArchSpec::is_warp_tiling_legal(desc.kernel_type, block_m, block_n));
+    desc.epilogue_smem_bytes = SM120ArchSpec::get_mega_moe_epilogue_smem(epilogue.kind, block_m, block_n);
     const auto choice = SM120BlockScaledChoice{Layout{0, block_m, block_n, 64, 1, 1}, false};
     sm120_fp8_fp4_gemm_1d1d_launch("sm120_mega_moe_grouped_gemm", desc, a, sfa, b, sfb, d,
-                                   psum_layout.data_ptr(), 1, num_experts, 1, num_experts, 32, 32, 1.0f, choice);
+                                   psum_layout.data_ptr(), 1, num_experts, 1, num_experts, 32, 32, 1.0f, choice, epilogue);
 }
 
 // Intermediate rows of `sm120_fp8_fp4_mega_moe`. A call used to allocate them with `torch::empty`, about 2.6 GB at the
@@ -221,7 +211,7 @@ static void sm120_mega_moe_grouped_gemm(const torch::Tensor& a, const torch::Ten
 // pool to a static owner, so that is an error
 struct SM120MegaMoEScratch {
     torch::Tensor pair_rows, row_pair, total_rows, psum_layout, row_weights;
-    torch::Tensor l1_acts, l1_acts_sf, l1_out, l2_acts, l2_acts_sf, l2_out;
+    torch::Tensor l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, l2_out;
 
     static SM120MegaMoEScratch get(const torch::Device& device, const int64_t& capacity_pair_slots, const int64_t& capacity_rows,
                                    const int64_t& num_pair_slots, const int64_t& num_rows,
@@ -254,7 +244,6 @@ struct SM120MegaMoEScratch {
             s.row_weights = carve(base, offset, {num_rows}, torch::kFloat);
             s.l1_acts = carve(base, offset, {num_rows, hidden}, torch::kFloat8_e4m3fn);
             s.l1_acts_sf = make_sf(hidden);
-            s.l1_out = carve(base, offset, {num_rows, intermediate_hidden * 2}, torch::kBFloat16);
             s.l2_acts = carve(base, offset, {num_rows, intermediate_hidden}, torch::kFloat8_e4m3fn);
             s.l2_acts_sf = make_sf(intermediate_hidden);
             s.l2_out = carve(base, offset, {num_rows, hidden}, torch::kBFloat16);
@@ -335,7 +324,6 @@ static void sm120_fp8_fp4_mega_moe(const torch::Tensor& y, const torch::Tensor& 
     const auto& row_weights = scratch.row_weights;
     const auto& l1_acts = scratch.l1_acts;
     const auto& l1_acts_sf = scratch.l1_acts_sf;
-    const auto& l1_out = scratch.l1_out;
     const auto& l2_acts = scratch.l2_acts;
     const auto& l2_acts_sf = scratch.l2_acts_sf;
     // With several ranks the return kernel sends these rows to the combine buffer of each pair's source rank
@@ -363,18 +351,27 @@ static void sm120_fp8_fp4_mega_moe(const torch::Tensor& y, const torch::Tensor& 
                           num_tokens, num_max_tokens_per_rank);
         Runtime::barrier(num_ranks, sym, ctrl, num_tokens);
     }
-    Runtime::dispatch(num_ranks, num_local_experts, num_topk, block_m, sym, topk_idx, recv_topk_idx, ctrl, pair_rows,
-                      pair_stride, row_pair, psum_layout, stats, total_rows, num_tokens, num_max_tokens_per_rank);
-    Runtime::gather(num_ranks, hidden, num_topk, Runtime::grid_for(num_est_rows, Runtime::kNumWarps), sym, x, x_sf, topk_weights,
-                    recv_x, recv_x_sf, recv_topk_weights, row_pair, total_rows, l1_acts, l1_acts_sf, row_weights, sf_stride,
-                    num_max_tokens_per_rank);
-    sm120_mega_moe_grouped_gemm(l1_acts, l1_acts_sf, l1_weights, l1_weights_sf, l1_out, psum_layout,
-                                num_local_experts, num_rows, intermediate_hidden * 2, hidden, block_m, num_tokens_per_expert);
-    Runtime::swiglu(intermediate_hidden, fast_math,
-                    Runtime::grid_for(static_cast<int64_t>(num_est_rows) * (intermediate_hidden / 128), Runtime::kNumWarps),
-                    l1_out, row_weights, row_pair, total_rows, l2_acts, l2_acts_sf, activation_clamp, sf_stride);
+    const int num_dispatch_blocks = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(
+        runtime->get_num_sms(), ceil_div<int64_t>(static_cast<int64_t>(num_est_tokens) * num_topk, Runtime::kPairsPerDispatchBlock))));
+    Runtime::dispatch(num_ranks, num_local_experts, hidden, num_topk, block_m, num_dispatch_blocks, sym, x, x_sf, topk_weights, topk_idx,
+                      recv_x, recv_x_sf, recv_topk_weights, recv_topk_idx, ctrl, pair_rows, pair_stride, row_pair, psum_layout, stats,
+                      total_rows, l1_acts, l1_acts_sf, row_weights, sf_stride, num_tokens, num_max_tokens_per_rank);
+    // L1 leaves the SwiGLU/FP8 rows of L2 in `l2_acts`: its BF16 output never leaves the CTA, so D is not written
+    // (`l2_out` stands in for it)
+    SM120GemmEpilogue swiglu_epilogue;
+    swiglu_epilogue.kind = SM120MegaMoEEpilogue::SwiGLU;
+    swiglu_epilogue.fast_math = fast_math;
+    swiglu_epilogue.args.row_pair = row_pair.data_ptr<int>();
+    swiglu_epilogue.args.row_weights = row_weights.data_ptr<float>();
+    swiglu_epilogue.args.l2_acts = reinterpret_cast<uint8_t*>(l2_acts.data_ptr());
+    swiglu_epilogue.args.l2_acts_sf = l2_acts_sf.data_ptr<int>();
+    swiglu_epilogue.args.activation_clamp = activation_clamp;
+    swiglu_epilogue.args.sf_stride = sf_stride;
+    sm120_mega_moe_grouped_gemm(l1_acts, l1_acts_sf, l1_weights, l1_weights_sf, l2_out, psum_layout,
+                                num_local_experts, num_rows, intermediate_hidden * 2, hidden, block_m, num_tokens_per_expert,
+                                swiglu_epilogue);
     sm120_mega_moe_grouped_gemm(l2_acts, l2_acts_sf, l2_weights, l2_weights_sf, l2_out, psum_layout,
-                                num_local_experts, num_rows, hidden, intermediate_hidden, block_m, num_tokens_per_expert);
+                                num_local_experts, num_rows, hidden, intermediate_hidden, block_m, num_tokens_per_expert, {});
     if (is_multi_rank) {
         Runtime::send_rows(num_ranks, hidden, num_topk, Runtime::grid_for(num_est_rows, Runtime::kNumWarps), sym, l2_out, row_pair,
                            total_rows, combine_rows);

@@ -31,6 +31,8 @@ struct GemmDesc {
 
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
+    // Shared memory the kernel's fused epilogue needs besides the pipeline (SM120 mega MoE)
+    int epilogue_smem_bytes = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
     int get_expected_n() const { return expected_n > 0 ? expected_n : n; }
     int get_expected_k() const { return expected_k > 0 ? expected_k : k; }

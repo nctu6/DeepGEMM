@@ -7,7 +7,8 @@ import deep_gemm
 from deep_gemm.testing import bench_kineto, calc_diff
 from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
 # SM120 `fp8_fp4_mega_moe` on one rank: the fused SM100 kernel needs TMEM, 2-CTA UMMA and NVLink symmetric memory, so
-# SM120 runs dispatch, the two m-grouped FP8 x FP4 GEMMs, SwiGLU and combine as separate kernels. The reference below
+# SM120 runs dispatch (with the gather), the two m-grouped FP8 x FP4 GEMMs (SwiGLU in the first one's epilogue) and the
+# combine as separate kernels. The reference below
 # replays the same arithmetic in PyTorch (dequantized FP32 GEMMs, BF16 rounding of the L1 output, BF16 clamp, SwiGLU,
 # top-k weight, per-32 UE8M0 FP8 cast, FP32 combine of BF16 rows), so only the GEMM accumulation order differs
 
@@ -111,7 +112,7 @@ def test(args):
             y_ref = reference(x_fp8, x_sf_float, topk_idx, topk_weights, l1, l2, args.activation_clamp)
             diff = calc_diff(y, y_ref)
             assert diff < 1e-4, f'{num_tokens=}: {diff=}'
-        names = ('mega_moe_dispatch', 'mega_moe_gather', 'gemm_1d1d', 'mega_moe_swiglu', 'mega_moe_combine')
+        names = ('mega_moe_dispatch', 'gemm_1d1d', 'mega_moe_combine')
         t = bench_kineto(run, names, suppress_kineto_output=True, with_multiple_kernels=True)
         print(f' > tokens={num_tokens:5}, H={hidden}, I={intermediate}, experts={num_topk}/{num_experts}: '
               f'diff={diff:.1e}, {sum(t) * 1e6:7.1f} us ({", ".join(f"{n.split("_")[-1]} {x * 1e6:.1f}" for n, x in zip(names, t))})', flush=True)
@@ -160,6 +161,79 @@ def test_scratch_is_sized_once(args):
     print(' > the mega MoE scratch is sized by the first call', flush=True)
 
 
+def test_tile_height_and_graph_replay(args):
+    # The dispatch lays every expert out in runs of `BLOCK_M` rows and the fused SwiGLU epilogue of L1 works on 64-row
+    # slices of a tile, so the tile height changes which CTA, warp and slice handles a row, but no value: every tile
+    # height gives the same bits. A CUDA graph captured once and replayed with new inputs (routing included) gives the
+    # bits of an eager call
+    hidden, intermediate, num_experts, num_topk = args.hidden, args.intermediate_hidden, args.num_experts, args.num_topk
+    max_tokens = 512
+    group = dist.group.WORLD
+    buffer = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, max_tokens, num_topk, hidden, intermediate,
+                                                    mma_type='fp8xfp4')
+    weights = []
+    for n, k in ((intermediate * 2, hidden), (hidden, intermediate)):
+        w = torch.randn((num_experts, n, k), dtype=torch.bfloat16, device='cuda')
+        data = torch.empty((num_experts, n, k // 2), dtype=torch.int8, device='cuda')
+        sf = torch.empty((num_experts, n, k // 32), dtype=torch.float, device='cuda')
+        for i in range(num_experts):
+            data[i], sf[i] = per_token_cast_to_fp4(w[i], use_ue8m0=True, gran_k=32)
+        weights.append((data, deep_gemm.transform_sf_into_required_layout(sf, n, k, (1, 32), num_experts)))
+    t_l1, t_l2 = deep_gemm.transform_weights_for_mega_moe(*weights)
+
+    def make_inputs(num_tokens):
+        x_fp8, x_sf = per_token_cast_to_fp8(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda'),
+                                            use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        topk_weights, topk_idx = torch.topk(torch.randn((num_tokens, num_experts), device='cuda'), num_topk, dim=-1)
+        topk_idx.masked_fill_(torch.rand_like(topk_weights) < 0.2, -1)
+        # A token with every slot masked has a zero row
+        topk_idx[0] = -1
+        return x_fp8, x_sf, topk_idx, topk_weights.softmax(-1)
+
+    def stage(inputs):
+        x_fp8, x_sf, topk_idx, topk_weights = inputs
+        num_tokens = x_fp8.shape[0]
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens].copy_(x_sf)
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+    def call(y):
+        deep_gemm.fp8_fp4_mega_moe(y, t_l1, t_l2, buffer, activation_clamp=args.activation_clamp, fast_math=True)
+
+    for num_tokens in (1, 5, 300):
+        inputs = make_inputs(num_tokens)
+        stage(inputs)
+        results = []
+        for block_m in (16, 32, 64, 128):
+            os.environ['DG_SM120_MEGA_BLOCK_M'] = str(block_m)
+            y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+            call(y)
+            results.append(y)
+        del os.environ['DG_SM120_MEGA_BLOCK_M']
+        assert not results[0][0].any(), 'a token without routed slots must be zero'
+        for block_m, y in zip((32, 64, 128), results[1:]):
+            assert torch.equal(y, results[0]), f'{num_tokens=}: BLOCK_M {block_m} differs from BLOCK_M 16'
+
+        # Graph: capture with one routing, replay with another
+        y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        stage(make_inputs(num_tokens))
+        call(y)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call(y)
+        replay_inputs = make_inputs(num_tokens)
+        stage(replay_inputs)
+        graph.replay()
+        y_eager = torch.empty_like(y)
+        call(y_eager)
+        torch.cuda.synchronize()
+        assert torch.equal(y, y_eager), f'{num_tokens=}: graph replay differs from an eager call'
+    buffer.destroy()
+    print(' > tile heights 16-128 give the same bits; graph replay equals eager', flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='SM120 mega MoE (one rank)')
     parser.add_argument('--num-tokens', type=int, nargs='+', default=[1, 7, 64, 300])
@@ -173,3 +247,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     test(args)
     test_scratch_is_sized_once(args)
+    test_tile_height_and_graph_replay(args)

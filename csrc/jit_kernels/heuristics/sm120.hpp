@@ -7,6 +7,7 @@
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/impls/sm120_mega_moe_epilogue.cuh>
 
 #include "common.hpp"
 #include "utils.hpp"
@@ -70,6 +71,14 @@ struct SM120ArchSpec {
             return 0;
         const int num_accum = (block_m / 16) * (block_n / 2 / 8) * 4;
         return align(num_accum * (get_num_math_threads(KernelType::Kernel1D1D, block_m, block_n) / get_num_k_warps(block_n)) * 4, 128);
+    }
+
+    // Shared memory of the mega MoE's fused SwiGLU epilogue: up to 64 rows of the tile as BF16, each row padded by 16 bytes
+    // (mirrors `SMEM_EPILOGUE_SIZE` in `sm120_fp8_fp4_gemm_1d1d.cuh`)
+    static int get_mega_moe_epilogue_smem(const SM120MegaMoEEpilogue& epilogue, const int& block_m, const int& block_n) {
+        if (epilogue != SM120MegaMoEEpilogue::SwiGLU)
+            return 0;
+        return align(std::min(block_m, 64) * (block_n + 8) * 2, 128);
     }
 
     static bool is_warp_tiling_legal(const KernelType& kernel_type, const int& block_m, const int& block_n) {
@@ -229,8 +238,8 @@ struct SM120ArchSpec {
         }
         const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sf_per_stage;
         const int smem_reduce = is_1d1d_kernel(desc.kernel_type) ? get_k_warp_reduce_smem(layout.block_m, layout.block_n) : 0;
-        const int num_stages = std::min((get_smem_capacity() - smem_barriers - smem_reduce) / smem_per_stage, kNumMaxStages);
-        return {smem_barriers + smem_reduce + num_stages * smem_per_stage, num_stages, 0};
+        const int num_stages = std::min((get_smem_capacity() - smem_barriers - smem_reduce - desc.epilogue_smem_bytes) / smem_per_stage, kNumMaxStages);
+        return {smem_barriers + smem_reduce + desc.epilogue_smem_bytes + num_stages * smem_per_stage, num_stages, 0};
     }
 
     static LaunchConfig get_launch_config(const GemmDesc& desc, const Layout& layout) {
