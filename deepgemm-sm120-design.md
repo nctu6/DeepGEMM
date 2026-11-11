@@ -1324,8 +1324,9 @@ Other notes:
    size, 1.35x at 128 tokens); the sharded index-candidate top-k uses DeepSelect
    (1.25-4.7x); the BF16 einsum heads are one launch; the whisper graph-capture
    flake was the cyclic GC freeing a dead CUDA graph inside a capture
-   (`gc_paused_for_capture`). Open: the host paths of `fp8_mqa_logits` (26 us)
-   and DeepSelect (34 us) are what is left of a 128-token DSA chunk.
+   (`gc_paused_for_capture`). The host paths of `fp8_mqa_logits` (26 us)
+   and DeepSelect (34 us) that were left of a 128-token DSA chunk are cut to about 14.5 and 16.5 us
+   in task 37 (analysis 9.41).
 
 ## 11. Reproducing
 
