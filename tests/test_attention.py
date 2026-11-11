@@ -176,17 +176,20 @@ def test_mqa_logits():
         logits = deep_gemm.fp8_fp4_mqa_logits(**kernel_kwargs)
         assert logits.dtype == dtype
 
+        # Only the first `ke - ks` columns of a row are defined; the padding up to `max_seqlen_k` is never written, so
+        # compare the valid entries alone (a `masked_fill` would copy the padding too, which `initcheck` reports as
+        # an uninitialized read)
         self_mask = torch.arange(logits.size(1), device='cuda')[None, :] < (ke - ks)[:, None]
-        masked_logits = logits.masked_fill(~self_mask, 0)
+        masked_logits = logits[self_mask]
         for _ in range(20):
-            logits_again = deep_gemm.fp8_fp4_mqa_logits(**kernel_kwargs).masked_fill(~self_mask, 0)
+            logits_again = deep_gemm.fp8_fp4_mqa_logits(**kernel_kwargs)[self_mask]
             assert_bitwise_equal(logits_again, masked_logits, 'mqa logits self-consistency')
 
         workspace = None
         if get_arch_major() == 10:
             workspace = deep_gemm.get_mqa_logits_metadata(ks, ke, seq_len_kv, num_heads)
             scheduled_logits = deep_gemm.fp8_fp4_mqa_logits(**kernel_kwargs, schedule_meta=workspace)
-            scheduled_logits = scheduled_logits.masked_fill(~self_mask, 0)
+            scheduled_logits = scheduled_logits[self_mask]
             assert_bitwise_equal(scheduled_logits, masked_logits, 'mqa logits scheduled path')
 
         # Expand the compressed result for comparison with the dense reference.

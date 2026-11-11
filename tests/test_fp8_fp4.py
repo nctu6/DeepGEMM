@@ -537,6 +537,45 @@ def test_deterministic_is_batch_invariant_sm120() -> None:
     print(' > Passed\n')
 
 
+@test_filter(lambda: get_arch_major() == 12)
+def test_psum_gaps_do_not_reach_valid_rows_sm120() -> None:
+    # The PSUM layout pads every group up to the MK alignment, and the generators leave those rows uninitialized. The
+    # SM120 kernels read the padding rows at tile granularity (their data and scales; `compute-sanitizer --tool initcheck`
+    # reports it) and write garbage rows back, which is harmless only while rows stay independent. Fill the padding with
+    # zeros and with NaN (FP8 0x7f): the valid rows must be bitwise equal and match the reference
+    print('Testing PSUM padding rows:')
+    kernel_type = KernelType.Kernel1D2D
+    configs = [(QuantConfig(), 6, 20, 4096, 2048), (QuantConfig(), 4, 192, 4096, 4096),
+               (QuantConfig((32, 32, False, True)), 6, 20, 4096, 2048), (QuantConfig((32, 32, False, True)), 4, 192, 4096, 4096)]
+    for quant_config, num_groups, expected_m_per_group, n, k in configs:
+        use_ue8m0 = get_ue8m0_usage(kernel_type, quant_config)
+        recipe, recipe_a, recipe_b = quant_config.get_recipes()
+        expected_m = int(expected_m_per_group * 1.2)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(expected_m))
+        (a_data, a_sf), b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_masked(
+            num_groups, 2 * expected_m_per_group, expected_m_per_group, n, k,
+            use_ue8m0=use_ue8m0, use_psum_layout=True, quant_config=quant_config)
+        gaps = ~valid_mask
+        assert gaps.any(), 'the shapes must leave padding rows'
+        results = {}
+        for name, data_byte, sf_value in (('zero', 0, 0.0), ('nan', 0x7f, float('nan'))):
+            filled_data, filled_sf = a_data.clone(), a_sf.clone()
+            filled_data.view(torch.uint8)[gaps] = data_byte
+            filled_sf[gaps] = sf_value
+            out = torch.zeros_like(d)
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                (filled_data, filled_sf), b, out, grouped_layout, use_psum_layout=True,
+                expected_m_for_psum_layout=expected_m, disable_ue8m0_cast=not use_ue8m0,
+                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+            results[name] = out[valid_mask]
+        label = f'{quant_config.is_fp4_b=}, {num_groups=}, {expected_m_per_group=}, {n=}, {k=}'
+        assert_bitwise_equal(results['nan'], results['zero'], f'PSUM padding rows reached a valid row: {label}')
+        diff = calc_diff(results['nan'], ref_d[valid_mask])
+        assert diff < quant_config.max_diff(), f'{label}, {diff:.5f}'
+    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+    print(' > Passed\n')
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -551,3 +590,4 @@ if __name__ == '__main__':
     test_mixed_ue8m0_and_fp32_scale_pair()
     test_mn_major_fp8_sm120()
     test_deterministic_is_batch_invariant_sm120()
+    test_psum_gaps_do_not_reach_valid_rows_sm120()
