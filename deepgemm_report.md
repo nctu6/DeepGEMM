@@ -67,6 +67,8 @@ table is design 7.8).
 | MLA decode (task 17) | `cute_dsl_mla_mma_decode_with_kvcache` | `triton_mla_mma_decode_with_kvcache` | 1.46x geomean (128 points), 1.84x on 4/8-row blocks | 0.97x BF16 16 heads, 2 x 1K |
 | V4 / V4.1 prefill attention (task 17) | `cute_dsl_dsv4_mma_prefill` (> 16 heads) | `triton_dsv4_mma_prefill` | 1.13x geomean (117 points), 0.89-1.63x | 0.89x window-only rows at 1-2 tokens |
 | V4.1 decode, packed rows (task 18) | `triton_dsv41_mma_selected_attention` | gather into BF16 workspace + same kernel | 1.66x geomean (21 points), 1.01-3.67x | 1.01x, 128 heads, 128 tokens |
+| V4 decode, FP8 page-planar rows read in the CuTe core (task 36) | `cute_dsl_dsv4_mma_decode` (dequantizing gather, no BF16 workspace; bitwise equal) | `triton_dsv4_decode` (workspace + CuTe core above 16 heads); `triton_dsv4_mma_decode` | 1.75x geomean over the workspace route (105 points, 8-128 heads, widths 128 / 640 / 1152, 1-2048 tokens), 1.06-5.14x; 1.71x over the Triton direct reader, 1.12-2.23x | 1.06x workspace (128 heads, 16 tokens, 1152 rows) / 1.12x Triton |
+| V4.1 decode, packed rows read in the CuTe core (task 36) | `cute_dsl_dsv41_mma_selected_attention` (FP8 `swa` + FP4 `global`, bitwise equal) | gather glue + `cute_dsl_dsv4_mma_prefill`; `triton_dsv41_mma_selected_attention` | 3.12x geomean over the workspace route (1.43-7.93x), 1.62x over the Triton direct reader (0.94-3.02x; 1.92x with a compressed cache, 1.16x window-only) | 0.94x vs Triton, 64 heads, window-only, 1 token (0.4 us of 7) |
 | MLA decode / V4 prefill / Hadamard (Triton, task 14) | `triton_*_mma_*` | portable Triton leaves | MLA 14-131x, V4 4-9x, Hadamard 55-117x from 512 tokens | Hadamard 0.9x at 1 token (launch-bound) |
 | mHC | `tf32_hc_prenorm_gemm` leaves | Triton | `mhc_pre` 1.5-13.6x, `mhc_mixes` 1.6-15x | 1.5x |
 
@@ -136,8 +138,9 @@ the installed build reports SM120 kernels (`deep_gemm.get_supported_arch_majors(
 - Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs). Done in task 22: real V4.1 with 128 experts on two GPUs, and real MLA on Moonlight-16B. V4 cannot load (no TokenSpeed model class). No V3.2, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box (analysis 9.27).
 - Three heavy tests (FP8 k-grouped, FP8 masked, `test_mqa_logits`) do not finish under compute-sanitizer in 15-40 min; no error before the limit.
 - `test_deepseek_v41_model[eager]` failed once in three full runs during task 14 and never reproduced. Task 25 (analysis 9.31) closed it as not reproducible: sanitizers (memcheck, racecheck, initcheck, synccheck) clean, poisoned allocations and stream delays change no bit, about 1400 eager runs and 46 whole-file runs pass; the original failure text is lost, so a recurrence needs its output kept.
-- Tasks 1-33 are pushed to `origin/nctu6` in both repos; tasks 34 and 35 are committed locally and not pushed. `test_projection_tp` runs only tp2 here (tp4 / tp8 need 4 and 8 NVLink GPUs). TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107, so upstreaming needs that scope to change.
+- Tasks 1-33 are pushed to `origin/nctu6` in both repos; tasks 34-36 are committed locally and not pushed. `test_projection_tp` runs only tp2 here (tp4 / tp8 need 4 and 8 NVLink GPUs). TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90/sm100/sm103/sm107, so upstreaming needs that scope to change.
 
+- CuTe DSL V4 / V4.1 decode that reads the packed rows is done (task 36, analysis 9.40): bit-identical to the workspace route, selected for every head count. Open there: the 32-head packed CTA spills 120-168 bytes (20 registers hold the next tile's packed bytes), and V4.1 window-only layers at 32-128 heads tie with the Triton direct reader for 1-4 and 256+ tokens (0.94-1.06x).
 ## 8. Where to read more
 
 | Topic | Where |
