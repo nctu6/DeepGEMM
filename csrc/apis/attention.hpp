@@ -137,7 +137,8 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     const int stride_logits_alignment = 1024 / static_cast<int>(c10::elementSize(out_dtype));
     const int stride_logits = align(align(max_seqlen_k, block_kv), stride_logits_alignment);
     auto logits = torch::empty({aligned_seq_len, stride_logits}, q_fp.options().dtype(out_dtype));
-    logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, max_seqlen_k)});
+    // The view of the first `seq_len` rows and `max_seqlen_k` columns (one `as_strided`, not two slices through `index`)
+    logits = logits.as_strided({seq_len, max_seqlen_k}, {stride_logits, 1});
 
     // Dispatch implementation
     if (arch_major == 10) {

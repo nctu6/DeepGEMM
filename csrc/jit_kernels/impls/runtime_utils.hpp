@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <string>
 #include <utility>
@@ -19,6 +20,12 @@
 #include "../../utils/exception.hpp"
 
 namespace deep_gemm {
+
+// `deep_jit::get_env<int>(name, default_value)` without building a `std::string` per read (a 16-character name
+// allocates), for the tensor-map builders that read two variables per descriptor. Same parsing and errors.
+static int get_env_int_fast(const char* name, const int& default_value = 0) {
+    return std::getenv(name) == nullptr ? default_value : deep_jit::get_env<int>(name, default_value);
+}
 
 static std::pair<int, int> get_inner_outer_dims(const cute::UMMA::Major& major, const int& k, const int& mn) {
     return major == cute::UMMA::Major::K ? std::make_pair(k, mn) : std::make_pair(mn, k);
@@ -118,7 +125,7 @@ static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const in
 
 // L2 promotion of 2D TMA loads (`DG_TMA_L2_PROMOTION` = 0 / 64 / 128 / 256 bytes, developer override; default 256)
 static CUtensorMapL2promotion get_tma_l2_promotion() {
-    switch (deep_jit::get_env<int>("DG_TMA_L2_PROMOTION", 256)) {
+    switch (get_env_int_fast("DG_TMA_L2_PROMOTION", 256)) {
         case 0:   return CU_TENSOR_MAP_L2_PROMOTION_NONE;
         case 64:  return CU_TENSOR_MAP_L2_PROMOTION_L2_64B;
         case 128: return CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
@@ -154,7 +161,7 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim), static_cast<cuuint32_t>(smem_outer_dim)};
     const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(gmem_outer_stride * elem_size), };
     const cuuint32_t elem_strides[2] = {1, 1};
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+    if (get_env_int_fast("DG_PRINT_CONFIGS")) {
         printf("Making TMA desc: global memory: %d %d, shared memory: %d %d, outer stride: %d, swizzle: %d (base: %d), elem size: %d, pointer: %llu\n",
                gmem_inner_dim, gmem_outer_dim, smem_inner_dim, smem_outer_dim,
                gmem_outer_stride, swizzle_mode, swizzle_base, elem_size,
@@ -198,7 +205,7 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
     const cuuint32_t smem_dims[3] = {static_cast<cuuint32_t>(smem_dim_0), static_cast<cuuint32_t>(smem_dim_1), static_cast<cuuint32_t>(smem_dim_2)};
     const cuuint64_t gmem_strides[2] = {static_cast<cuuint64_t>(gmem_stride_0 * elem_size), static_cast<cuuint64_t>(gmem_stride_1 * elem_size)};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+    if (get_env_int_fast("DG_PRINT_CONFIGS")) {
         printf("Making 3D TMA desc: global memory: %d %d %d, shared memory: %d %d %d, outer stride: %d %d, swizzle: %d, elem size: %d\n",
                gmem_dim_0, gmem_dim_1, gmem_dim_2, smem_dim_0, smem_dim_1, smem_dim_2,
                gmem_stride_0, gmem_stride_1, swizzle_mode, elem_size);
@@ -243,7 +250,7 @@ static CUtensorMap make_tma_4d_desc(const torch::Tensor& t,
     const cuuint32_t smem_dims[4] = {static_cast<cuuint32_t>(smem_dim_0), static_cast<cuuint32_t>(smem_dim_1), static_cast<cuuint32_t>(smem_dim_2), static_cast<cuuint32_t>(smem_dim_3)};
     const cuuint64_t gmem_strides[3] = {num_gmem_stride_0_bytes, num_gmem_stride_1_bytes, num_gmem_stride_2_bytes};
     const cuuint32_t elem_strides[4] = {1, 1, 1, 1};
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+    if (get_env_int_fast("DG_PRINT_CONFIGS")) {
         printf("Making 4D TMA desc: global memory: %d %d %d %d, shared memory: %d %d %d %d, outer stride: %ld %ld %ld, swizzle: %d, elem size: %d\n",
                gmem_dim_0, gmem_dim_1, gmem_dim_2, gmem_dim_3, smem_dim_0, smem_dim_1, smem_dim_2, smem_dim_3,
                gmem_stride_0, gmem_stride_1, gmem_stride_2, swizzle_mode, elem_size);
@@ -290,7 +297,7 @@ static CUtensorMap make_tma_5d_desc(const torch::Tensor& t,
     const cuuint32_t smem_dims[5] = {static_cast<cuuint32_t>(smem_dim_0), static_cast<cuuint32_t>(smem_dim_1), static_cast<cuuint32_t>(smem_dim_2), static_cast<cuuint32_t>(smem_dim_3), static_cast<cuuint32_t>(smem_dim_4)};
     const cuuint64_t gmem_strides[4] = {num_gmem_stride_0_bytes, num_gmem_stride_1_bytes, num_gmem_stride_2_bytes, num_gmem_stride_3_bytes};
     const cuuint32_t elem_strides[5] = {1, 1, 1, 1, 1};
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+    if (get_env_int_fast("DG_PRINT_CONFIGS")) {
         printf("Making 5D TMA desc: global memory: %d %d %d %d %d, shared memory: %d %d %d %d %d, outer stride: %ld %ld %ld %ld, swizzle: %d, elem size: %d\n",
                gmem_dim_0, gmem_dim_1, gmem_dim_2, gmem_dim_3, gmem_dim_4, smem_dim_0, smem_dim_1, smem_dim_2, smem_dim_3, smem_dim_4,
                gmem_stride_0, gmem_stride_1, gmem_stride_2, gmem_stride_3, swizzle_mode, elem_size);

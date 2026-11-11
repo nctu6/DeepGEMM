@@ -5,6 +5,7 @@
 #include "../../runtime/runtime.hpp"
 #include "../heuristics/sm120.hpp"
 
+#include "kernel_lookup.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -57,7 +58,10 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += (num_q_stages * 2 + num_kv_stages * 2) * 8;
     DG_HOST_ASSERT(smem_size <= SM120ArchSpec::get_smem_capacity());
 
-    const auto kernel = jit->compile("sm120_fp8_mqa_logits", std::format(R"(
+    const auto logits_dtype = logits.scalar_type();
+    const auto kernel = get_cached_kernel("sm120_fp8_mqa_logits", std::array<int64_t, 6>{
+        num_heads, head_dim, block_q, block_kv, num_sms, static_cast<int64_t>(logits_dtype)}, [&] {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -73,12 +77,13 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
-    num_heads, head_dim,
-    block_q, block_kv,
-    num_q_stages, num_kv_stages,
-    num_sms,
-    num_specialized_threads, num_math_threads,
-    to_string(logits.scalar_type())));
+        num_heads, head_dim,
+        block_q, block_kv,
+        num_q_stages, num_kv_stages,
+        num_sms,
+        num_specialized_threads, num_math_threads,
+        to_string(logits_dtype));
+    });
 
     jit->launch(
         kernel, {
@@ -144,7 +149,11 @@ static void sm120_fp8_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor
     smem_size = align(smem_size, 16) + (num_q_stages * 2 + num_kv_stages * 2) * 16;
     DG_HOST_ASSERT(smem_size <= SM120ArchSpec::get_smem_capacity());
 
-    const auto kernel = jit->compile("sm120_fp8_fp4_mqa_logits", std::format(R"(
+    const auto weights_dtype = weights.scalar_type(), logits_dtype = logits.scalar_type();
+    const auto kernel = get_cached_kernel("sm120_fp8_fp4_mqa_logits", std::array<int64_t, 9>{
+        num_heads, head_dim, block_q, block_kv, num_kv_stages, num_sms, is_fp4,
+        static_cast<int64_t>(weights_dtype), static_cast<int64_t>(logits_dtype)}, [&] {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_fp4_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -160,12 +169,13 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
-    num_heads, head_dim,
-    block_q, block_kv,
-    num_q_stages, num_kv_stages,
-    num_sms,
-    num_specialized_threads, num_math_threads,
-    is_fp4 ? "true" : "false", to_string(weights.scalar_type()), to_string(logits.scalar_type())));
+        num_heads, head_dim,
+        block_q, block_kv,
+        num_q_stages, num_kv_stages,
+        num_sms,
+        num_specialized_threads, num_math_threads,
+        is_fp4 ? "true" : "false", to_string(weights_dtype), to_string(logits_dtype));
+    });
 
     jit->launch(
         kernel, {
