@@ -1025,8 +1025,9 @@ bullet's capacity trade is gone and the cache format is unchanged.
   kernel for Full passes, the contiguous kernel for one request's chunk, FP32
   logits, then the CuTe DSL DeepSelect; Reindex scores the whole history and
   gathers the pool, or reads only the pool with the sparse kernel where that
-  wins (`_sparse_reindex_wins`: paged histories past the 16K-row pool from 2^21
-  scores, one request's chunk from four or eight times the pool).
+  wins (`_sparse_reindex_wins`: histories of at least twice the 16K-row pool; before
+  task 35 the sparse kernel was slower and the rule depended on rows and layout,
+  analysis 9.39).
 - Against `triton_dsv41_index_topk` (CUDA graph, 32 heads, top-k 512, 2048
   candidate blocks): decode Full 5.6-16x, candidate-source Full 7.7-33x,
   Reindex 2.2-22x; chunked prefill 11-46x, 22-88x, 6.8-22x. Every pass wins.
