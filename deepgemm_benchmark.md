@@ -620,8 +620,9 @@ Fatal Python error: Aborted
 
 `[L2] writeback queued/started` lines come right before the abort. The gateway keeps the container "Up" and
 `/health` green, so these first runs (before the watchdog existed) left the client hanging or getting connection
-errors. Which path erased or skipped the descriptor was not traced (task 50). These runs use the same flags as
-the primary set minus the env variable. They are kept as the finding, not compared, and not used in any ratio.
+errors. Task 50 traced it: a hybrid model's state checkpoint outlived the KV of its boundary, the drain erased the
+boundary's descriptor, and the checkpoint's later eviction hit the check; fixed in the scheduler (section 5.1 and
+`deepgemm-analysis.md` 9.46). These runs use the same flags as the primary set minus the env variable. They are kept as the finding, not compared, and not used in any ratio.
 
 First default-config sessions (`default/<model>/<image>/`, RAG only):
 
@@ -680,6 +681,15 @@ Repro with the watchdog (`repro_queue.txt`, `restart_queue.txt`, fresh server pe
   (`server-20261112-064147.log` line 3158), the server restarted (336 s, `server-20261112-065158.log`), and
   C=16 completed on the new server (`restart_count=1`).
 - Only the FP8 27B model was run with KV events on. The crash is in the scheduler, not in the model.
+
+### 5.1 Rerun with the fixed scheduler (task 50)
+The scheduler fix (TokenSpeed `d61649596`) was built as the Python extension from the same source tree and mounted
+over `tokenspeed_scheduler_ext` in `nctu6/tokenspeed:ef057889-20261112` (nothing else changed: no scheduler or
+runtime diff between that commit and the fix besides it). Default config, KV events on (`kv_events_config` with the
+ZMQ publisher, no `SMG_TOKENSPEED_SERVICER_KV_EVENTS`), Qwen3.8-27B-FP8, TP1, GPU 6, RAG 500 prompts, C=64 then
+C=128 on a fresh server (`results/fix50/`): C=64 500 ok / 0 errors in 124.7 s (1060.7 output tok/s); C=128 500 ok /
+0 errors in 103.6 s (1284.7 output tok/s), no fatal line, where the unfixed image died 35 s into C=128. One run per
+point; the numbers show that the run completes, not a comparison (the primary set uses the env variable).
 
 ## 6. Excluded agentX smoke runs (`agentx_smoke/`)
 
