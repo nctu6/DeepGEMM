@@ -3,7 +3,7 @@
 Long form: [`deepgemm-sm120-design.md`](deepgemm-sm120-design.md) (designs, bugs, every table; the
 section numbers below like "design 7.8" point there). Status log, dead ends and per-task
 measurements: [`deepgemm-analysis.md`](deepgemm-analysis.md) ("analysis 9.x"). Serving benchmark of two
-TokenSpeed images (before / after SM120 work, six models): [`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md).
+TokenSpeed images (before / after SM120 work, six models): [`deepgemm_benchmark.md`](deepgemm_benchmark.md).
 
 ## 1. Purpose and status
 
@@ -15,7 +15,7 @@ TokenSpeed attention leaves run on SM120 and beat the Triton / FlashInfer fallba
 except a few ties and losses listed in section 3 and section 7. Tasks 1-39 are pushed to `origin/nctu6` in both
 repos (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit); use `git log origin/nctu6`
 for the exact heads. Tasks 40-47 benchmark two TokenSpeed images on GPUs 6 and 7
-([`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md), analysis 9.44): the block-FP8 27B model serves
+([`deepgemm_benchmark.md`](deepgemm_benchmark.md), analysis 9.44): the block-FP8 27B model serves
 1.52x faster at C=1 (1.04x at C=512), the BF16 control ties, and both NVFP4 models and the V4.1 subset start only on the
 after image.
 
@@ -84,7 +84,7 @@ End to end (in-process `Engine`):
 - V4.1 topology with dummy weights on the native indexer: prefill 1.11-1.19x, TPOT 1.02-1.06x, same greedy tokens (analysis 9.21).
 - Real V4.1 checkpoint (all 40 layers, Engram, head; first 128 of 384 experts), task 22: every path has the same single-layer error against a float32 reference built from the same weights (2.8% layer 0, 3.7-3.9% layer 2). Task 24 (analysis 9.29) profiled it and moved the dense projections to DeepGEMM: Marlin TP2 14.5-14.8K tok/s prefill, 10.4-10.7 ms TPOT (was 10.2-10.7K, 23-25 ms); MegaMoE DP2/EP2 18.1-18.6K tok/s (1.25x over Marlin), 13.8-14.0 ms TPOT (1.31x behind: DP attention reads every dense weight per GPU, plus MegaMoE glue).
 - Real MLA checkpoint (Moonlight-16B-A3B, one GPU): correct answers; TPOT 2.3-3.2x better than the portable MLA decode at 3K context x 8, a tie at short context (analysis 9.27).
-- Served with `tokenspeed serve` (tasks 40-47, [`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md), analysis 9.44), image `e27cee86` (before) against `ef057889` (after), same flags, RAG at C = 1 .. 512 and agentX at C = 1, 16, 64: Qwen3.8-27B-FP8 output tok/s 1.52x at C=1, 1.28x at 16, 1.11x at 64, 1.04x at 256-512 (TPOT 1.53x at C=1, TTFT 1.00x); Qwen3.6-35B-A3B (BF16 control) and gemma-4-31B-it 1.00-1.03x. Qwen3.8-27B-NVFP4, Qwen3.5-122B-A10B-NVFP4 (TP2) and the V4.1 128-expert subset (TP2) fail to start on the before image and run on the after image (V4.1: Mega MoE 1.01-1.17x over Marlin in RAG, a tie in agentX). One run per point on a shared host.
+- Served with `tokenspeed serve` (tasks 40-48, [`deepgemm_benchmark.md`](deepgemm_benchmark.md): testing conditions, every run, failures; analysis 9.44, 9.45), image `e27cee86` (before) against `ef057889` (after), same flags, RAG at C = 1 .. 512 and agentX at C = 1, 16, 64: Qwen3.8-27B-FP8 output tok/s 1.52x at C=1, 1.28x at 16, 1.11x at 64, 1.04x at 256-512 (TPOT 1.53x at C=1, TTFT 1.00x); Qwen3.6-35B-A3B (BF16 control) and gemma-4-31B-it 1.00-1.03x. Qwen3.8-27B-NVFP4, Qwen3.5-122B-A10B-NVFP4 (TP2) and the V4.1 128-expert subset (TP2) fail to start on the before image and run on the after image (V4.1: Mega MoE 1.01-1.17x over Marlin in RAG, a tie in agentX). One run per point on a shared host.
 
 ## 4. What is not supported, and why
 
@@ -163,5 +163,5 @@ This is the canonical open list; the Open list in `deepgemm-analysis.md` ("Curre
 | TokenSpeed integration, MXFP4 leaves, install | design 8 |
 | Limitations and open items in full | design 9, 10 |
 | Reproducing | design 11 |
-| Served throughput and latency of the before / after TokenSpeed images, six models | [`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md), analysis 9.44 |
+| Served throughput and latency of the before / after TokenSpeed images, six models | [`deepgemm_benchmark.md`](deepgemm_benchmark.md), analysis 9.44, 9.45 |
 | Status log, dead ends, per-task measurements | analysis sections 8, 9, 9.5-9.26 |
