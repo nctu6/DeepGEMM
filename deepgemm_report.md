@@ -11,11 +11,9 @@ adds SM120 (compute capability 12.0, consumer and workstation Blackwell) with ne
 TMA, mbarrier pipelines and `mma.sync`, plus arch-12 host paths, so TokenSpeed can serve
 DeepSeek-style models on RTX PRO 6000. Tasks 1-26 and 29-39 are done: the GEMMs, the indexer kernels and the
 TokenSpeed attention leaves run on SM120 and beat the Triton / FlashInfer fallbacks everywhere
-except a few ties and losses listed in section 3 and section 7. Tasks 1-33 are pushed to `origin/nctu6` in both
-repos; tasks 34-39 (MegaMoE epilogue fusion, the multi-wave sparse MX indexer kernel, the packed-row CuTe V4 / V4.1
-decode, the DSA host path, the compute-sanitizer runs and the final verification) are local commits until the user
-pushes (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit). Use
-`git log origin/nctu6..HEAD` for the exact local commits.
+except a few ties and losses listed in section 3 and section 7. Tasks 1-39 are pushed to `origin/nctu6` in both
+repos (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit); use `git log origin/nctu6`
+for the exact heads.
 
 ## 2. What is supported on SM120
 
@@ -146,7 +144,7 @@ This is the canonical open list; the Open list in `deepgemm-analysis.md` ("Curre
 - Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs). The V4 checkpoint cannot load (no TokenSpeed V4 model class); no V3.2, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box (analysis 9.27).
 - Sanitizers and flakes: the three heavy sanitizer runs are done (analysis 9.42), but the tools see only the shapes the tests launch, the kernel filter leaves torch kernels unchecked in memcheck, synccheck and racecheck, racecheck models shared memory only (the 21 largest cases ran as one launch each) and the repeat loops were cut to 2. The V4.1 eager flake is closed as not reproducible (analysis 9.31); a recurrence needs its pytest output kept.
 - Verification limits: `test_projection_tp` tp4 / tp8 need 4 and 8 NVLink GPUs; scheduler clang-tidy and the C++ build are not run (no ninja on the box); TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90 / sm100 / sm103 / sm107, so upstreaming needs that scope to change; a wheel release is optional (the source build replaces the pin).
-- Push state: tasks 1-33 are pushed to `origin/nctu6` in both repos; tasks 34-39 are local commits until the user pushes (DeepGEMM first, then TokenSpeed).
+- Push state: tasks 1-39 are pushed to `origin/nctu6` in both repos (DeepGEMM first, then TokenSpeed).
 
 ## 8. Where to read more
 
