@@ -2,7 +2,8 @@
 
 Long form: [`deepgemm-sm120-design.md`](deepgemm-sm120-design.md) (designs, bugs, every table; the
 section numbers below like "design 7.8" point there). Status log, dead ends and per-task
-measurements: [`deepgemm-analysis.md`](deepgemm-analysis.md) ("analysis 9.x").
+measurements: [`deepgemm-analysis.md`](deepgemm-analysis.md) ("analysis 9.x"). Serving benchmark of two
+TokenSpeed images (before / after SM120 work, six models): [`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md).
 
 ## 1. Purpose and status
 
@@ -13,7 +14,10 @@ DeepSeek-style models on RTX PRO 6000. Tasks 1-26 and 29-39 are done: the GEMMs,
 TokenSpeed attention leaves run on SM120 and beat the Triton / FlashInfer fallbacks everywhere
 except a few ties and losses listed in section 3 and section 7. Tasks 1-39 are pushed to `origin/nctu6` in both
 repos (DeepGEMM first, then TokenSpeed with its `DeepGEMM` pin on a pushed commit); use `git log origin/nctu6`
-for the exact heads.
+for the exact heads. Tasks 40-47 benchmark two TokenSpeed images on GPUs 6 and 7
+([`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md), analysis 9.44): the block-FP8 27B model serves
+1.52x faster at C=1 (1.04x at C=512), the BF16 control ties, and both NVFP4 models and the V4.1 subset start only on the
+after image.
 
 ## 2. What is supported on SM120
 
@@ -80,6 +84,7 @@ End to end (in-process `Engine`):
 - V4.1 topology with dummy weights on the native indexer: prefill 1.11-1.19x, TPOT 1.02-1.06x, same greedy tokens (analysis 9.21).
 - Real V4.1 checkpoint (all 40 layers, Engram, head; first 128 of 384 experts), task 22: every path has the same single-layer error against a float32 reference built from the same weights (2.8% layer 0, 3.7-3.9% layer 2). Task 24 (analysis 9.29) profiled it and moved the dense projections to DeepGEMM: Marlin TP2 14.5-14.8K tok/s prefill, 10.4-10.7 ms TPOT (was 10.2-10.7K, 23-25 ms); MegaMoE DP2/EP2 18.1-18.6K tok/s (1.25x over Marlin), 13.8-14.0 ms TPOT (1.31x behind: DP attention reads every dense weight per GPU, plus MegaMoE glue).
 - Real MLA checkpoint (Moonlight-16B-A3B, one GPU): correct answers; TPOT 2.3-3.2x better than the portable MLA decode at 3K context x 8, a tie at short context (analysis 9.27).
+- Served with `tokenspeed serve` (tasks 40-47, [`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md), analysis 9.44), image `e27cee86` (before) against `ef057889` (after), same flags, RAG at C = 1 .. 512 and agentX at C = 1, 16, 64: Qwen3.8-27B-FP8 output tok/s 1.52x at C=1, 1.28x at 16, 1.11x at 64, 1.04x at 256-512 (TPOT 1.53x at C=1, TTFT 1.00x); Qwen3.6-35B-A3B (BF16 control) and gemma-4-31B-it 1.00-1.03x. Qwen3.8-27B-NVFP4, Qwen3.5-122B-A10B-NVFP4 (TP2) and the V4.1 128-expert subset (TP2) fail to start on the before image and run on the after image (V4.1: Mega MoE 1.01-1.17x over Marlin in RAG, a tie in agentX). One run per point on a shared host.
 
 ## 4. What is not supported, and why
 
@@ -144,6 +149,7 @@ This is the canonical open list; the Open list in `deepgemm-analysis.md` ("Curre
 - Full-model real-weight runs: V3.2 TP8 (no checkpoint on the box, about 690 GB FP8, all 8 GPUs) and V4.1 with all 384 experts (4 GPUs). The V4 checkpoint cannot load (no TokenSpeed V4 model class); no V3.2, GLM-5.x, dots3-note or V2-Lite checkpoint is on the box (analysis 9.27).
 - Sanitizers and flakes: the three heavy sanitizer runs are done (analysis 9.42), but the tools see only the shapes the tests launch, the kernel filter leaves torch kernels unchecked in memcheck, synccheck and racecheck, racecheck models shared memory only (the 21 largest cases ran as one launch each) and the repeat loops were cut to 2. The V4.1 eager flake is closed as not reproducible (analysis 9.31); a recurrence needs its pytest output kept.
 - Verification limits: `test_projection_tp` tp4 / tp8 need 4 and 8 NVLink GPUs; scheduler clang-tidy and the C++ build are not run (no ninja on the box); TokenSpeed's `AGENTS.md` lists NVIDIA support as sm90 / sm100 / sm103 / sm107, so upstreaming needs that scope to change; a wheel release is optional (the source build replaces the pin).
+- Serving benchmark (tasks 40-47, analysis 9.44): (a) the scheduler aborts under RAG load at C >= 128 in both images when KV-event publishing is on (`Fatal check failed: cache mutation on a KV event boundary with no token descriptor`, `scheduler.cpp:385/386`); the `smg_grpc_servicer` turns it on by default, `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` avoids it; the bookkeeping fix is open. (b) gemma-4-31B-it at TP1 has `max_req_input_len` 199,614 (KV capacity 293,760 tokens), below the 256K agentX traces, so agentX at C = 16 and 64 is not runnable on one GPU (needs TP2 or a smaller footprint). (c) The gateway's default parser selection (`hf` tool-call parser) fails every gemma-4 chat request with HTTP 400; `--tool-call-parser gemma4` avoids it. (d) The default `max_cudagraph_capture_size` is 160 while the benchmark ran `--max-num-seqs 512`; on V4.1 the decode step goes from about 49 ms at batch 116 to 130-140 ms at batch 244-500, so C >= 256 numbers are not graph numbers (whether that is an eager fallback was not verified, and a larger capture size was not tried). The before-image NVFP4 and V4.1 start failures are fixed in the after image, so they are not open.
 - Push state: tasks 1-39 are pushed to `origin/nctu6` in both repos (DeepGEMM first, then TokenSpeed).
 
 ## 8. Where to read more
@@ -157,4 +163,5 @@ This is the canonical open list; the Open list in `deepgemm-analysis.md` ("Curre
 | TokenSpeed integration, MXFP4 leaves, install | design 8 |
 | Limitations and open items in full | design 9, 10 |
 | Reproducing | design 11 |
+| Served throughput and latency of the before / after TokenSpeed images, six models | [`deepgemm-image-benchmark.md`](deepgemm-image-benchmark.md), analysis 9.44 |
 | Status log, dead ends, per-task measurements | analysis sections 8, 9, 9.5-9.26 |
