@@ -766,6 +766,14 @@ C=128 on a fresh server (`results/fix50/`): C=64 500 ok / 0 errors in 124.7 s (1
 0 errors in 103.6 s (1284.7 output tok/s), no fatal line, where the unfixed image died 35 s into C=128. One run per
 point; the numbers show that the run completes, not a comparison (the primary set uses the env variable).
 
+### 5.2 Verification of the fixes (task 54)
+Local TokenSpeed head `c4681daa6` (tasks 50-53), GPU 7. C++ scheduler tests 610 passed, scheduler Python tests 251,
+`test/cli` 200, runtime suite 9018 passed (top-level files 6798), 0 failed; `pre-commit run --all-files` clean.
+In-process probes with KV events on and the scheduler extension of the head: Qwen3.8-27B-FP8, Qwen3.8-27B-NVFP4 and
+Qwen3.6-35B-A3B answer "Paris" and "2, 3, 5, 7, 11". gemma-4-31B-it served by `tokenspeed serve` (after image, changed
+files mounted, default parser args, KV events on): completions and chat answer correctly and a `get_weather` tool call
+is parsed. No TP2 probe: GPU 6 was held by another user's job. Details: `deepgemm-analysis.md` 9.50.
+
 ## 6. Excluded agentX smoke runs (`agentx_smoke/`)
 
 The first agentX runs used smoke mode: `--num-dataset-entries 8`, `--benchmark-duration 240`,
