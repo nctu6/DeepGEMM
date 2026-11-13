@@ -15,7 +15,7 @@ The tables are generated (section 8). Server log lines are quoted with their pat
 ## 1. Summary
 
 Ratio convention: output tok/s is after over before, and TTFT p50 and TPOT p50 are before over after, so a
-value above 1.00x always means the after image is better. One run per point, no repeats. Cells are
+value above 1.00x always means the after image is better. One run per point (repeat spread of the headline points in section 3.10). Cells are
 `before / after (ratio)`. "after only" rows have no before value, because the before image does not start
 that model (section 4.1). The last row compares the two MoE backends of V4.1 on the after image
 (`Marlin / mega_moe`, ratio = mega_moe against Marlin). TTFT and TPOT are in ms.
@@ -653,6 +653,98 @@ within 1%). These are inside the spread of one shared-host run. The batch here i
 requests), so it sits around the old cap and the ladder coverage does not decide it. Decision: keep the default (cap =
 `max_num_seqs`); no code change. Explicit `--max-cudagraph-capture-size` remains the way to trade graphs for KV.
 
+### 3.10 Repeat spread (task 59)
+Question: which of the single-run ratios above are larger than the run-to-run spread? Same after image
+`ef057889-20261112`, head `5b2ecbcfe` files mounted (`forward_step.py`, `server_args.py`, `serve_smg.py`) and the task 50
+scheduler extension, KV events on, default CUDA graph ladder, standard RAG protocol (500 prompts, ISL ~800, 256 output
+tokens). A fresh server per repeat, 3 repeats, GPUs 6 and 7, queues `fix59_queue.txt` and `fix59w_queue.txt`, results
+`results/fix59/` and `results/fix59w/`. 0 errors and 500 ok in all 36 runs. Spread = (max - min) / mean. "original vs
+mean" is the single run of section 1 (after image) against the mean of the repeats. Only the after image was repeated, so
+the before values of the ratios below are still single runs.
+
+V4.1 ran as two sets. `fix59` (cold) sent C=128 as the first load on each fresh server. `fix59w` (warm) sent C=16 first
+and then C=128 on the same server, as the original runs did (C ascending on one server) and as task 56 did. The cold set
+is 30% lower in output tok/s on Marlin (1324 vs 1891) and 32% on `mega_moe` (1477 vs 2179), with TPOT p50 +19% / +18%, and
+its spread is 5-7% against 0.3-0.9%. The first heavy load on a new server seems to pay one-time costs (inferred from the run order; no trace was taken), so the warm set is the
+primary one (it matches the original protocol and the original numbers); the cold set is reported as the worst case.
+
+| point | n | metric | mean | min | max | spread | per repeat | original single run | original vs mean |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-27B-FP8 C=1 | 3 | out tok/s | 47.6 | 47.5 | 47.6 | 0.2% | 47.6, 47.5, 47.5 | 47.7 | +0.3% |
+| Qwen3.8-27B-FP8 C=1 | 3 | TTFT p50 ms | 104.0 | 103.4 | 104.3 | 0.9% | 103.4, 104.2, 104.3 | 103.0 | -0.9% |
+| Qwen3.8-27B-FP8 C=1 | 3 | TPOT p50 ms | 20.7 | 20.6 | 20.7 | 0.2% | 20.6, 20.7, 20.7 | 20.6 | -0.3% |
+| Qwen3.8-27B-FP8 C=16 | 3 | out tok/s | 515.1 | 514.8 | 515.5 | 0.1% | 514.8, 515.5, 515.1 | 515.3 | +0.0% |
+| Qwen3.8-27B-FP8 C=16 | 3 | TTFT p50 ms | 978.0 | 971.2 | 988.4 | 1.8% | 988.4, 971.2, 974.4 | 979.0 | +0.1% |
+| Qwen3.8-27B-FP8 C=16 | 3 | TPOT p50 ms | 26.5 | 26.5 | 26.6 | 0.3% | 26.5, 26.6, 26.5 | 26.6 | +0.3% |
+| Qwen3.8-27B-FP8 C=64 | 3 | out tok/s | 1059.1 | 1054.3 | 1062.5 | 0.8% | 1054.3, 1062.5, 1060.5 | 1066.2 | +0.7% |
+| Qwen3.8-27B-FP8 C=64 | 3 | TTFT p50 ms | 3015.6 | 2887.0 | 3183.5 | 9.8% | 3183.5, 2976.4, 2887.0 | 2804.0 | -7.0% |
+| Qwen3.8-27B-FP8 C=64 | 3 | TPOT p50 ms | 46.6 | 46.6 | 46.6 | 0.1% | 46.6, 46.6, 46.6 | 47.1 | +1.1% |
+| Qwen3.8-27B-FP8 C=256 | 3 | out tok/s | 1330.3 | 1327.3 | 1333.3 | 0.4% | 1327.3, 1330.4, 1333.3 | 1324.7 | -0.4% |
+| Qwen3.8-27B-FP8 C=256 | 3 | TTFT p50 ms | 11530.0 | 11357.4 | 11625.8 | 2.3% | 11625.8, 11606.9, 11357.4 | 11276.0 | -2.2% |
+| Qwen3.8-27B-FP8 C=256 | 3 | TPOT p50 ms | 117.4 | 116.5 | 118.9 | 2.1% | 118.9, 116.8, 116.5 | 120.1 | +2.3% |
+| Qwen3.6-35B-A3B BF16 C=1 | 3 | out tok/s | 169.7 | 168.8 | 170.1 | 0.8% | 170.0, 170.1, 168.8 | 170.1 | +0.3% |
+| Qwen3.6-35B-A3B BF16 C=1 | 3 | TTFT p50 ms | 64.5 | 64.4 | 64.6 | 0.3% | 64.5, 64.6, 64.4 | 64.0 | -0.7% |
+| Qwen3.6-35B-A3B BF16 C=1 | 3 | TPOT p50 ms | 5.6 | 5.6 | 5.7 | 0.9% | 5.6, 5.6, 5.7 | 5.6 | -0.8% |
+| Qwen3.6-35B-A3B BF16 C=64 | 3 | out tok/s | 1341.7 | 1339.0 | 1344.6 | 0.4% | 1344.6, 1339.0, 1341.4 | 1360.2 | +1.4% |
+| Qwen3.6-35B-A3B BF16 C=64 | 3 | TTFT p50 ms | 963.0 | 949.6 | 974.6 | 2.6% | 949.6, 974.6, 964.7 | 824.0 | -14.4% |
+| Qwen3.6-35B-A3B BF16 C=64 | 3 | TPOT p50 ms | 43.0 | 42.9 | 43.1 | 0.3% | 43.0, 43.1, 42.9 | 42.9 | -0.2% |
+| V4.1 marlin C=128 (cold) | 3 | out tok/s | 1323.9 | 1286.1 | 1378.1 | 6.9% | 1286.1, 1307.6, 1378.1 | 1901.0 | +43.6% |
+| V4.1 marlin C=128 (cold) | 3 | TTFT p50 ms | 6079.6 | 5035.0 | 6877.0 | 30.3% | 6877.0, 6326.7, 5035.0 | 2045.0 | -66.4% |
+| V4.1 marlin C=128 (cold) | 3 | TPOT p50 ms | 69.0 | 68.7 | 69.1 | 0.6% | 68.7, 69.1, 69.1 | 57.9 | -16.1% |
+| V4.1 mega_moe C=128 (cold) | 3 | out tok/s | 1477.3 | 1448.4 | 1529.9 | 5.5% | 1453.5, 1448.4, 1529.9 | 2228.9 | +50.9% |
+| V4.1 mega_moe C=128 (cold) | 3 | TTFT p50 ms | 5930.6 | 5459.5 | 6388.9 | 15.7% | 5943.4, 6388.9, 5459.5 | 1756.0 | -70.4% |
+| V4.1 mega_moe C=128 (cold) | 3 | TPOT p50 ms | 59.3 | 58.3 | 60.7 | 4.1% | 58.9, 60.7, 58.3 | 49.7 | -16.2% |
+| V4.1 marlin C=128 (warm) | 3 | out tok/s | 1891.4 | 1883.2 | 1900.6 | 0.9% | 1900.6, 1890.5, 1883.2 | 1901.0 | +0.5% |
+| V4.1 marlin C=128 (warm) | 3 | TTFT p50 ms | 2133.2 | 1948.5 | 2394.9 | 20.9% | 2056.1, 2394.9, 1948.5 | 2045.0 | -4.1% |
+| V4.1 marlin C=128 (warm) | 3 | TPOT p50 ms | 57.9 | 57.2 | 59.2 | 3.5% | 57.2, 57.3, 59.2 | 57.9 | +0.0% |
+| V4.1 mega_moe C=128 (warm) | 3 | out tok/s | 2179.1 | 2175.6 | 2182.5 | 0.3% | 2182.5, 2179.1, 2175.6 | 2228.9 | +2.3% |
+| V4.1 mega_moe C=128 (warm) | 3 | TTFT p50 ms | 1872.8 | 1823.9 | 1908.6 | 4.5% | 1823.9, 1908.6, 1885.9 | 1756.0 | -6.2% |
+| V4.1 mega_moe C=128 (warm) | 3 | TPOT p50 ms | 50.3 | 49.8 | 50.6 | 1.4% | 50.6, 49.8, 50.5 | 49.7 | -1.2% |
+| V4.1 marlin C=16 (warm) | 3 | out tok/s | 588.9 | 586.0 | 591.9 | 1.0% | 586.0, 588.9, 591.9 | 612.8 | +4.1% |
+| V4.1 marlin C=16 (warm) | 3 | TTFT p50 ms | 782.4 | 720.1 | 856.2 | 17.4% | 856.2, 720.1, 771.1 | 658.0 | -15.9% |
+| V4.1 marlin C=16 (warm) | 3 | TPOT p50 ms | 22.8 | 22.8 | 22.9 | 0.5% | 22.8, 22.9, 22.8 | 22.8 | -0.2% |
+| V4.1 mega_moe C=16 (warm) | 3 | out tok/s | 601.0 | 600.2 | 602.1 | 0.3% | 600.2, 600.6, 602.1 | 626.3 | +4.2% |
+| V4.1 mega_moe C=16 (warm) | 3 | TTFT p50 ms | 683.6 | 661.4 | 702.8 | 6.1% | 661.4, 702.8, 686.7 | 634.0 | -7.3% |
+| V4.1 mega_moe C=16 (warm) | 3 | TPOT p50 ms | 22.5 | 22.4 | 22.6 | 1.0% | 22.4, 22.4, 22.6 | 22.2 | -1.3% |
+
+Ratios from the repeats (V4.1 `mega_moe` over Marlin at C=128, same-index comparison of the min / max):
+| Set | out tok/s | range | TPOT p50 (Marlin / mega_moe) | TTFT p50 (Marlin / mega_moe) |
+|---|---|---|---|---|
+| warm (primary) | 1.15x | 1.15-1.16x | 1.15x | 1.14x |
+| cold | 1.12x | 1.05-1.19x | 1.16x | 1.03x |
+| original single run | 1.17x | | 1.16x | 1.16x |
+
+Warm C=16: 601.0 / 588.9 = 1.02x (the original 1.02x).
+
+Conclusions:
+- Qwen3.8-27B-FP8 and the BF16 control are very stable on a fresh server: output tok/s spread 0.1-0.8%, TPOT p50
+  0.1-2.1%, TTFT p50 0.9-9.8% (worst at C=64, 3016 ms mean). The original single runs sit within 0.9% of the mean at C=1 and
+  C=16 and within 1.1% in output tok/s and 2.3% in TPOT p50 at C=64 and C=256.
+- FP8 before/after, with the before run still single and the after run replaced by the mean of the repeats (min..max
+  of the repeats in brackets): output tok/s 1.52x (1.52-1.52x) at C=1, 1.28x (1.28x) at C=16, 1.10x (1.10x) at C=64 (original
+  1.11x), 1.04x (1.04-1.05x) at C=256; TPOT p50 1.53x, 1.31x, 1.14x, 1.08-1.10x (original 1.06x at C=256). All four gains
+  are far larger than the after-image spread (0.1-0.8% in output tok/s), so the repeats confirm them. The C=256 gain
+  (4%) is the least certain: the before image has no repeats and the host is shared, so only the after side of that ratio
+  is known to 0.4%. The gain falls with C as in section 1.
+- TTFT p50 at C=64 is the one noisy FP8 metric (9.8% spread; the original 2804 ms is 7% below the mean 3016 ms), so the
+  original TTFT ratio of 1.01x at C=64 and the BF16 control's 1.05x are inside the spread. TTFT ratios of 0.98-1.01x at
+  other points are inside it too.
+- BF16 control (Qwen3.6-35B-A3B): output tok/s and TPOT p50 repeat to 0.4-0.9%. The original 1.00-1.03x at C=1 holds
+  (original +0.2% of the mean). At C=64 the original after run is 1.4% above the mean of the repeats (1360 vs 1342 tok/s), so
+  against the before run (1358) the ratio is 0.99x, not 1.00x: control differences of up to 1.5% are inside the host
+  noise, and the control still shows no FP8-like gain. TTFT p50 at C=64 (824 ms originally, 963 ms mean) is outside the
+  repeats: that 1.05x is not reproducible and should be read as noise of a single run.
+- V4.1 `mega_moe` over Marlin at C=128: with the warm set the gain is 1.15x in output tok/s and TPOT p50 and 1.14x in
+  TTFT p50, with a 0.3-0.9% spread on tok/s, so the 1.15-1.17x of section 1 is confirmed and larger than the spread. The
+  original 1.17x is 0.01-0.02 above the repeats because the Marlin original was 0.5% above and `mega_moe` 2.3% above the
+  warm mean. Without the warm-up (cold set) the pair is 1.12x with 5-7% spread and the single-run range 1.05-1.19x
+  is ten points wide, so a first-load comparison cannot resolve ratios below about 1.10x. The small ratios of section 1 below C=64
+  (1.01-1.07x) were not repeated; at C=16 the repeats give 1.02x with 0.3-1.0% spread.
+- V4.1 TTFT p50 has a spread of 20.9% (Marlin, warm) and 17.4% (C=16); read TTFT ratios of V4.1 as noise below about
+  20%.
+
+Not repeated: the before image, the other C values, agentX, gemma-4, the NVFP4 models, V4.1 C=256 and above.
+
 ## 4. Failures
 
 Raw logs are on aws-raichu under `/workspace/nctu6/infra/tokenspeed/tmp/bench_images/` (paths below are
@@ -870,7 +962,8 @@ before the workers existed.
 
 ## 7. Caveats
 
-- One run per point, no repeats. Differences of a few percent are inside the spread. The BF16 control differs
+- One run per point; section 3.10 repeats the headline points three times on the after image (spread 0.1-0.9% in
+  output tok/s, TTFT p50 up to 21%). Differences of a few percent in TTFT are inside the spread. The BF16 control differs
   by 0-1% in RAG output tok/s and TPOT, but by up to 11% in TTFT p50 (RAG) and 4-6% in agentX TPOT p50. TTFT
   p99 and agentX TTFT are heavy-tailed.
 - Shared host. Concurrent TP1 sessions ran on GPUs 6 and 7 (section 2.6), and other users' jobs ran on GPUs
