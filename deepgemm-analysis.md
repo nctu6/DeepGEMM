@@ -2931,7 +2931,7 @@ Ways to 262,143 (Single-request token limit line, GPU 6/7, `--max-model-len 2621
 | `--chunked-prefill-size 1024` | 2339 (10 MiB) | 276,927 | 262,143 | 191 s |
 | (computed) chunk 4096 / 2048 | 2294 | 240,447 / 260,927 | not enough | |
 
-Both servers answer a chat probe ("Paris", "2, 3, 5, 7, 11"). Not tried: a higher `--gpu-memory-utilization` (0.92 adds about 190 parents, 2.0 GiB, still 2.5K short of the 2784 needed at chunk 8192), fewer `--max-num-seqs` or capture sizes (the 512-request graph/state reserve is a small part of the 22 GiB), TP2.
+Both servers answer a chat probe ("Paris", "2, 3, 5, 7, 11"). Not tried: a higher `--gpu-memory-utilization` (0.92 adds about 190 parents, 2.0 GiB, still 2.5K short of the 2784 needed at chunk 8192), fewer `--max-num-seqs` or capture sizes (their effect on the 22 GiB was not measured), TP2.
 
 Per-request rejection. This repo already rejects a prompt above `max_req_input_len` per request: `input_processor.py` raises `ValueError("The input (N tokens) exceeds the engine's maximum input length ...")`, and the engine publishes the limit in its worker info. The HTTP 400 at `WorkerSelection` is the gateway (smg), and the terminal warmup failure is AIPerf's; both are outside this repo and were not changed. Not verified: what smg does with the limit exactly (the 400 carries no length), only that all six reruns with a 262,143 limit complete.
 
