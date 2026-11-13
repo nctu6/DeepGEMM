@@ -786,15 +786,22 @@ ladder; `--max-num-seqs 512`, `gpu_memory_utilization` 0.90, max model len 26214
 | model (TP2) | decode graphs | chat France | chat primes | RAG C=16 out tok/s / TTFT p50 / TPOT p50 | RAG C=128 out tok/s / TTFT p50 / TPOT p50 | ok / err | `Fatal check` | task 3.5 row (C=16, C=128) |
 |---|---|---|---|---|---|---|---|---|
 | Qwen3.5-122B-A10B-NVFP4 | `max_cudagraph_capture_size=512`, `Capturing batches: [512, 480, 448, 192, 80]` | "The capital of France is **Paris**." | "2, 3, 5, 7, 11" | 812.5 / 584 ms / 17.1 ms | 1911.6 / 2920 ms / 53.7 ms | 500 / 0 at both | 0 | 802.6 / 648 / 17.0 and 1912.2 / 2947 / 53.6 |
-| V4.1 128-of-384, Marlin `auto` | not run | not run | not run | not run | not run | - | - | - |
-| V4.1 128-of-384, `mega_moe` | not run | not run | not run | not run | not run | - | - | - |
+| V4.1 128-of-384, Marlin `auto` | `max_cudagraph_capture_size=512`, `Capturing batches: [512, 480, 448, 192, 80]` | "Paris." | no answer (512 tokens of counting 1, 2, 3, ... in the reasoning field, empty content) | 598.5 / 697 ms / 22.8 ms | 1912.1 / 1989 ms / 57.9 ms | 500 / 0 at both | 0 | 613.5 / 724 / 22.4 and 1934.0 / 1897 / 57.6 (fix53full) |
+| V4.1 128-of-384, `mega_moe` | same ladder | "Paris." | same as Marlin (counting, empty content) | 607.4 / 656 ms / 22.4 ms | 2191.0 / 1892 ms / 50.0 ms | 500 / 0 at both | 0 | 625.8 / 621 / 22.2 and 2227.8 / 1657 / 48.8 (fix53full) |
 
 Qwen3.5 is a thinking model: chat `content` carries the `<think>` block, then the answer, so the chat probes use 512 tokens.
 The completions probes give "Paris" and " 7, 11, 13, ..." (the gate prompt continues a list). The Qwen3.5 numbers match
 the earlier after-image rows (3.5) within 1%, so the head's scheduler fix and graph ladder cost nothing on this model.
-The V4.1 sessions did not run: another user's job took ~97 GB on GPU 7 at 09:10 (right after the Qwen3.5 session, the
-worker had not started a container) and still held it 25 minutes later, so the worker was stopped. Nothing of another
-user was touched. Rerun with `fix56_queue.txt` lines 2 and 3 when GPU 7 is free.
+V4.1 (128 of 384 experts, `--hf-overrides`, `--engram-host-table --engram-host-table-layout sharded`, one run per point,
+both sessions on GPUs 6+7 started after another user's job had left GPU 7): `TokenSpeed KV events enabled` is in both server
+logs, no `Fatal check`, `max_cudagraph_capture_size=512`, 500 ok / 0 errors at C=16 and C=128 for both backends. Completions
+probes: "Paris" for both; the list prompt continues " 7, 9, 11, 13, 15, 17, 19, 21," for both, byte for byte the output of the
+task 53 and task 46 sessions (the 128-expert subset is not meaningful on free text, section 3 caveats), so this is not a
+regression but the "2, 3, 5, 7, 11" answer is not produced by this model. Chat: "Paris." for both; the chat primes probe
+spends its 512 tokens counting 1, 2, 3, ... in the reasoning field and returns empty content (recorded, not gated). Against
+the fix53full rows the output tok/s are 0.976x / 0.989x (Marlin C=16 / C=128) and 0.971x / 0.984x (`mega_moe`), TPOT p50
++1.7% / +0.6% and +1.0% / +2.6%; one run per point on a shared host, so this is run-to-run spread and not a change of the
+head. `mega_moe` against Marlin on the same head: 1.015x at C=16, 1.146x at C=128 (TPOT 50.0 against 57.9 ms).
 
 ## 6. Excluded agentX smoke runs (`agentx_smoke/`)
 
