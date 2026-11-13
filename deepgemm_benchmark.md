@@ -772,7 +772,29 @@ Local TokenSpeed head `c4681daa6` (tasks 50-53), GPU 7. C++ scheduler tests 610 
 In-process probes with KV events on and the scheduler extension of the head: Qwen3.8-27B-FP8, Qwen3.8-27B-NVFP4 and
 Qwen3.6-35B-A3B answer "Paris" and "2, 3, 5, 7, 11". gemma-4-31B-it served by `tokenspeed serve` (after image, changed
 files mounted, default parser args, KV events on): completions and chat answer correctly and a `get_weather` tool call
-is parsed. No TP2 probe: GPU 6 was held by another user's job. Details: `deepgemm-analysis.md` 9.50.
+is parsed. Details: `deepgemm-analysis.md` 9.50. The TP2 checks follow (task 56).
+
+**TP2 end-to-end (task 56, GPUs 6+7, pushed head `9bc0d7029`, DeepGEMM `dd2902b`).** Setup: after image
+`nctu6/tokenspeed:ef057889-20261112` with `forward_step.py`, `server_args.py` and `serve_smg.py` of the head and the
+scheduler extension built from the head (task 50) mounted read-only over the installed ones (`fix56_queue.txt`, queue key
+`mounts=`); KV events ON (no `SMG_TOKENSPEED_SERVICER_KV_EVENTS`; log: `TokenSpeed KV events enabled`); default CUDA graph
+ladder; `--max-num-seqs 512`, `gpu_memory_utilization` 0.90, max model len 262144 as in the benchmark. Probes: greedy
+`/v1/completions` (gate) and greedy `/v1/chat/completions` ("capital of France", "first five prime numbers") through
+`tokenspeed serve`. Smoke: RAG, 500 prompts, C=16 (warm-up) then C=128, one run per point. Results:
+`tmp/bench_images_local/results/fix56/`.
+
+| model (TP2) | decode graphs | chat France | chat primes | RAG C=16 out tok/s / TTFT p50 / TPOT p50 | RAG C=128 out tok/s / TTFT p50 / TPOT p50 | ok / err | `Fatal check` | task 3.5 row (C=16, C=128) |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3.5-122B-A10B-NVFP4 | `max_cudagraph_capture_size=512`, `Capturing batches: [512, 480, 448, 192, 80]` | "The capital of France is **Paris**." | "2, 3, 5, 7, 11" | 812.5 / 584 ms / 17.1 ms | 1911.6 / 2920 ms / 53.7 ms | 500 / 0 at both | 0 | 802.6 / 648 / 17.0 and 1912.2 / 2947 / 53.6 |
+| V4.1 128-of-384, Marlin `auto` | not run | not run | not run | not run | not run | - | - | - |
+| V4.1 128-of-384, `mega_moe` | not run | not run | not run | not run | not run | - | - | - |
+
+Qwen3.5 is a thinking model: chat `content` carries the `<think>` block, then the answer, so the chat probes use 512 tokens.
+The completions probes give "Paris" and " 7, 11, 13, ..." (the gate prompt continues a list). The Qwen3.5 numbers match
+the earlier after-image rows (3.5) within 1%, so the head's scheduler fix and graph ladder cost nothing on this model.
+The V4.1 sessions did not run: another user's job took ~97 GB on GPU 7 at 09:10 (right after the Qwen3.5 session, the
+worker had not started a container) and still held it 25 minutes later, so the worker was stopped. Nothing of another
+user was touched. Rerun with `fix56_queue.txt` lines 2 and 3 when GPU 7 is free.
 
 ## 6. Excluded agentX smoke runs (`agentx_smoke/`)
 
