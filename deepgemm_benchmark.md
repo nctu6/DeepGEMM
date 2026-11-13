@@ -60,7 +60,7 @@ Headlines:
 - V4.1 subset, mega_moe against Marlin (both on the after image): RAG 1.01-1.07x up to C=64, 1.17x at C=128,
   1.04x at C=256 and 512. agentX 0.97x / 1.00x / 1.03x.
 - At high C every server saturates for the same reasons in both images: a full KV pool, and decode batches
-  above the largest CUDA graph (160). V4.1 RAG dips at C=256 (section 3.6). gemma agentX C=16/64 cannot run
+  above the largest CUDA graph (160; fixed for the default in task 53, section 3.8). V4.1 RAG dipped at C=256 (section 3.6). gemma agentX C=16/64 cannot run
   at TP1 with the default args (the 256K traces exceed `max_req_input_len=199614`, section 4.2); with
   `--kv-cache-dtype fp8` or `--chunked-prefill-size 1024` the limit is 262,143 and C=16/64 run (section 3.3, task 52).
 - With the servicer's default config (KV events on), the scheduler aborts in both images under RAG load at
@@ -521,9 +521,9 @@ with the Qwen rows.
   noise: mega_moe has the same shape (8.71, 6.71, 10.89 req/s), and effective concurrency is 250 and 500 as set.
   The server log shows decode batches of 116-128 at C=128 (about 2390 generated tok/s, ~49 ms a step), 244-256
   at C=256 (~1900 tok/s, ~130 ms a step) and 500 at C=512 (~3550 tok/s, ~140 ms a step). The step time jumps
-  2.7x once the batch passes 160, the largest captured graph, then barely grows with the batch. That fits decode
-  above the graph size running eagerly with a much higher host cost for the 40-layer step. I did not confirm an
-  eager fallback in the executor, so this is the likely explanation, not a verified one (task 53).
+  2.7x once the batch passes 160, the largest captured graph, then barely grows with the batch. Task 53 confirmed
+  the cause: the default `--max-cudagraph-capture-size` was 160 whatever `--max-num-seqs` said (512 here), and a
+  decode batch above the largest graph runs the same refresh path without a graph (section 3.8).
 - RAG C=1 TTFT p99 is 1277 ms against p50 98 ms: the first request of the run pays one-time work (C=1 only).
 - agentX: 654 requests finish at C=64 against 14-54 for the other models. Its KV pool holds 24.5M tokens against
   0.3-3.6M for the others.
@@ -577,6 +577,39 @@ with the Qwen rows.
 | 1 | 0.108 | 11088.6 | 86.7 | 298 | 210 | 1321 | 11.6 | 10.9 | 17.6 | 9.1 | 13.3 | 100 | 0 | 0.9 | 103124 | 941 | 6 | yes |
 | 16 | 0.190 | 16396.0 | 151.1 | 428 | 174 | 4010 | 12.1 | 11.2 | 27.3 | 10.5 | 18.1 | 177 | 0 | 1.8 | 86148 | 1135 | 200 | yes |
 | 64 | 0.704 | 63451.4 | 541.6 | 750 | 299 | 6546 | 36.2 | 32.1 | 100.5 | 23.6 | 205.1 | 662 | 0 | 18.7 | 90097 | 1693 | 747 | yes |
+
+
+### 3.8 Task 53 rerun: decode graphs up to `--max-num-seqs` (V4.1 subset, TP2)
+
+The default `--max-cudagraph-capture-size` is now `--max-num-seqs` (TokenSpeed `a0a5484a1`). The rerun uses the
+`ef057889-20261112` image with the two changed Python files (`forward_step.py`, `server_args.py`) mounted over the
+installed ones, `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` like the original rows, the same server flags (only the
+captured sizes change), the same RAG protocol and the full C = 1 .. 512 ramp on a fresh server per variant
+(`results/fix53full/`; an earlier C = 128/256/512-only rerun in `results/fix53/` started cold and is not used for
+C=128). One run per point, shared host.
+
+- Capture list: `[512, 480, 448, 416, 384, 352, 320, 288, 256, 240, ..., 160, 152, ..., 8, 4, 2, 1]` (37 graphs)
+  against `[160, 152, 144, 104, 40]` before. Graph
+  memory reserve counted before the KV sizing: KV cache 24.92 -> 22.91 GiB per rank (token capacity 24.47M ->
+  22.06M, -9.8%).
+
+Output tok/s and TPOT p50 (ms), original row -> rerun (ratio of output tok/s):
+
+| C | Marlin out tok/s | Marlin TPOT p50 | mega_moe out tok/s | mega_moe TPOT p50 |
+|---|---|---|---|---|
+| 1 | 104.5 -> 104.1 (1.00x) | 9.0 -> 9.0 | 106.1 -> 105.7 (1.00x) | 8.9 -> 8.9 |
+| 16 | 612.8 -> 613.5 (1.00x) | 22.8 -> 22.4 | 626.3 -> 625.8 (1.00x) | 22.2 -> 22.2 |
+| 32 | 974.9 -> 977.2 (1.00x) | 29.4 -> 29.7 | 1003.7 -> 1003.0 (1.00x) | 28.6 -> 28.6 |
+| 64 | 1429.0 -> 1430.5 (1.00x) | 39.5 -> 39.4 | 1522.3 -> 1525.5 (1.00x) | 37.0 -> 37.3 |
+| 128 | 1901.0 -> 1934.0 (1.02x) | 57.9 -> 57.6 | 2228.9 -> 2227.8 (1.00x) | 49.7 -> 48.7 |
+| 256 | 1649.8 -> **2656.4 (1.61x)** | 139.8 -> **81.0** | 1717.8 -> **3029.2 (1.76x)** | 134.0 -> **70.6** |
+| 512 | 2692.5 -> **3480.9 (1.29x)** | 160.2 -> **120.5** | 2788.3 -> **3827.9 (1.37x)** | 157.0 -> **109.8** |
+
+All requests succeeded at every C (500; 100 at C=1), 0 errors. The curve is now
+monotonic (Marlin 1934, 2656, 3481; mega_moe 2228, 3029, 3828) and C=1..64 are unchanged. TTFT p50 at C=256 is
+3185 -> 3477 ms (Marlin) and 3166 -> 3096 ms (mega_moe), at C=512 6547 -> 5899 and 5738 -> 5305. mega_moe over Marlin
+on the same image: 1.00-1.17x up to C=128, 1.14x at C=256 (was 1.04x), 1.10x at C=512 (was 1.04x). Marlin stays the
+`auto` choice.
 
 
 ## 4. Failures
