@@ -61,7 +61,8 @@ Headlines:
   1.04x at C=256 and 512. agentX 0.97x / 1.00x / 1.03x.
 - At high C every server saturates for the same reasons in both images: a full KV pool, and decode batches
   above the largest CUDA graph (160). V4.1 RAG dips at C=256 (section 3.6). gemma agentX C=16/64 cannot run
-  at TP1 (the 256K traces exceed `max_req_input_len=199614`, section 4.2).
+  at TP1 with the default args (the 256K traces exceed `max_req_input_len=199614`, section 4.2); with
+  `--kv-cache-dtype fp8` or `--chunked-prefill-size 1024` the limit is 262,143 and C=16/64 run (section 3.3, task 52).
 - With the servicer's default config (KV events on), the scheduler aborts in both images under RAG load at
   C=128. Every primary result uses `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` (section 5).
 
@@ -380,9 +381,11 @@ status has no metrics (`FAILED` = the run's marker; section 4).
 - From C=32 the server runs only about 27 requests at a time (output tok/s x TPOT p50; the log shows at most
   34 running and 451 queued with 2291 of 2295 KV pages active). Throughput stays at 362-372 tok/s and TPOT at
   73-74 ms while TTFT p50 grows with the queue. The cap is the KV pool (293,760 tokens), the same in both images.
-  I did not trace why a ~1.1K-token request holds that many pages (the cache has one full-attention group and
-  five sliding-window groups).
-- agentX C=16 and 64 fail in both images (section 4.2). C=1 completes (11 requests each, valid).
+  Why a ~1.1K-token request holds that many pages (task 52, arithmetic from the capacity model, not a trace):
+  each of the five sliding groups owns its parents, and a request keeps its 1024-token window there (17 blocks of
+  64 tokens, one parent per block) in every group, about 85 parents with the full-attention share, and
+  2295 / 85 = 27 requests.
+- agentX C=16 and 64 fail in both images with the default args (section 4.2). C=1 completes (11 requests each, valid). The rerun with args that lift the limit follows the agentX table below.
 
 **before `e27cee86`, RAG** (`gemma4-31b-it/e27cee86/rag/`)
 
@@ -423,6 +426,34 @@ status has no metrics (`FAILED` = the run's marker; section 4).
 | 1 | 0.012 | 1654.4 | 16.0 | 4330 | 2236 | 12226 | 50.7 | 50.5 | 52.2 | 51.1 | 98.4 | 11 | 0 | 0.9 | 139875 | 986 | 51 | yes |
 | 16 | FAILED | | | | | | | | | | | | | | | | | |
 | 64 | FAILED | | | | | | | | | | | | | | | | | |
+
+**after `ef057889`, agentX rerun with a 262,143-token limit (task 52, `results/fix52/gemma4-31b-it/`)**: same image
+(`nctu6/tokenspeed:ef057889-20261112`), same harness and AIPerf command as above (full mode, 900 s, seed 1110,
+`--tool-call-parser gemma4`, `--max-num-seqs 512`, `--gpu-memory-utilization 0.9`, `--max-model-len 262144`, GPU 6
+or 7, KV events off); only the engine args differ. The image's engine code is unchanged (`ef057889f`); the TokenSpeed
+commits `1950e48eb` (test) and `eece48b98` (docs) change no runtime code. All six runs `submission_valid=true`,
+0 errors, no restart.
+
+| args | C | req/s | in tok/s | out tok/s | TTFT p50 | TTFT p99 | TPOT p50 | TPOT p99 | ITL p50 | ITL p99 | ok | failed | eff. C avg | ISL avg | wall s | warmup s | valid |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `--kv-cache-dtype fp8` | 1 | 0.012 | 1654.4 | 16.0 | 2261 | 12599 | 48.4 | 49.6 | 48.8 | 50.3 | 11 | 0 | 0.8 | 139872 | 988 | 53 | yes |
+| `--kv-cache-dtype fp8` | 16 | 0.017 | 1582.5 | 13.4 | 302891 | 422396 | 89.1 | 1115.9 | 59.5 | 1464.8 | 16 | 0 | 6.4 | 92971 | 1925 | 980 | yes |
+| `--kv-cache-dtype fp8` | 64 | 0.009 | 928.8 | 5.0 | 453702 | 873794 | 149.0 | 1673.9 | 55.4 | 2031.7 | 8 | 0 | 4.9 | 109138 | 5923 | 4978 | yes |
+| `--chunked-prefill-size 1024` | 1 | 0.012 | 1654.4 | 16.0 | 2351 | 13302 | 50.5 | 52.1 | 51.1 | 98.6 | 11 | 0 | 0.9 | 139875 | 992 | 56 | yes |
+| `--chunked-prefill-size 1024` | 16 | 0.007 | 969.6 | 9.2 | 554379 | 699321 | 54.5 | 208.8 | 55.8 | 362.7 | 7 | 0 | 4.0 | 130199 | 1977 | 1032 | yes |
+| `--chunked-prefill-size 1024` | 64 | 0.004 | 547.0 | 3.8 | 267216 | 535074 | 54.4 | 398.3 | 52.6 | 56.2 | 4 | 0 | 1.4 | 128535 | 6249 | 5304 | yes |
+
+Startup lines: fp8 `Cache profile: parent_bytes=5242880 parents=4617`, `Single-request token limit: cache=496831 ...
+max_input=262143`; chunk 1024 `parents=2339`, `cache=276927 ... max_input=262143` (default: 2295 parents,
+`cache=199615 ... max_input=199614`). Both servers answer "Paris" and "2, 3, 5, 7, 11" in a chat probe.
+Read these with care. Only 4 to 16 requests complete in the 900 s window (a 256K prefill takes minutes), the
+warmup is 16 to 88 minutes at C=16/64, the traces in the window differ between runs (ISL avg 93K to 140K), there
+is one run per point, and two runs shared the host (GPU 6 and 7, CPU, disk). The two args are not a comparison of
+each other: `fp8` also changes the KV numerics, chunk 1024 keeps BF16 KV and issues prefill in 1024-token steps.
+TPOT p50 at C=1 is 48.4 ms (fp8) and 50.5 ms (chunk 1024), against 50.5 ms in the default-args C=1 run above.
+C=16/64 throughput is low (13 and 5 output tok/s at best) because these are 100K-256K-context agent traces that
+a 22 GiB pool holds only a few of. This is a capacity result (the runs complete), not a throughput comparison
+with the Qwen rows.
 
 
 ### 3.4 Qwen3.8-27B-NVFP4 (TP1)
@@ -582,7 +613,18 @@ The engine's single-request limit is `max_input=199614` (one GPU, 0.9 memory use
 agentX corpus has traces up to 256K tokens. The gateway answers 400 at `WorkerSelection`, and AIPerf's warmup
 phase then fails terminally. The 400 is not logged with the request length, so the link to the 199,614 limit is
 inferred from the limit and the trace sizes. C=1 completes in both images (11 requests, valid). I did not check
-why its traces did not hit the limit. This is not an image difference. Task 52 follows it up.
+why its traces did not hit the limit. This is not an image difference. Cause and rerun: task 52, below and
+section 3.3.
+
+Cause (task 52). Not a counting error. At 0.90 the KV pool is 2295 parents of 10 MiB (22.4 GiB). The capacity model
+charges each of the five sliding groups its lookback plus one whole 8192-token prefill chunk (147 parents each,
+735 in all, 32% of the pool), which leaves 1560 parents for the full-attention group: 199,615 tokens. The same model
+needs 2784 parents for 262,144. The model reproduces the engine's number from the config alone (2294 usable parents:
+199,487). Args that reach 262,143 (startup line `Single-request token limit`):
+`--kv-cache-dtype fp8` (5 MiB parents, 4617 of them, cache limit 496,831) and `--chunked-prefill-size 1024`
+(2339 parents, 276,927); 2048 would give 260,927 and fall short. A prompt above the limit is already rejected per
+request by the engine's input processor (`ValueError`); the 400 comes from the gateway's worker selection (smg, not
+in the TokenSpeed repo) and the abort from AIPerf's warmup, neither of which this repo can change.
 
 ### 4.3 Other failed runs
 
