@@ -612,6 +612,47 @@ on the same image: 1.00-1.17x up to C=128, 1.14x at C=256 (was 1.04x), 1.10x at 
 `auto` choice.
 
 
+### 3.9 Task 58: graph ladder KV cost under long context (cap 160 vs default ladder)
+Question: does the larger default ladder (task 53) lose where KV capacity binds? Same `ef057889-20261112` image with
+the task 53 / 50 files mounted, KV events on (task 50 fix), one server per setting, one run per point, shared host
+(`results/fix58/`, queues `fix58_queue.txt`, `fix58b_queue.txt`). `cap160` = `--max-cudagraph-capture-size 160`
+(the old default), `default` = no flag (ladder to `--max-num-seqs 512`, 37 graphs). Qwen3.8-27B-FP8 TP1 ran agentX full
+mode (the two servers on GPUs 7 / 6); V4.1-Flash 128-of-384 experts TP2 (Marlin) ran RAG with 288 prompts of ~151K
+tokens, 256 output tokens, C=192.
+
+Startup and capacity (rank 0 log):
+| Model | Setting | Captured sizes | Graph memory reserve | KV pool | KV token capacity | Graph capture (final pass) | Server start to gRPC ready |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-27B-FP8 | cap160 | 23 (160 .. 1) | 1.47 GB | 53.44 GiB | 873,984 | 18 s | 5 m 11 s |
+| Qwen3.8-27B-FP8 | default | 37 (512 .. 1) | 2.60 GB | 52.41 GiB | 857,088 (-1.9%) | 31 s | 5 m 27 s |
+| V4.1 subset TP2 | cap160 | 23 (160 .. 1) | 5.26 GB | 24.92 GiB | 24,465,920 | 30 s | 8 m 55 s |
+| V4.1 subset TP2 | default | 37 (512 .. 1) | 7.42 GB | 22.91 GiB | 22,062,080 (-9.8%) | 47 s | 8 m 43 s |
+
+Startup differences are within the weight-load and kernel-tuning spread (the extra graphs cost 13-16 s).
+
+Served results (cap160 / default; ratio default over cap160):
+| Run | out tok/s | TTFT p50 (ms) | TPOT p50 (ms) | ok / failed | effective C avg / max |
+|---|---|---|---|---|---|
+| Qwen3.8-27B-FP8 agentX C=16 | 31.83 / 31.21 (0.98x) | 2532 / 1807 | 83.1 / 91.2 | 54 / 0, 53 / 0 | 6.2 / 10, 6.1 / 10 |
+| Qwen3.8-27B-FP8 agentX C=64 | 10.29 / 10.29 (1.00x) | 399137 / 398770 | 226.2 / 214.7 | 15 / 0, 15 / 0 | 8.5 / 15, 8.4 / 15 |
+| V4.1 RAG C=192, ~151K tokens | 27.19 / 27.52 (1.01x) | 669508 / 740536 | 3545 / 3339 | 288 / 0, 288 / 0 | 173.2 / 192, 173.4 / 192 |
+
+V4.1 wall 2718 s (cap160) vs 2685 s (default). Input tokens/s 16047 vs 16244.
+
+KV binding evidence (decode batch log lines, rank 0): V4.1 pages 19,356 vs 17,791 (the 8.1% fewer pages with the
+larger ladder); page ratio reaches 0.99 / 0.98, at or above 0.9 in 50% / 43% of the decode lines; running requests peak
+at 188 / 172 of 512 allowed; prefill queue up to 191 (mean 80 / 86). Qwen pages 569 vs 558; page ratio reaches
+1.00 / 0.99, at or above 0.9 in 48% / 54% of the decode lines; running requests peak at 9 / 8; queue up to 35 in both.
+No retraction line in any of the four logs; 0 request errors; the only Traceback is the shutdown `CancelledError` of
+the lifespan.
+
+Reading. KV does bind in all four runs, and the default ladder holds 1.9% / 9.8% fewer tokens. It did not lose: output
+tok/s is 0.98-1.01x, V4.1 finishes 1.2% sooner with a 5.8% lower TPOT p50 and a 10.6% higher TTFT p50, and the
+agentX C=16 TTFT / TPOT p50 move in opposite directions (single run, 53 vs 54 completions, the 99th percentiles agree
+within 1%). These are inside the spread of one shared-host run. The batch here is set by KV pages (at most 188 running
+requests), so it sits around the old cap and the ladder coverage does not decide it. Decision: keep the default (cap =
+`max_num_seqs`); no code change. Explicit `--max-cudagraph-capture-size` remains the way to trade graphs for KV.
+
 ## 4. Failures
 
 Raw logs are on aws-raichu under `/workspace/nctu6/infra/tokenspeed/tmp/bench_images/` (paths below are
