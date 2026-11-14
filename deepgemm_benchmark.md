@@ -745,6 +745,39 @@ Conclusions:
 
 Not repeated: the before image, the other C values, agentX, gemma-4, the NVFP4 models, V4.1 C=256 and above.
 
+### 3.11 MegaMoE `auto` decision, V4.1 Marlin vs `mega_moe` (task 60)
+Real V4.1-Flash-1017, 128 of 384 experts (`--hf-overrides '{"n_routed_experts": 128, "num_checkpoint_experts": 384}'`), TP2 on
+GPUs 6 and 7 (attention TP2 + MoE TP2, replicated tokens), after image `ef057889-20261112` + head `5b2ecbcfe` files (`forward_step.py`,
+`server_args.py`, `serve_smg.py`) + task 50 scheduler extension, KV events on, default graph ladder. Marlin = `--moe-backend auto` (the
+image's behaviour), `mega_moe` = `--moe-backend mega_moe`. Six fresh servers interleaved (marlin-r1, mega_moe-r1, marlin-r2, ...), on each
+RAG C=1 (100 prompts), then C=16, then C=128 (500 prompts, warm-up rule), 500 / 100 ok, 0 errors, 0 `Fatal`. Queue `fix60_queue.txt`, results
+`results/fix60/` (`summary.md`, `summary.json`). Spread = (max - min) / mean. Prefill throughput: input tok/s over the run (C=16, C=128) and
+ISL / TTFT p50 at C=1 (ISL about 800 tokens, so this is a short-prompt number dominated by launch latency).
+
+| C | metric | Marlin mean (min-max) | mega_moe mean (min-max) | mega_moe / Marlin |
+|---|---|---|---|---|
+| 1 | out tok/s | 104.0 (104.0-104.1) | 106.1 (106.0-106.1) | 1.020x |
+| 1 | TPOT p50 ms | 9.0 (9.0-9.0) | 8.9 (8.9-8.9) | 0.983x |
+| 1 | TTFT p50 ms | 104.7 (104.1-105.2) | 100.1 (97.9-102.1) | 0.956x |
+| 1 | input tok/s | 329.4 (329.3-329.7) | 335.9 (335.7-336.1) | 1.020x |
+| 1 | ISL/TTFT p50 tok/s | 7741.5 (7705.0-7790.7) | 8097.9 (7941.5-8281.2) | 1.046x |
+| 16 | out tok/s | 611.0 (609.2-613.9) | 622.5 (619.7-626.5) | 1.019x |
+| 16 | TPOT p50 ms | 22.6 (22.5-22.7) | 22.3 (22.2-22.4) | 0.986x |
+| 16 | TTFT p50 ms | 681.8 (653.5-713.9) | 637.3 (598.1-667.3) | 0.935x |
+| 16 | input tok/s | 1901.6 (1895.9-1910.5) | 1937.5 (1928.8-1950.0) | 1.019x |
+| 16 | ISL/TTFT p50 tok/s | 1170.2 (1116.0-1219.1) | 1252.9 (1194.0-1332.1) | 1.071x |
+| 128 | out tok/s | 1910.5 (1899.4-1919.6) | 2196.5 (2196.3-2196.7) | 1.150x |
+| 128 | TPOT p50 ms | 57.7 (57.0-58.2) | 50.0 (49.6-50.3) | 0.867x |
+| 128 | TTFT p50 ms | 1946.9 (1798.0-2036.5) | 1909.5 (1867.7-1930.5) | 0.981x |
+| 128 | input tok/s | 5946.1 (5911.4-5974.4) | 6836.3 (6835.5-6836.8) | 1.150x |
+| 128 | ISL/TTFT p50 tok/s | 410.5 (391.2-443.1) | 417.4 (412.7-426.6) | 1.017x |
+
+Reading: output tok/s and TPOT are outside the spread of both paths at every C (C=1: 106.1 vs 104.0 tok/s, spread 0.1%; C=16: 622.5 vs
+611.0, spread 0.8-1.1%; C=128: 2196.5 vs 1910.5, 1.15x, spread 0.0-1.1%). Prefill: C=1 TTFT p50 100.1 (97.9-102.1) vs 104.7 (104.1-105.2) ms,
+disjoint ranges; C=128 input tok/s 6836 vs 5946 (1.15x). C=16 TTFT p50 overlaps (598-667 vs 654-714 ms): no claim there. TTFT p50 is the noisy
+metric (up to 12% on Marlin). Check run `fix60auto` (default args, no `--moe-backend`, gates mounted over the after image, C=16 only): server log
+`DeepSeek V4.1 default moe_backend=mega_moe`, probes france / primes PASS, chat "Paris.", 500 ok, 601 out tok/s (cold server, no C=1 first, so below the warm 610-627).
+
 ## 4. Failures
 
 Raw logs are on aws-raichu under `/workspace/nctu6/infra/tokenspeed/tmp/bench_images/` (paths below are
