@@ -17,7 +17,9 @@ The tables are generated (section 8). Server log lines are quoted with their pat
 Ratio convention: output tok/s is after over before, and TTFT p50 and TPOT p50 are before over after, so a
 value above 1.00x always means the after image is better. One run per point (repeat spread of the headline points in section 3.10). Cells are
 `before / after (ratio)`. "after only" rows have no before value, because the before image does not start
-that model (section 4.1). The last row compares the two MoE backends of V4.1 on the after image
+that model (section 4.1). The V4.1 rows with "before + subset backport" use the before image with only the
+subset loading of TokenSpeed `6d6702bae` mounted over it (task 68, section 3.12; compare at the same 160-graph cap,
+the original after rows). The last row compares the two MoE backends of V4.1 on the after image
 (`Marlin / mega_moe`, ratio = mega_moe against Marlin). TTFT and TPOT are in ms.
 
 
@@ -30,7 +32,8 @@ RAG:
 | gemma-4-31B-it BF16 (TP1) | out tok/s 22.2 / 23.0 (1.03x)<br>TTFT p50 175 / 173 (1.01x)<br>TPOT p50 44.4 / 43.0 (1.03x) | out tok/s 256.6 / 263.3 (1.03x)<br>TTFT p50 633 / 648 (0.98x)<br>TPOT p50 58.8 / 57.2 (1.03x) | out tok/s 365.8 / 371.4 (1.02x)<br>TTFT p50 1428 / 1514 (0.94x)<br>TPOT p50 73.6 / 73.0 (1.01x) | out tok/s 369.5 / 370.8 (1.00x)<br>TTFT p50 22836 / 22735 (1.00x)<br>TPOT p50 73.8 / 73.3 (1.01x) | out tok/s 364.8 / 369.3 (1.01x)<br>TTFT p50 64409 / 64567 (1.00x)<br>TPOT p50 73.7 / 73.6 (1.00x) | out tok/s 365.8 / 371.6 (1.02x)<br>TTFT p50 148361 / 146598 (1.01x)<br>TPOT p50 73.6 / 73.3 (1.00x) | out tok/s 361.8 / 370.9 (1.03x)<br>TTFT p50 171128 / 166253 (1.03x)<br>TPOT p50 74.2 / 73.0 (1.02x) |
 | Qwen3.8-27B-NVFP4 (TP1) **after only** | out tok/s 55.3<br>TTFT p50 74<br>TPOT p50 17.7 | out tok/s 618.2<br>TTFT p50 729<br>TPOT p50 22.4 | out tok/s 966.1<br>TTFT p50 1346<br>TPOT p50 27.5 | out tok/s 1320.6<br>TTFT p50 2217<br>TPOT p50 38.8 | out tok/s 1554.5<br>TTFT p50 3873<br>TPOT p50 64.6 | out tok/s 1609.5<br>TTFT p50 7733<br>TPOT p50 114.6 | out tok/s 1611.6<br>TTFT p50 36700<br>TPOT p50 117.2 |
 | Qwen3.5-122B-A10B-NVFP4 (TP2) **after only** | out tok/s 133.4<br>TTFT p50 83<br>TPOT p50 7.2 | out tok/s 802.6<br>TTFT p50 648<br>TPOT p50 17.0 | out tok/s 1098.1<br>TTFT p50 984<br>TPOT p50 24.8 | out tok/s 1480.1<br>TTFT p50 1527<br>TPOT p50 35.9 | out tok/s 1912.2<br>TTFT p50 2947<br>TPOT p50 53.6 | out tok/s 2281.5<br>TTFT p50 5606<br>TPOT p50 86.7 | out tok/s 2255.7<br>TTFT p50 10803<br>TPOT p50 115.1 |
-| DeepSeek-V4.1-Flash 128-of-384 experts, Marlin `auto` (TP2) **after only** | out tok/s 104.5<br>TTFT p50 98<br>TPOT p50 9.0 | out tok/s 612.8<br>TTFT p50 658<br>TPOT p50 22.8 | out tok/s 974.9<br>TTFT p50 815<br>TPOT p50 29.4 | out tok/s 1429.0<br>TTFT p50 1199<br>TPOT p50 39.5 | out tok/s 1901.0<br>TTFT p50 2045<br>TPOT p50 57.9 | out tok/s 1649.8<br>TTFT p50 3185<br>TPOT p50 139.8 | out tok/s 2692.5<br>TTFT p50 6547<br>TPOT p50 160.2 |
+| DeepSeek-V4.1-Flash 128-of-384 experts, Marlin `auto` (TP2), before + subset backport / after | out tok/s 26.6 / 104.5 (3.93x)<br>TTFT p50 194 / 98 (1.98x)<br>TPOT p50 35.1 / 9.0 (3.89x) | out tok/s 326.9 / 612.8 (1.87x)<br>TTFT p50 1544 / 658 (2.35x)<br>TPOT p50 38.3 / 22.8 (1.68x) | out tok/s 563.5 / 974.9 (1.73x)<br>TTFT p50 1369 / 815 (1.68x)<br>TPOT p50 49.3 / 29.4 (1.68x) | out tok/s 756.2 / 1429.0 (1.89x)<br>TTFT p50 2958 / 1199 (2.47x)<br>TPOT p50 71.9 / 39.5 (1.82x) | out tok/s 939.9 / 1901.0 (2.02x)<br>TTFT p50 4760 / 2045 (2.33x)<br>TPOT p50 115.2 / 57.9 (1.99x) | out tok/s 1035.1 / 1649.8 (1.59x)<br>TTFT p50 8108 / 3185 (2.55x)<br>TPOT p50 212.1 / 139.8 (1.52x) | out tok/s 1152.7 / 2692.5 (2.34x)<br>TTFT p50 14397 / 6547 (2.20x)<br>TPOT p50 378.4 / 160.2 (2.36x) |
+| DeepSeek-V4.1-Flash 128-of-384 experts, `mega_moe` (TP2), before + subset backport / after | out tok/s 26.6 / 106.1 (3.99x)<br>TTFT p50 194 / 93 (2.08x)<br>TPOT p50 35.1 / 8.9 (3.95x) | out tok/s 326.9 / 626.3 (1.92x)<br>TTFT p50 1544 / 634 (2.44x)<br>TPOT p50 38.3 / 22.2 (1.73x) | out tok/s 563.5 / 1003.7 (1.78x)<br>TTFT p50 1369 / 770 (1.78x)<br>TPOT p50 49.3 / 28.6 (1.72x) | out tok/s 756.2 / 1522.3 (2.01x)<br>TTFT p50 2958 / 1087 (2.72x)<br>TPOT p50 71.9 / 37.0 (1.94x) | out tok/s 939.9 / 2228.9 (2.37x)<br>TTFT p50 4760 / 1756 (2.71x)<br>TPOT p50 115.2 / 49.7 (2.32x) | out tok/s 1035.1 / 1717.8 (1.66x)<br>TTFT p50 8108 / 3166 (2.56x)<br>TPOT p50 212.1 / 134.0 (1.58x) | out tok/s 1152.7 / 2788.3 (2.42x)<br>TTFT p50 14397 / 5738 (2.51x)<br>TPOT p50 378.4 / 157.0 (2.41x) |
 | DeepSeek-V4.1-Flash 128-of-384 experts, `mega_moe` (TP2): Marlin / mega_moe, both after image | out tok/s 104.5 / 106.1 (1.01x)<br>TTFT p50 98 / 93 (1.05x)<br>TPOT p50 9.0 / 8.9 (1.01x) | out tok/s 612.8 / 626.3 (1.02x)<br>TTFT p50 658 / 634 (1.04x)<br>TPOT p50 22.8 / 22.2 (1.03x) | out tok/s 974.9 / 1003.7 (1.03x)<br>TTFT p50 815 / 770 (1.06x)<br>TPOT p50 29.4 / 28.6 (1.03x) | out tok/s 1429.0 / 1522.3 (1.07x)<br>TTFT p50 1199 / 1087 (1.10x)<br>TPOT p50 39.5 / 37.0 (1.07x) | out tok/s 1901.0 / 2228.9 (1.17x)<br>TTFT p50 2045 / 1756 (1.16x)<br>TPOT p50 57.9 / 49.7 (1.17x) | out tok/s 1649.8 / 1717.8 (1.04x)<br>TTFT p50 3185 / 3166 (1.01x)<br>TPOT p50 139.8 / 134.0 (1.04x) | out tok/s 2692.5 / 2788.3 (1.04x)<br>TTFT p50 6547 / 5738 (1.14x)<br>TPOT p50 160.2 / 157.0 (1.02x) |
 
 agentX:
@@ -42,7 +45,8 @@ agentX:
 | gemma-4-31B-it BF16 (TP1) | out tok/s 16.0 / 16.0 (1.00x)<br>TTFT p50 2254 / 2236 (1.01x)<br>TPOT p50 52.0 / 50.5 (1.03x) | FAILED / FAILED | FAILED / FAILED |
 | Qwen3.8-27B-NVFP4 (TP1) **after only** | out tok/s 24.2<br>TTFT p50 2581<br>TPOT p50 25.0 | out tok/s 40.2<br>TTFT p50 1009<br>TPOT p50 67.8 | out tok/s 8.6<br>TTFT p50 404731<br>TPOT p50 147.1 |
 | Qwen3.5-122B-A10B-NVFP4 (TP2) **after only** | out tok/s 63.7<br>TTFT p50 919<br>TPOT p50 13.3 | out tok/s 118.6<br>TTFT p50 720<br>TPOT p50 18.8 | out tok/s 14.9<br>TTFT p50 123098<br>TPOT p50 583.7 |
-| DeepSeek-V4.1-Flash 128-of-384 experts, Marlin `auto` (TP2) **after only** | out tok/s 89.6<br>TTFT p50 187<br>TPOT p50 11.3 | out tok/s 150.8<br>TTFT p50 190<br>TPOT p50 11.5 | out tok/s 524.2<br>TTFT p50 299<br>TPOT p50 34.3 |
+| DeepSeek-V4.1-Flash 128-of-384 experts, Marlin `auto` (TP2), before + subset backport / after | out tok/s 21.4 / 89.6 (4.18x)<br>TTFT p50 831 / 187 (4.44x)<br>TPOT p50 38.8 / 11.3 (3.42x) | out tok/s 89.4 / 150.8 (1.69x)<br>TTFT p50 502 / 190 (2.64x)<br>TPOT p50 32.7 / 11.5 (2.85x) | out tok/s 191.1 / 524.2 (2.74x)<br>TTFT p50 863 / 299 (2.88x)<br>TPOT p50 106.8 / 34.3 (3.12x) |
+| DeepSeek-V4.1-Flash 128-of-384 experts, `mega_moe` (TP2), before + subset backport / after | out tok/s 21.4 / 86.7 (4.05x)<br>TTFT p50 831 / 210 (3.97x)<br>TPOT p50 38.8 / 10.9 (3.54x) | out tok/s 89.4 / 151.1 (1.69x)<br>TTFT p50 502 / 174 (2.89x)<br>TPOT p50 32.7 / 11.2 (2.92x) | out tok/s 191.1 / 541.6 (2.83x)<br>TTFT p50 863 / 299 (2.89x)<br>TPOT p50 106.8 / 32.1 (3.33x) |
 | DeepSeek-V4.1-Flash 128-of-384 experts, `mega_moe` (TP2): Marlin / mega_moe, both after image | out tok/s 89.6 / 86.7 (0.97x)<br>TTFT p50 187 / 210 (0.89x)<br>TPOT p50 11.3 / 10.9 (1.04x) | out tok/s 150.8 / 151.1 (1.00x)<br>TTFT p50 190 / 174 (1.09x)<br>TPOT p50 11.5 / 11.2 (1.03x) | out tok/s 524.2 / 541.6 (1.03x)<br>TTFT p50 299 / 299 (1.00x)<br>TPOT p50 34.3 / 32.1 (1.07x) |
 
 Headlines:
@@ -780,6 +784,136 @@ disjoint ranges; C=128 input tok/s 6836 vs 5946 (1.15x). C=16 TTFT p50 overlaps 
 metric (up to 12% on Marlin). Check run `fix60auto` (default args, no `--moe-backend`, gates mounted over the after image, C=16 only): server log
 `DeepSeek V4.1 default moe_backend=mega_moe`, probes france / primes PASS, chat "Paris.", 500 ok, 601 out tok/s (cold server, no C=1 first, so below the warm 610-627).
 
+### 3.12 Before image + subset backport on the V4.1 128-of-384 subset (task 68)
+The before image `nctu6/tokenspeed:e27cee86-20261028` stops on the subset (section 4.1) because the loader of `e27cee861` has no
+`num_checkpoint_experts`. Question: how fast is the old image on the same 128-expert subset when only that loading is added. Everything else is
+the before image's own: no DeepGEMM SM120 leaf, Triton / portable kernels, FlashInfer FA2 prefill, the original CUDA graph cap.
+
+**Backport.** TokenSpeed `6d6702bae` ("load the first routed experts of the checkpoint") applied to the `e27cee861` versions of its two source
+files; its test file is not part of the image. Applied with `patch` (no conflict, offsets of 4 lines); the Python files compile. Two files
+are mounted read-only over `/usr/local/lib/python3.12/dist-packages/tokenspeed/runtime/`:
+`configs/deepseek_v41_config.py` (+5 lines: `self.num_checkpoint_experts: int | None = kwargs.get("num_checkpoint_experts")`) and
+`models/deepseek_v41.py` (+45 / -1: `_expert_subset`, `_is_left_out_expert`, the shard filter skips the left-out experts, the skip reason
+`left_out_expert`, and the first `n_routed_experts` rows of `ffn.gate.weight` / `bias` / `bias_vl`). No adaptation was needed. The full diff
+against `e27cee861` is `tokenspeed/tmp/bench_images_local/results/fix68/backport_vs_e27cee861.diff` (86 lines; `backport.patch` is the original
+commit). Nothing else changed: no kernel, scheduler or server-argument file.
+
+**Conditions.** As section 2.3 / task 46: TP2 on GPUs 6 and 7, `--max-num-seqs 512 --gpu-memory-utilization 0.9 --max-model-len 262144
+--engram-host-table --engram-host-table-layout sharded`, `--hf-overrides '{"n_routed_experts": 128, "num_checkpoint_experts": 384}'`,
+`SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`, MoE backend left at the before image's default (it has no MegaMoE). RAG C=1,16,32,64,128,256,512 in
+one ramp on one fresh server (500 prompts, 100 at C=1), then agentX full mode C=1,16,64 (900 s windows). Queue `fix68_queue.txt`, results
+`results/fix68/`. One run per point; the server did not crash or restart (0 restarts), 500 / 500 ok at every RAG point, 0 errors, agentX
+`submission_valid=true` (all three). Startup 627 s (after image 537-557 s).
+
+**Probe (recorded, not gated).** `france` PASS (" The capital of France is Paris."), `primes` FAIL (" 7, 9, 0, 1, 4, 6, 8, 10,"; the after image
+passes it), `chat` and `chat_primes` give empty content with the answer only in `reasoning` (the after image: chat empty too). The subset's output is not
+meaningful (a third of the experts), so I did not investigate the `primes` difference.
+
+**Selected kernels (what the server log names).** The log does not name the dense FP8 or the MoE leaf (section 7), so those two are not recorded;
+the before image has no SM120 DeepGEMM leaf, so they are its portable ones. The log shows: attention prefill is FlashInfer FA2 extend
+(`batch_prefill_..._head_dim_qk_512`, 256 MiB workspace); attention decode is the Triton `_dsv4_sparse_attention_kernel`; the indexer runs the Triton
+`_index_scan_kernel` and `_finish_topk_kernel` (13 and 6 compilations while serving) where the after image's log shows only `_index_select_all` /
+`_finish_topk_kernel`; the other Triton kernels are the same in both logs (`_swa_rope_insert`, `_compressor_metadata`, `_global_slots_kernel`, mHC
+`_mhc_pre_mix_hc4_kernel`). CUDA graphs: warm-up ladder `[160, 152, 144, 104, 40]`, main ladder `[160, 152, ..., 16, 8, 4, 2, 1]` (23 graphs, cap 160,
+KV 19,805 LCM blocks; the after default ladder of task 53 has 37 graphs up to 512 and 17,791 blocks).
+
+**Same-condition comparison.** The original after rows (sections 3.6 and 3.7) also had the 160 cap, so they are the like-for-like comparison.
+Task 53's default ladder (`fix53full`, section 3.8) is the current default of the after image and is shown for reference only. Ratio convention
+of section 1: output tok/s after over before, TTFT and TPOT before over after, so above 1.00x means the after image is better.
+
+#### RAG
+
+Output tok/s (ratio = after / before+backport, above 1 = after better)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 26.6 | 104.5 | 106.1 | 104.1 | 105.7 | 3.93x | 3.99x | 3.91x | 3.97x |
+| 16 | 326.9 | 612.8 | 626.3 | 613.5 | 625.8 | 1.87x | 1.92x | 1.88x | 1.91x |
+| 32 | 563.5 | 974.9 | 1003.7 | 977.2 | 1003.0 | 1.73x | 1.78x | 1.73x | 1.78x |
+| 64 | 756.2 | 1429.0 | 1522.3 | 1430.5 | 1525.5 | 1.89x | 2.01x | 1.89x | 2.02x |
+| 128 | 939.9 | 1901.0 | 2228.9 | 1934.0 | 2227.8 | 2.02x | 2.37x | 2.06x | 2.37x |
+| 256 | 1035.1 | 1649.8 | 1717.8 | 2656.4 | 3029.2 | 1.59x | 1.66x | 2.57x | 2.93x |
+| 512 | 1152.7 | 2692.5 | 2788.3 | 3480.9 | 3827.9 | 2.34x | 2.42x | 3.02x | 3.32x |
+
+TTFT p50, ms (ratio = before+backport / after, above 1 = after better)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 194 | 98 | 93 | 98 | 92 | 1.98x | 2.08x | 1.98x | 2.12x |
+| 16 | 1544 | 658 | 634 | 724 | 621 | 2.35x | 2.44x | 2.13x | 2.49x |
+| 32 | 1369 | 815 | 770 | 673 | 749 | 1.68x | 1.78x | 2.03x | 1.83x |
+| 64 | 2958 | 1199 | 1087 | 1139 | 995 | 2.47x | 2.72x | 2.60x | 2.97x |
+| 128 | 4760 | 2045 | 1756 | 1897 | 1657 | 2.33x | 2.71x | 2.51x | 2.87x |
+| 256 | 8108 | 3185 | 3166 | 3477 | 3096 | 2.55x | 2.56x | 2.33x | 2.62x |
+| 512 | 14397 | 6547 | 5738 | 5899 | 5305 | 2.20x | 2.51x | 2.44x | 2.71x |
+
+TPOT p50, ms (ratio = before+backport / after, above 1 = after better)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 35.1 | 9.0 | 8.9 | 9.0 | 8.9 | 3.89x | 3.95x | 3.88x | 3.95x |
+| 16 | 38.3 | 22.8 | 22.2 | 22.4 | 22.2 | 1.68x | 1.73x | 1.71x | 1.73x |
+| 32 | 49.3 | 29.4 | 28.6 | 29.7 | 28.6 | 1.68x | 1.72x | 1.66x | 1.72x |
+| 64 | 71.9 | 39.5 | 37.0 | 39.4 | 37.3 | 1.82x | 1.94x | 1.82x | 1.93x |
+| 128 | 115.2 | 57.9 | 49.7 | 57.6 | 48.7 | 1.99x | 2.32x | 2.00x | 2.36x |
+| 256 | 212.1 | 139.8 | 134.0 | 81.0 | 70.6 | 1.52x | 1.58x | 2.62x | 3.01x |
+| 512 | 378.4 | 160.2 | 157.0 | 120.5 | 109.8 | 2.36x | 2.41x | 3.14x | 3.45x |
+
+Completed requests (ratio = after / before+backport)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 100 | 100 | 100 | 100 | 100 | 1.00x | 1.00x | 1.00x | 1.00x |
+| 16 | 500 | 500 | 500 | 500 | 500 | 1.00x | 1.00x | 1.00x | 1.00x |
+| 32 | 500 | 500 | 500 | 500 | 500 | 1.00x | 1.00x | 1.00x | 1.00x |
+| 64 | 500 | 500 | 500 | 500 | 500 | 1.00x | 1.00x | 1.00x | 1.00x |
+| 128 | 500 | 500 | 500 | 500 | 500 | 1.00x | 1.00x | 1.00x | 1.00x |
+| 256 | 500 | 500 | 500 | 500 | 500 | 1.00x | 1.00x | 1.00x | 1.00x |
+| 512 | 500 | 500 | 500 | 500 | 500 | 1.00x | 1.00x | 1.00x | 1.00x |
+
+#### agentX
+
+Output tok/s (ratio = after / before+backport, above 1 = after better)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 21.4 | 89.6 | 86.7 | - | - | 4.18x | 4.05x | - | - |
+| 16 | 89.4 | 150.8 | 151.1 | - | - | 1.69x | 1.69x | - | - |
+| 64 | 191.1 | 524.2 | 541.6 | - | - | 2.74x | 2.83x | - | - |
+
+TTFT p50, ms (ratio = before+backport / after, above 1 = after better)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 831 | 187 | 210 | - | - | 4.44x | 3.97x | - | - |
+| 16 | 502 | 190 | 174 | - | - | 2.64x | 2.89x | - | - |
+| 64 | 863 | 299 | 299 | - | - | 2.88x | 2.89x | - | - |
+
+TPOT p50, ms (ratio = before+backport / after, above 1 = after better)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 38.8 | 11.3 | 10.9 | - | - | 3.42x | 3.54x | - | - |
+| 16 | 32.7 | 11.5 | 11.2 | - | - | 2.85x | 2.92x | - | - |
+| 64 | 106.8 | 34.3 | 32.1 | - | - | 3.12x | 3.33x | - | - |
+
+Completed requests (ratio = after / before+backport)**
+
+| C | before+backport | after Marlin (orig) | after mega_moe (orig) | after Marlin (fix53full) | after mega_moe (fix53full) | ratio vs Marlin orig | ratio vs mega orig | ratio vs Marlin fix53full | ratio vs mega fix53full |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 16 | 100 | 100 | - | - | 6.25x | 6.25x | - | - |
+| 16 | 103 | 175 | 177 | - | - | 1.70x | 1.72x | - | - |
+| 64 | 317 | 654 | 662 | - | - | 2.06x | 2.09x | - | - |
+
+
+**Reading.** With the subset loaded, the old image's kernels are 3.9-4.0x slower than the after image at C=1 in output tok/s (TPOT p50 35.1 vs
+9.0 ms), 1.7-1.9x at C=16-32, 1.9-2.4x at C=64-128, 1.6-1.7x at C=256 and 2.3-2.4x at C=512 against the original after rows (the after default ladder widens that to 2.6-2.9x
+at C=256 and 2.6-3.5x TPOT at C=256-512, section 3.8, because the before image keeps the 160 cap). TTFT p50 is 1.7-2.7x worse at every C. The before
+image's decode is slower per step at C=1 (a decode-bound point: 35 ms vs 9 ms), which matches the launch-bound Triton indexer and the portable dense
+and MoE kernels; I did not profile which one dominates (no trace). agentX: 4.2x / 1.7x / 2.7x output tok/s (Marlin row) and TPOT 3.4x / 2.9x /
+3.1x. At agentX C=1 the before server finishes 16 requests in the 900 s window against 100 on the after image, so that point has few samples.
+The 128-expert subset MoE cost is a third of the full model's (section 7), so the full V4.1 gap is not read from this table.
+
 ## 4. Failures
 
 Raw logs are on aws-raichu under `/workspace/nctu6/infra/tokenspeed/tmp/bench_images/` (paths below are
@@ -795,7 +929,7 @@ container exited before becoming healthy')` and `SESSION_FAILED`, and does not r
 |---|---|---|---|---|
 | Qwen3.8-27B-NVFP4, TP1, GPU 7 | `RuntimeError: Kernel implementation not found` | `tokenspeed/runtime/layers/dense/nvfp4.py:196` (`fp4_quantize(x, layer.input_scale_inv)`, reached from `qwen3_5.py` `forward`) -> `tokenspeed_kernel/registry.py:531` (`error_fn`): no `fp4_quantize` kernel is registered for SM120 in this image | 67 s | `qwen38-27b-nvfp4/e27cee86/server-20261112-115858.log` |
 | Qwen3.5-122B-A10B-NVFP4, TP2 | `RuntimeError: Check failed: (fc1_act_global.ndim() == 0 \|\| fc1_act_global.size(0) == num_experts_on_rank) is false: fc1 act global must be scalar or (num_experts_on_rank,)` | `tokenspeed_kernel/ops/moe/flashinfer.py:3172` (`flashinfer_cutlass_nvfp4_moe_apply`), startup forward | 362 s | `qwen35-122b-a10b-nvfp4/e27cee86/server-20261112-170130.log` |
-| V4.1 subset, TP2 | `ValueError: Unexpected V4.1 expert tensor: layers.0.ffn.experts.128.w1.scale` | `tokenspeed/runtime/models/deepseek_v41.py:2444` (`_load_text_weights`, from `load_weights` :2677): the loader has no `num_checkpoint_experts`, which landed later in `6d6702bae` | 46 s | `dsv41-flash-1017/e27cee86/server-20261112-185406.log` |
+| V4.1 subset, TP2 | `ValueError: Unexpected V4.1 expert tensor: layers.0.ffn.experts.128.w1.scale` | `tokenspeed/runtime/models/deepseek_v41.py:2444` (`_load_text_weights`, from `load_weights` :2677): the loader has no `num_checkpoint_experts`, which landed later in `6d6702bae` | 46 s | `dsv41-flash-1017/e27cee86/server-20261112-185406.log`. With that loading backported the before image runs the subset (section 3.12, task 68) |
 
 The same NVFP4 failure appears in the default-config set (`default/qwen38-27b-nvfp4/e27cee86/server-20261112-055342.log`)
 and in the dry run (`default/dryrun/qwen38-27b-nvfp4/e27cee86/server-20261112-044312.log`). The after image starts
@@ -1003,9 +1137,9 @@ before the workers existed.
   p99 and agentX TTFT are heavy-tailed.
 - Shared host. Concurrent TP1 sessions ran on GPUs 6 and 7 (section 2.6), and other users' jobs ran on GPUs
   0-5. They share CPU, PCIe, disk, page cache and the network.
-- V4.1 is a 128-of-384-expert subset and after-only. Its output is not meaningful and its MoE cost is about a
+- V4.1 is a 128-of-384-expert subset. The before image runs it only with the subset loading backported (section 3.12). Its output is not meaningful and its MoE cost is about a
   third of the full model's. Compare its two backends with each other, not with a full V4.1 deployment.
-- Three models are after-only (the before image does not start them), so they have no ratio.
+- Two models are after-only (the before image does not start them), so they have no ratio. V4.1 has a ratio only against the before image with the subset backport mounted (section 3.12), not the stock before image.
 - gemma-4 at TP1 cannot run the 256K agentX traces (`max_req_input_len=199614`), so agentX C=16/64 have no
   result in either image.
 - CUDA graphs cover decode batches up to 160 only (`cudagraph_capture_size=160`, the default), while
