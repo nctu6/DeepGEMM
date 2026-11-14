@@ -17,6 +17,7 @@
 #include <deep_gemm/impls/sm120_mega_moe_epilogue.cuh>
 #include "../heuristics/sm120.hpp"
 
+#include "kernel_lookup.hpp"
 #include "runtime_utils.hpp"
 #include "sm120_fp8_gemm_1d2d.hpp"
 
@@ -52,7 +53,25 @@ public:
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
-        const auto kernel = jit->compile(tag, std::format(R"(
+        // Every value that fills the template below is in the key, so the source is built on the first call only
+        const auto& desc = args.gemm_desc;
+        const auto& config = args.gemm_config;
+        const auto kernel = get_cached_kernel(tag, std::array<int64_t, 26>{
+            args.is_fp4, args.is_bf16, args.is_mixed_fp4_b, args.gran_k,
+            static_cast<int64_t>(desc.major_a), static_cast<int64_t>(desc.major_b),
+            get_compiled_dim(desc.m, 'm', desc.compiled_dims),
+            get_compiled_dim(desc.n, 'n', desc.compiled_dims),
+            get_compiled_dim(desc.k, 'k', desc.compiled_dims),
+            desc.num_groups,
+            config.layout.block_m, config.layout.block_n, config.layout.block_k,
+            config.storage_config.swizzle_a_mode, config.storage_config.swizzle_b_mode,
+            config.pipeline_config.num_stages,
+            config.launch_config.num_tma_threads, config.launch_config.num_math_threads,
+            config.launch_config.num_sms, static_cast<int64_t>(desc.gemm_type),
+            args.use_stream_k, desc.with_accumulation, args.early_pdl_trigger,
+            static_cast<int64_t>(args.epilogue), args.epilogue_fast_math,
+            static_cast<int64_t>(desc.cd_dtype)}, [&] {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
@@ -88,7 +107,8 @@ static void __instantiate_kernel() {{
         args.use_stream_k ? "true" : "false", args.gemm_desc.with_accumulation ? "true" : "false",
         args.early_pdl_trigger ? "true" : "false",
         static_cast<uint32_t>(args.epilogue), args.epilogue_fast_math ? "true" : "false",
-        to_string(args.gemm_desc.cd_dtype)));
+        to_string(args.gemm_desc.cd_dtype));
+        });
 
         jit->launch(
             kernel, args.options,

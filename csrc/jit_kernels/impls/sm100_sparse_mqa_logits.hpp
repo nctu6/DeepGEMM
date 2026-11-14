@@ -6,6 +6,7 @@
 
 #include "../../runtime/runtime.hpp"
 #include "../heuristics/sm100.hpp"
+#include "kernel_lookup.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -166,7 +167,10 @@ static void launch_sm100_sparse_mqa_logits_metadata(const bool is_paged,
     // The metadata kernel is arch-agnostic (no TMEM/cluster/UMMA), so bound its smem by the live device, not SM100
     DG_HOST_ASSERT(num_ctas > 0 and num_smem_bytes <= jit->device.get_num_smem_bytes());
 
-    const auto kernel = jit->compile("sm100_sparse_mqa_logits_metadata", std::format(R"(
+    const auto kernel = get_cached_kernel("sm100_sparse_mqa_logits_metadata", std::array<int64_t, 8>{
+        num_max_sparse_blocks, split_kv, sparse_block_kv, num_smem_bytes, is_paged, use_unaligned_ks, page_kv,
+        num_sms}, [&] {
+        return std::format(R"(
 #include <deep_gemm/scheduler/sm100_sparse_mqa_logits_metadata.cuh>
 
 using namespace deep_gemm;
@@ -184,7 +188,8 @@ static void __instantiate_kernel() {{
         kNumKVSplitsPerEntry, kNumMetadataThreads, num_smem_bytes,
         is_paged ? "true" : "false", use_unaligned_ks ? "true" : "false",
         kBlockQ, split_kv, sparse_block_kv,
-        num_max_sparse_blocks, page_kv, kNumKVSplitsPerEntry, num_sms, kNumMetadataThreads));
+        num_max_sparse_blocks, page_kv, kNumKVSplitsPerEntry, num_sms, kNumMetadataThreads);
+    });
 
     jit->launch(
         kernel, {

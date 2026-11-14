@@ -5,6 +5,7 @@
 #include <deep_gemm/layout/sparse_mqa_logits.cuh>
 
 #include "../../runtime/runtime.hpp"
+#include "kernel_lookup.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -49,7 +50,9 @@ static void launch_sm120_sparse_mqa_logits(const bool is_paged, const int sparse
     const auto qk_dtype_name = is_fp4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t";
     (void) qk_dtype_name;
 
-    const auto kernel = jit->compile("sm120_sparse_mqa_logits", std::format(R"(
+    const auto kernel = get_cached_kernel("sm120_sparse_mqa_logits", std::array<int64_t, 6>{
+        num_heads, sparse_block_kv, split_kv, num_stages, is_fp4, is_paged}, [&] {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_sparse_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -59,7 +62,8 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {}, {}
     >);
 }};
-)", num_heads, sparse_block_kv, split_kv, num_stages, is_fp4 ? "true" : "false", is_paged ? "true" : "false"));
+)", num_heads, sparse_block_kv, split_kv, num_stages, is_fp4 ? "true" : "false", is_paged ? "true" : "false");
+    });
 
     const uint32_t page_stride_bytes = is_paged ? static_cast<uint32_t>(fused_kv_cache.stride(0)) : 0;
     const uint32_t page_kv = is_paged ? static_cast<uint32_t>(fused_kv_cache.size(1)) : 0;

@@ -8,6 +8,7 @@
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
+#include "kernel_lookup.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -51,7 +52,9 @@ static void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS"))
         printf("SM120 hc pre-norm: M %d, N %d, K %d, splits %d, stages %d, smem %d\n", m, n, k, num_splits, num_stages, smem_size);
 
-    const auto kernel = jit->compile("sm120_tf32_hc_prenorm_gemm", std::format(R"(
+    const auto kernel = get_cached_kernel("sm120_tf32_hc_prenorm_gemm", std::array<int64_t, 6>{
+        n, k, block_m, block_k, num_splits, num_stages}, [&] {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_tf32_hc_prenorm_gemm.cuh>
 
 using namespace deep_gemm;
@@ -70,7 +73,8 @@ static void __instantiate_kernel() {{
         block_m, block_k,
         num_splits,
         num_stages,
-        num_math_threads, num_tma_threads));
+        num_math_threads, num_tma_threads);
+    });
 
     jit->launch(
         kernel, {

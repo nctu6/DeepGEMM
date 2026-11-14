@@ -280,7 +280,11 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
     DG_HOST_ASSERT(num_q_stages > 0 and "Not enough shared memory for SM120 paged MQA logits");
     const int smem_size = get_smem_size(num_q_stages, num_kv_stages);
 
-    const auto kernel = jit->compile("sm120_fp8_paged_mqa_logits", std::format(R"(
+    const auto logits_dtype = logits.scalar_type();
+    const auto kernel = get_cached_kernel("sm120_fp8_paged_mqa_logits", std::array<int64_t, 11>{
+        next_n, num_heads, head_dim, block_kv, is_context_lens_2d, num_q_stages, num_kv_stages, split_kv,
+        is_mx, is_fp4, static_cast<int64_t>(logits_dtype)}, [&] {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -305,7 +309,8 @@ static void __instantiate_kernel() {{
     split_kv,
     num_specialized_threads, num_math_threads,
     is_mx ? "true" : "false", is_fp4 ? "true" : "false",
-    to_string(logits.scalar_type())));
+    to_string(logits_dtype));
+    });
 
     jit->launch(
         kernel, {

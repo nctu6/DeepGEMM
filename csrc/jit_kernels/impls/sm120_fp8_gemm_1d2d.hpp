@@ -11,6 +11,7 @@
 #include "../../utils/exception.hpp"
 #include "../heuristics/sm120.hpp"
 
+#include "kernel_lookup.hpp"
 #include "runtime_utils.hpp"
 #include "sm120_fp8_transpose.hpp"
 
@@ -38,7 +39,23 @@ public:
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
-        const auto kernel = jit->compile(tag, std::format(R"(
+        // Every value that fills the template below is in the key, so the source is built on the first call only
+        const auto& desc = args.gemm_desc;
+        const auto& config = args.gemm_config;
+        const auto kernel = get_cached_kernel(tag, std::array<int64_t, 19>{
+            static_cast<int64_t>(desc.major_a), static_cast<int64_t>(desc.major_b),
+            static_cast<int64_t>(args.major_sfb),
+            get_compiled_dim(desc.m, 'm', desc.compiled_dims),
+            get_compiled_dim(desc.n, 'n', desc.compiled_dims),
+            get_compiled_dim(desc.k, 'k', desc.compiled_dims),
+            desc.num_groups,
+            config.layout.block_m, config.layout.block_n, config.layout.block_k,
+            config.storage_config.swizzle_a_mode, config.storage_config.swizzle_b_mode,
+            config.pipeline_config.num_stages,
+            config.launch_config.num_tma_threads, config.launch_config.num_math_threads,
+            config.launch_config.num_sms, static_cast<int64_t>(desc.gemm_type),
+            args.use_stream_k, static_cast<int64_t>(desc.cd_dtype)}, [&] {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
@@ -70,7 +87,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
         args.use_stream_k ? "true" : "false",
-        to_string(args.gemm_desc.cd_dtype)));
+        to_string(args.gemm_desc.cd_dtype));
+        });
 
         jit->launch(
             kernel, args.options,

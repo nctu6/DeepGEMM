@@ -4,6 +4,7 @@
 
 #include "../../runtime/runtime.hpp"
 #include "../heuristics/sm90.hpp"
+#include "kernel_lookup.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -108,7 +109,9 @@ static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     DG_HOST_ASSERT(smem_size <= jit->device.get_num_smem_bytes());
 
     // Compile
-    const auto kernel = jit->compile("sm90_paged_mqa_logits_metadata", std::format(R"(
+    const auto kernel = get_cached_kernel("sm90_paged_mqa_logits_metadata", std::array<int64_t, 4>{
+        aligned_batch_size, split_kv, num_sms, is_varlen}, [&] {
+        return std::format(R"(
 #include <deep_gemm/scheduler/sm90_paged_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -118,7 +121,8 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}
     >);
 }};
-)", aligned_batch_size, split_kv, num_sms, is_varlen ? "true" : "false"));
+)", aligned_batch_size, split_kv, num_sms, is_varlen ? "true" : "false");
+    });
 
     // Launch
     jit->launch(
