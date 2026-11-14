@@ -159,7 +159,8 @@ static void launch_sm100_sparse_mqa_logits_metadata(const bool is_paged,
     const int num_max_kv_splits = ceil_div<int>(num_max_merged_kv_blocks, split_kv / sparse_block_kv);
     int num_smem_bytes = (kBlockQ * num_max_sparse_blocks + num_max_merged_kv_blocks + num_max_kv_splits) *
                          static_cast<int>(sizeof(uint32_t));
-    num_smem_bytes += (kNumMetadataThreads / 32) * static_cast<int>(sizeof(uint32_t));
+    // Warp sums, the request-start search of the paged form (two buffers per warp) and the next Q token
+    num_smem_bytes += (3 * (kNumMetadataThreads / 32) + 1) * static_cast<int>(sizeof(uint32_t));
     num_smem_bytes += (1 + kNumMetadataThreads / 32 * (kNumKVSplitsPerEntry + 1)) * static_cast<int>(sizeof(uint32_t));
     num_smem_bytes = align(num_smem_bytes, 16);
     const int num_q_block_bytes = align<int>((3 + kBlockQ) * static_cast<int>(sizeof(uint32_t)), 16);

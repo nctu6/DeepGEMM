@@ -23,6 +23,9 @@ struct SharedStorage {
     uint32_t packed_slots_by_merged_kv_block[kNumMaxMergedKVBlocks];
     uint32_t packed_slot_bases_by_kv_split[kNumMaxKVSplits];
     uint32_t warp_sums[kNumWarps];
+    // Paged: the request-start search (two buffers, one barrier per round) and the next Q token of the CTA
+    uint32_t request_start_mins[2][kNumWarps];
+    uint32_t next_q_token;
     uint32_t num_waves;
     uint32_t kv_split_histograms[kNumWarps][kNumKVSplitsPerEntry + 1];
     struct alignas(16) {
@@ -33,6 +36,46 @@ struct SharedStorage {
     } q_block;
     uint32_t is_last_cta;
 };
+
+// First Q token of the request that Q token `q_token_idx` belongs to: the run of equal `indices` ending at it. The whole
+// CTA searches backwards in parallel (each round tests kNumThreads * kUnroll tokens with independent loads), so a
+// prefill chunk of one request costs a few rounds instead of one dependent global load per token; decode (a run of
+// one token) is a single round. Returns the same value in every thread and must be called by all of them.
+template <uint32_t kNumThreads, typename smem_t>
+CUTLASS_DEVICE uint32_t find_request_start(const uint32_t* indices, const uint32_t q_token_idx, smem_t& smem) {
+    constexpr uint32_t kUnroll = 4;
+    constexpr uint32_t kNumWarps = kNumThreads / 32;
+    constexpr uint32_t kNotFound = ~0u;
+    const uint32_t request_idx = indices[q_token_idx];
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const uint32_t warp_idx = threadIdx.x / 32;
+    for (uint32_t round_idx = 0, distance_base = 0; ; ++ round_idx, distance_base += kNumThreads * kUnroll) {
+        // Smallest distance back to a token of another request (or past the first token) seen by this thread
+        uint32_t first_other = kNotFound;
+        uint32_t other_request[kUnroll];
+        #pragma unroll
+        for (uint32_t i = 0; i < kUnroll; ++ i) {
+            const uint32_t distance = distance_base + i * kNumThreads + threadIdx.x + 1;
+            other_request[i] = distance <= q_token_idx ? indices[q_token_idx - distance] : ~request_idx;
+        }
+        #pragma unroll
+        for (uint32_t i = 0; i < kUnroll; ++ i) {
+            const uint32_t distance = distance_base + i * kNumThreads + threadIdx.x + 1;
+            if (other_request[i] != request_idx and distance <= q_token_idx + 1)
+                first_other = cute::min(first_other, distance);
+        }
+        first_other = __reduce_min_sync(0xffffffffu, first_other);
+        auto* mins = smem.request_start_mins[round_idx % 2];
+        if (lane_idx == 0)
+            mins[warp_idx] = first_other;
+        __syncthreads();
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumWarps; ++ i)
+            first_other = cute::min(first_other, mins[i]);
+        if (first_other != kNotFound)
+            return q_token_idx + 1 - first_other;
+    }
+}
 
 // Divide KV splits evenly, then split each SM range at Q-block boundaries.
 template <uint32_t BLOCK_Q, uint32_t kNumKVBlocksPerSplit, uint32_t kNumSMs, typename smem_t>
@@ -201,29 +244,42 @@ void sm100_sparse_mqa_logits_metadata(
     // Build Q-block metadata
     uint32_t q_token_idx = blockIdx.x * (kIsPaged ? 1 : BLOCK_Q);
     while (true) {
-        if (thread_idx == 0) {
-            smem.q_block.num_q_tokens = 0;
+        if constexpr (kIsPaged) {
+            // Keep Q blocks within one request: a block starts at every even offset from the request's first token, and
+            // the CTA takes the next Q token from the counter when this one is not a block start
             while (q_token_idx < num_q_tokens) {
-                uint32_t num_q_block_tokens = cute::min(BLOCK_Q, num_q_tokens - q_token_idx);
-                if constexpr (kIsPaged) {
-                    // Keep Q blocks within one request
+                const uint32_t request_q_token_base = find_request_start<kNumThreads>(indices, q_token_idx, smem);
+                if ((q_token_idx - request_q_token_base) % BLOCK_Q == 0)
+                    break;
+                if (thread_idx == 0)
+                    smem.next_q_token = gridDim.x + ptx::atomic_add(&workspace_state->next_q_offset, 1u);
+                __syncthreads();
+                q_token_idx = smem.next_q_token;
+            }
+            if (thread_idx == 0) {
+                smem.q_block.num_q_tokens = 0;
+                if (q_token_idx < num_q_tokens) {
                     const uint32_t request_idx = indices[q_token_idx];
-                    // Requests contain few Q tokens, so use a linear scan
-                    uint32_t request_q_token_base = q_token_idx;
-                    while (request_q_token_base > 0 and indices[request_q_token_base - 1] == request_idx)
-                        --request_q_token_base;
-                    if ((q_token_idx - request_q_token_base) % BLOCK_Q != 0) {
-                        q_token_idx = gridDim.x + ptx::atomic_add(&workspace_state->next_q_offset, 1u);
-                        continue;
-                    }
-                    num_q_block_tokens = q_token_idx + 1 < num_q_tokens and
+                    const uint32_t num_q_block_tokens = q_token_idx + 1 < num_q_tokens and
                         indices[q_token_idx + 1] == request_idx ? BLOCK_Q : 1;
+                    const auto get_num_kv_blocks = [&](const uint32_t q_idx) {
+                        const uint32_t kv_end = context_lens[q_idx];
+                        return cute::min(NUM_MAX_SPARSE_BLOCKS, math::ceil_div(kv_end, SPARSE_BLOCK_KV));
+                    };
+                    smem.q_block.q_token_base = q_token_idx;
+                    smem.q_block.num_q_tokens = num_q_block_tokens;
+                    smem.q_block.num_kv_blocks[0] = get_num_kv_blocks(q_token_idx);
+                    smem.q_block.num_kv_blocks[1] = num_q_block_tokens == BLOCK_Q ? get_num_kv_blocks(q_token_idx + 1) : 0;
                 }
+            }
+        } else if (thread_idx == 0) {
+            smem.q_block.num_q_tokens = 0;
+            if (q_token_idx < num_q_tokens) {
+                const uint32_t num_q_block_tokens = cute::min(BLOCK_Q, num_q_tokens - q_token_idx);
                 const auto get_num_kv_blocks = [&](const uint32_t q_idx) {
-                    const uint32_t kv_begin = kIsPaged ? 0 : cute::min(cu_seq_len_k_start[q_idx], num_kv_tokens);
-                    const uint32_t kv_end = kIsPaged ? context_lens[q_idx] :
-                        cute::max(kv_begin, cute::min(cu_seq_len_k_end[q_idx], num_kv_tokens));
-                    if constexpr (not kIsPaged and not kUseUnalignedKs)
+                    const uint32_t kv_begin = cute::min(cu_seq_len_k_start[q_idx], num_kv_tokens);
+                    const uint32_t kv_end = cute::max(kv_begin, cute::min(cu_seq_len_k_end[q_idx], num_kv_tokens));
+                    if constexpr (not kUseUnalignedKs)
                         DG_DEVICE_ASSERT(kv_end == kv_begin or kv_begin % SPARSE_BLOCK_KV == 0);
                     return cute::min(NUM_MAX_SPARSE_BLOCKS, math::ceil_div(kv_end - kv_begin, SPARSE_BLOCK_KV));
                 };
@@ -231,7 +287,6 @@ void sm100_sparse_mqa_logits_metadata(
                 smem.q_block.num_q_tokens = num_q_block_tokens;
                 smem.q_block.num_kv_blocks[0] = get_num_kv_blocks(q_token_idx);
                 smem.q_block.num_kv_blocks[1] = num_q_block_tokens == BLOCK_Q ? get_num_kv_blocks(q_token_idx + 1) : 0;
-                break;
             }
         }
         __syncthreads();
@@ -434,9 +489,13 @@ void sm100_sparse_mqa_logits_metadata(
             kv_splits[kv_split_base + padded_kv_block_slot_idx / kNumKVBlocksPerSplit].kv_block_infos[padded_kv_block_slot_idx % kNumKVBlocksPerSplit] =
                 KVBlockInfo(0, kInvalidSparseSlot, kInvalidSparseSlot);
         }
-        if (thread_idx == 0) {
-            q_token_idx = kIsPaged ? gridDim.x + ptx::atomic_add(&workspace_state->next_q_offset, 1u) :
-                                     q_token_idx + gridDim.x * BLOCK_Q;
+        if constexpr (kIsPaged) {
+            if (thread_idx == 0)
+                smem.next_q_token = gridDim.x + ptx::atomic_add(&workspace_state->next_q_offset, 1u);
+            __syncthreads();
+            q_token_idx = smem.next_q_token;
+        } else if (thread_idx == 0) {
+            q_token_idx += gridDim.x * BLOCK_Q;
         }
     }
 
