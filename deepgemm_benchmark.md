@@ -64,7 +64,9 @@ Headlines:
   at TP1 with the default args (the 256K traces exceed `max_req_input_len=199614`, section 4.2); with
   `--kv-cache-dtype fp8` or `--chunked-prefill-size 1024` the limit is 262,143 and C=16/64 run (section 3.3, task 52).
 - With the servicer's default config (KV events on), the scheduler aborts in both images under RAG load at
-  C=128. Every primary result uses `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` (section 5).
+  C=128. This applies to the original run: every primary result uses `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`
+  (section 5). It is fixed in the C++ scheduler (task 50): sections 5.1 and 5.2 show the rerun and its
+  verification with KV events on, and the later reruns in sections 3.9-3.11 run with KV events on (3.8 kept them off like the original rows).
 
 ## 2. Testing conditions
 

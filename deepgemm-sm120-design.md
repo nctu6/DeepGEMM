@@ -1229,7 +1229,7 @@ See section 7.
   must be stream-ordered per rank. Results are bitwise equal to one rank over
   all experts, and the sequence replays in CUDA graphs. At EP 2 it ties Marlin
   W4A16 plus its collective up to 1024 tokens per rank (0.95-1.05x) and wins
-  1.28-1.39x from 2048; TokenSpeed offers it on SM120 for EP 2 (opt-in). Gate and
+  1.28-1.39x from 2048; TokenSpeed offers it on SM120 for EP 2 (`--moe-backend mega_moe`); since task 60 `auto` also resolves to it for V4.1 attention TP layouts under the declared gates (analysis 9.53). Gate and
   mHC are a GEMM plus elementwise work (`tf32_hc_prenorm_gemm` exists), and
   TokenSpeed calls neither. Analysis 9.26.
   (The DeepGEMM mHC pre/mixes kernels built on `tf32_hc_prenorm_gemm` do run,
