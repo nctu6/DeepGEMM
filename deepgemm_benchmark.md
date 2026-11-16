@@ -1188,3 +1188,26 @@ order, per-run tables, default / repro / smoke runs). Every ratio is computed fr
 
 Counts, primary set: 70 RAG runs and 26 agentX full-mode runs done, 4 agentX runs failed (gemma C=16/64), and
 30 runs of the three failed before-image sessions never started. Every primary session has `restarts: 0`.
+
+## 9. Qwen3.8-27B-FP8 by parallelism, TP1 and TP2 (task 71)
+
+Model `/models/Qwen/Qwen3.8-27B-FP8`, RTX PRO 6000 Blackwell (SM120), RAG workload (~820 input / 256 output tokens, 500 prompts, 100 at C=1, ignore EOS, seed 0), C = 1, 16, 32, 64, 128, 256, 512 as one ramp per fresh server, single run per point. Server args as in task 41 (`--max-num-seqs 512 --gpu-memory-utilization 0.9 --max-model-len 262144`; TP2 adds `--tensor-parallel-size 2` on GPUs 6 and 7). Before image `nctu6/tokenspeed:e27cee86-20261028` (`SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`, its CUDA graphs capture batch sizes up to 160); after image `nctu6/tokenspeed:1b671310-20261114`, unmodified, defaults (KV events on; CUDA graphs cover 512). The before TP1 ramp is the task 41 run (`results/qwen38-27b-fp8/e27cee86/rag/`); the other three ramps are in `results/fix71/`. Startup probes passed in all three new sessions; every point has 0 errors (500 requests, 100 at C=1). The chart is `assets/perf/tokenspeed-sm120-performance.png` in TokenSpeed (output tok/s per GPU: TP2 divided by 2).
+
+| Config | C | Out tok/s before | Out tok/s after | Ratio | TTFT p50 before / after (ms) | TPOT p50 before / after (ms) |
+|---|---|---|---|---|---|---|
+| TP1 | 1 | 31.3 | 47.6 | 1.52x | 103 / 102 | 31.6 / 20.6 |
+| TP1 | 16 | 402.9 | 514.6 | 1.28x | 970 / 989 | 34.8 / 26.6 |
+| TP1 | 32 | 709.3 | 791.7 | 1.12x | 1796 / 1845 | 37.4 / 32.6 |
+| TP1 | 64 | 962.2 | 1061.7 | 1.10x | 2822 / 2723 | 53.2 / 46.8 |
+| TP1 | 128 | 1219.4 | 1276.2 | 1.05x | 5798 / 5972 | 80.4 / 75.9 |
+| TP1 | 256 | 1275.4 | 1326.6 | 1.04x | 11421 / 11712 | 127.8 / 119.5 |
+| TP1 | 512 | 1275.8 | 1329.3 | 1.04x | 43074 / 42056 | 129.8 / 121.4 |
+| TP2 | 1 | 54.9 | 80.5 | 1.47x | 120 / 118 | 17.7 / 11.9 |
+| TP2 | 16 | 632.6 | 785.2 | 1.24x | 1002 / 1102 | 20.5 / 15.8 |
+| TP2 | 32 | 1024.2 | 1123.5 | 1.10x | 1833 / 1788 | 23.5 / 20.8 |
+| TP2 | 64 | 1325.5 | 1432.7 | 1.08x | 2833 / 2946 | 35.2 / 31.8 |
+| TP2 | 128 | 1586.1 | 1651.3 | 1.04x | 5471 / 5179 | 58.6 / 54.8 |
+| TP2 | 256 | 1386.5 | 1762.2 | 1.27x | 10257 / 10630 | 140.0 / 101.0 |
+| TP2 | 512 | 1796.5 | 1815.0 | 1.01x | 20118 / 20060 | 198.1 / 196.0 |
+
+Output tok/s is total across the server (not per GPU); ratios use the unrounded `metrics.json` values. Effective concurrency stays below C at the high end in both images (TP1 C=512: 345 before, 348 after), so those points measure the server's saturated throughput, not C=512 in flight. The large TP2 C=256 gain (TPOT 140.0 to 101.0 ms) is one run per point and was not repeated.
