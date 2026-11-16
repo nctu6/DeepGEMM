@@ -1213,7 +1213,7 @@ Model `/models/Qwen/Qwen3.8-27B-FP8`, RTX PRO 6000 Blackwell (SM120), RAG worklo
 Output tok/s is total across the server (not per GPU); ratios use the unrounded `metrics.json` values. Effective concurrency stays below C at the high end in both images (TP1 C=512: 345 before, 348 after), so those points measure the server's saturated throughput, not C=512 in flight. The large TP2 C=256 gain (TPOT 140.0 to 101.0 ms) is one run per point and was not repeated.
 
 ## 10. Qwen3.8-27B-FP8: TokenSpeed vs TensorRT-LLM, TP1 and TP2 (task 73)
-Same model, GPU, client and RAG protocol as section 9 (RTX PRO 6000 Blackwell, ~830 input / 256 output tokens, 500 prompts, 100 at C=1, ignore EOS, C = 1, 16, 32, 64, 128, 256, 512 as one ramp per fresh server, single run per point, 0 errors). TokenSpeed rows are the "after" rows of section 9 (image `1b671310-20261114`, `tokenspeed serve ... --max-num-seqs 512 --gpu-memory-utilization 0.9 --max-model-len 262144`, TP2 adds `--tensor-parallel-size 2`).
+Same model, GPU, client and RAG protocol as section 9 (RTX PRO 6000 Blackwell, ~820 input / 256 output tokens, 500 prompts, 100 at C=1, ignore EOS, C = 1, 16, 32, 64, 128, 256, 512 as one ramp per fresh server, single run per point, 0 errors). TokenSpeed rows are the "after" rows of section 9 (image `1b671310-20261114`, `tokenspeed serve ... --max-num-seqs 512 --gpu-memory-utilization 0.9 --max-model-len 262144`, TP2 adds `--tensor-parallel-size 2`).
 
 TensorRT-LLM: NGC `nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3`, `trtllm-serve /models/Qwen/Qwen3.8-27B-FP8 --backend pytorch --trust_remote_code --tp_size N --max_batch_size B --max_seq_len 262144 --max_num_tokens 8192 --config cfg.yml`, with this YAML (B = 512 for TP2, 256 for TP1):
 ```yaml
