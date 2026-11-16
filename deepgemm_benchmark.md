@@ -1211,3 +1211,53 @@ Model `/models/Qwen/Qwen3.8-27B-FP8`, RTX PRO 6000 Blackwell (SM120), RAG worklo
 | TP2 | 512 | 1796.5 | 1815.0 | 1.01x | 20118 / 20060 | 198.1 / 196.0 |
 
 Output tok/s is total across the server (not per GPU); ratios use the unrounded `metrics.json` values. Effective concurrency stays below C at the high end in both images (TP1 C=512: 345 before, 348 after), so those points measure the server's saturated throughput, not C=512 in flight. The large TP2 C=256 gain (TPOT 140.0 to 101.0 ms) is one run per point and was not repeated.
+
+## 10. Qwen3.8-27B-FP8: TokenSpeed vs TensorRT-LLM, TP1 and TP2 (task 73)
+Same model, GPU, client and RAG protocol as section 9 (RTX PRO 6000 Blackwell, ~830 input / 256 output tokens, 500 prompts, 100 at C=1, ignore EOS, C = 1, 16, 32, 64, 128, 256, 512 as one ramp per fresh server, single run per point, 0 errors). TokenSpeed rows are the "after" rows of section 9 (image `1b671310-20261114`, `tokenspeed serve ... --max-num-seqs 512 --gpu-memory-utilization 0.9 --max-model-len 262144`, TP2 adds `--tensor-parallel-size 2`).
+
+TensorRT-LLM: NGC `nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc3`, `trtllm-serve /models/Qwen/Qwen3.8-27B-FP8 --backend pytorch --trust_remote_code --tp_size N --max_batch_size B --max_seq_len 262144 --max_num_tokens 8192 --config cfg.yml`, with this YAML (B = 512 for TP2, 256 for TP1):
+```yaml
+enable_chunked_prefill: true
+trust_remote_code: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: B
+kv_cache_config:
+  free_gpu_memory_fraction: 0.9
+  enable_block_reuse: true
+  mamba_ssm_cache_dtype: float32
+print_iter_log: false
+```
+The overlap scheduler is the default. TRT-LLM has no curated config for this dense GatedDeltaNet model, so the YAML follows the keys of the release guide's Qwen3.5/3.8 MoE configs.
+
+**TP1 difference.** With max batch 512 the TP1 server does not start: `ValueError: The V2 Mamba GPU cache quota is too small for live recurrent states and attention pages: got 59135518310 bytes, need at least 78975401984 bytes`. TRT-LLM reserves one recurrent (GatedDeltaNet) state per possible live request, about 154 MB each at TP1, so 512 requests need 79 GB next to 28 GB of weights. Lowering `max_batch_size` (server flag and CUDA graph batch) to 256 (39.6 GB of states) is the only change; the fraction (0.9) and `max_seq_len` (262144) stay. TP2 halves the per-GPU state and starts with 512.
+
+| Engine | Config | Max batch | KV cache (tokens) |
+|---|---|---|---|
+| TokenSpeed | TP1 | 512 | 857088 |
+| TensorRT-LLM | TP1 | 256 | ~218k (50.1 GiB quota, 36.9 GiB fixed recurrent state, 64 KiB per token) |
+| TokenSpeed | TP2 | 512 | 2179584 |
+| TensorRT-LLM | TP2 | 512 | ~860k per GPU (63.1 GiB quota, 36.8 GiB fixed recurrent state, 32 KiB per token) |
+
+CUDA graphs: TokenSpeed captures decode graphs up to `--max-num-seqs` (512, section 9); TensorRT-LLM captures up to its max batch (256 TP1, 512 TP2) with padding. TRT-LLM KV token counts are derived from the logged quota, not reported by the server. At C=256 and C=512 the TP1 TensorRT-LLM server can run at most 256 requests at once (effective concurrency 232 and 355 of the 512 sent), so its smaller batch may cost it throughput at the top of the ramp; this was not isolated.
+
+Out tok/s is the server total; TTFT / TPOT are p50 (TokenSpeed / TensorRT-LLM).
+
+| Config | C | Out tok/s TokenSpeed | Out tok/s TensorRT-LLM | Ratio | TTFT p50 (ms) | TPOT p50 (ms) |
+|---|---|---|---|---|---|---|
+| TP1 | 1 | 47.6 | 40.2 | 1.18x | 102 / 111 | 20.6 / 24.4 |
+| TP1 | 16 | 514.6 | 459.1 | 1.12x | 989 / 1162 | 26.6 / 28.9 |
+| TP1 | 32 | 791.7 | 710.1 | 1.11x | 1845 / 1848 | 32.6 / 37.3 |
+| TP1 | 64 | 1061.7 | 974.2 | 1.09x | 2723 / 2426 | 46.8 / 55.4 |
+| TP1 | 128 | 1276.2 | 1174.4 | 1.09x | 5972 / 2844 | 75.9 / 96.1 |
+| TP1 | 256 | 1326.6 | 1166.4 | 1.14x | 11712 / 12134 | 119.5 / 136.0 |
+| TP1 | 512 | 1329.3 | 1158.8 | 1.15x | 42056 / 49576 | 121.4 / 136.1 |
+| TP2 | 1 | 80.5 | 67.3 | 1.20x | 118 / 110 | 11.9 / 14.4 |
+| TP2 | 16 | 785.2 | 669.6 | 1.17x | 1102 / 1142 | 15.8 / 19.2 |
+| TP2 | 32 | 1123.5 | 975.9 | 1.15x | 1788 / 1679 | 20.8 / 25.8 |
+| TP2 | 64 | 1432.7 | 1278.6 | 1.12x | 2946 / 2188 | 31.8 / 40.9 |
+| TP2 | 128 | 1651.3 | 1496.5 | 1.10x | 5179 / 2518 | 54.8 / 74.2 |
+| TP2 | 256 | 1762.2 | 1614.0 | 1.09x | 10630 / 3882 | 101.0 / 142.1 |
+| TP2 | 512 | 1815.0 | 1610.9 | 1.13x | 20060 / 23803 | 196.0 / 213.8 |
+
+Ratio range 1.09x to 1.20x (TP1 1.09x to 1.18x, TP2 1.09x to 1.20x). TensorRT-LLM TTFT p50 is lower at C=128 (both TP) and C=256 (TP2), (cause not investigated). Chart: `assets/perf/tokenspeed-sm120-performance.png` in the TokenSpeed repo (y = output tok/s per GPU x 60 / 1000, TP2 divided by 2; x = 1000 / TPOT p50). Single run per point, not repeated; TensorRT-LLM 1.4.0rc3 is a release candidate. Results: `tmp/bench_images_local/results/fix73/` (TensorRT-LLM) and `fix71/` (TokenSpeed).
