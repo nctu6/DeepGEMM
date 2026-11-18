@@ -1261,3 +1261,69 @@ Out tok/s is the server total; TTFT / TPOT are p50 (TokenSpeed / TensorRT-LLM).
 | TP2 | 512 | 1815.0 | 1610.9 | 1.13x | 20060 / 23803 | 196.0 / 213.8 |
 
 Ratio range 1.09x to 1.20x (TP1 1.09x to 1.18x, TP2 1.09x to 1.20x). TensorRT-LLM TTFT p50 is lower at C=128 (both TP) and C=256 (TP2), (cause not investigated). Chart: `assets/perf/tokenspeed-sm120-performance.png` in the TokenSpeed repo (y = output tok/s per GPU x 60 / 1000, TP2 divided by 2; x = 1000 / TPOT p50). Single run per point, not repeated; TensorRT-LLM 1.4.0rc3 is a release candidate. Results: `tmp/bench_images_local/results/fix73/` (TensorRT-LLM) and `fix71/` (TokenSpeed).
+
+## 11. Upstream merge verification (tasks 75-78)
+
+Question: does the merge of `origin/main` into `nctu6` (TokenSpeed branch `merge-main-1117`, 705 commits) keep the serving numbers of sections 9 and 10? DeepGEMM did not change in code (pin `76d1cbc`).
+
+**Conditions.** TokenSpeed `d4b6cf4f6` (merge `a6c0094fa` plus the fixes in analysis 9.59), image `nctu6/tokenspeed:d4b6cf4f-20261118` (ID `a6b788504cd7`, built from `docker/Dockerfile.nvidia.unieai`, arches 9.0a 10.0a 12.0a). Versions: torch 2.14.0+cu130, triton 3.8.0 (tokenspeed-triton 3.9.10.post20261028), flashinfer-python 0.7.4, tokenspeed-engine 0.1.1, tokenspeed-scheduler 0.1.58, tokenspeed-kernel 0.1.5.dev20261118, nvidia-cutlass-dsl 4.8.0, deep_gemm 2.8.2 (`76d1cbc`), smg fork 1.13.0 (`3f053dc9`). Default arguments, no environment variables, same RAG protocol as section 9 (500 prompts, 100 at C=1, 256 output tokens, ignore EOS, seed 0, warm server, fresh server per session), 0 request errors in every run. Two defaults differ from the pre-merge image `1b671310-20261114`:
+- KV events are off. The merged `ts serve` runs the gateway on the ZMQ lane (no gRPC servicer, whose default turned them on), passes no `--kv-events-config` and uses `--policy passthrough`, so nothing consumes them. The pre-merge numbers had them on.
+- The prefill-graph ladder goes up to 8192 tokens (`PREFILL_GRAPH_DEFAULT_MAX_TOKENS`, was 2048), which shrinks the KV pool: Qwen3.8-27B-FP8 850815 to 804607 tokens (task 77 readout).
+
+Selections that changed against the pre-merge image (`TOKENSPEED_KERNEL_VERBOSE=1`): `conv.causal_conv1d_prefill` triton to `cute_dsl_causal_conv1d_prefill`, new `flashinfer_gemma_rmsnorm`, Qwen3.8-NVFP4 per-channel scaled FP8 partly `torch_mm_fp8_scaled` (116 of 138 calls). The DeepGEMM selections (`deepgemm_sm120_mm_fp8_blockscale`, MegaMoE, mHC, indexer) and the decode graph list (37 sizes, 512 to 1) are unchanged.
+
+### 11.1 Qwen3.8-27B-FP8, merged vs pre-merge vs TensorRT-LLM
+
+Out tok/s, server total. Pre-merge is section 9 "after" (`1b671310`, `results/fix71/`); TensorRT-LLM 1.4.0rc3 is section 10 (`results/fix73/`, TP1 with max batch 256). Merged TP1 is the mean of two parallel sessions on GPUs 6 and 7 (they agree within 0.0-0.3%); merged TP2 is one run per point (C=256 and 512 have a repeat). Results: `results/fix78/` (`compare78.md`, `summary.md`).
+
+| Config | C | Merged | Pre-merge | TensorRT-LLM | Merged / pre-merge | Merged / TRT-LLM | TPOT p50 merged / pre-merge (ms) | TTFT p50 merged / pre-merge (ms) |
+|---|---|---|---|---|---|---|---|---|
+| TP1 | 1 | 49.0 | 47.6 | 40.2 | 1.027x | 1.22x | 20.1 / 20.6 | 94 / 102 |
+| TP1 | 16 | 536.3 | 514.6 | 459.1 | 1.042x | 1.17x | 25.6 / 26.6 | 917 / 989 |
+| TP1 | 32 | 822.3 | 791.7 | 710.1 | 1.039x | 1.16x | 31.6 / 32.6 | 1752 / 1845 |
+| TP1 | 64 | 1100.3 | 1061.7 | 974.2 | 1.036x | 1.13x | 45.4 / 46.8 | 2941 / 2723 |
+| TP1 | 128 | 1321.7 | 1276.2 | 1174.4 | 1.036x | 1.13x | 73.7 / 75.9 | 5444 / 5972 |
+| TP1 | 256 | 1366.2 | 1326.6 | 1166.4 | 1.030x | 1.17x | 105.0 / 119.5 | 11366 / 11712 |
+| TP1 | 512 | 1363.6 | 1329.3 | 1158.8 | 1.026x | 1.18x | 105.8 / 121.4 | 38930 / 42056 |
+| TP2 | 1 | 83.6 | 80.5 | 67.3 | 1.039x | 1.24x | 11.6 / 11.9 | 92 / 118 |
+| TP2 | 16 | 825.3 | 785.2 | 669.6 | 1.051x | 1.23x | 15.5 / 15.8 | 881 / 1102 |
+| TP2 | 32 | 1179.2 | 1123.5 | 975.9 | 1.050x | 1.21x | 20.3 / 20.8 | 1651 / 1788 |
+| TP2 | 64 | 1491.1 | 1432.7 | 1278.6 | 1.041x | 1.17x | 30.9 / 31.8 | 2866 / 2946 |
+| TP2 | 128 | 1708.3 | 1651.3 | 1496.5 | 1.035x | 1.14x | 52.7 / 54.8 | 5455 / 5179 |
+| TP2 | 256 | 1830.4 | 1762.2 | 1614.0 | 1.039x | 1.13x | 97.5 / 101.0 | 10008 / 10630 |
+| TP2 | 512 | 1784.1 | 1815.0 | 1610.9 | **0.983x** | 1.11x | 188.2 / 196.0 | 19346 / 20060 |
+
+All points except TP2 C=512 are 2.6-5.1% above pre-merge, outside the ~1% spread of task 59; the TP1 TPOT p50 is 0.96-0.98x up to C=128 and 0.88x at C=256/512. The gain was not isolated (candidates: KV events off, `cute_dsl_causal_conv1d_prefill`; neither A/B tested). TTFT p50 stays inside the task 59 noise (0.78-1.08x; TP2 C=1/16 at 0.78x/0.80x are single runs).
+
+**TP2 C=512, -1.9%.** Merged 1784.1 and 1776.2 (repeat) against pre-merge 1815.0 and 1813.0 (repeat spread 0.5% and 0.1%). TPOT p50 is lower (188.5 vs 196.5 ms), so the cause is concurrency, not per-token speed: effective concurrency 473 vs 497. A/B on the merged image with one knob, `--prefill-graph-max-tokens 2048` (the old default):
+
+| Variant | Out tok/s | Effective concurrency | Prefill ladder | KV pool (parents) |
+|---|---|---|---|---|
+| Pre-merge `1b671310` | 1815.0 | 497 | up to 2048 | 1419 |
+| Merged, default (8192) | 1784.1 | 473 | `[352, 1792, 7168, 7680, 8192]` | 1368 |
+| Merged, `--prefill-graph-max-tokens 2048` | 1869.8 | 495 | `[224, 704, 1792, 1920, 2048]` | 1387 |
+
+At C=512 all 500 requests are admitted at once, so the smaller pool admits fewer. C=256 is unaffected (1830.4 / 1823 at 8192, 1825 at 2048, pre-merge 1762.2 / 1750). The default is main's design choice and was not changed. The TP1 C=512 point was not A/B tested (no regression there).
+
+### 11.2 V4.1 128-of-384 subset, TP2
+
+Same subset checkpoint and protocol as `results/fix60/`; fresh server per run, C=16 then 128, three repeats interleaved. Merged is mean [min-max]; spread = (max - min) / mean. Pre-merge is the `fix60` mean.
+
+| Backend | C | Out tok/s merged | Spread | Out tok/s pre-merge | Ratio | TPOT p50 merged / pre (ms) | TTFT p50 merged / pre (ms) |
+|---|---|---|---|---|---|---|---|
+| default (`mega_moe`, prefill graph 8192) | 16 | 648.4 [647.2-649.7] | 0.4% | 622.5 | 1.042x | 22.0 / 22.3 | 545 / 637 |
+| default (`mega_moe`, prefill graph 8192) | 128 | 2294.4 [2292.3-2297.8] | 0.2% | 2196.5 | 1.045x | 48.7 / 50.0 | 1387 / 1910 |
+| Marlin, `--prefill-graph-max-tokens 2048` | 16 | 620.7 [619.5-621.9] | 0.4% | 611.0 | 1.016x | 22.4 / 22.6 | 671 / n.a. |
+| Marlin, `--prefill-graph-max-tokens 2048` | 128 | 1962.9 [1962.5-1963.4] | 0.0% | 1910.5 | 1.027x | 56.8 / 57.7 | 1655 / n.a. |
+
+The C=128 TTFT spread of `mega_moe` is 11.2%, so only the C=16 TTFT ratio (0.86x) is outside noise by a margin. Input tok/s at C=128: 7141 vs 6836 pre-merge. `mega_moe` over Marlin (both merged, Marlin at 2048): out tok/s 1.045x at C=16 and 1.169x at C=128 (pre-merge 1.019x / 1.150x), TPOT at C=128 0.857x (0.867x).
+
+**Prefill-graph cost for V4.1 `mega_moe`** (one session at 2048, `mega_moe-pg2048-r1`): 639.2 / 2290.8 out tok/s at C=16 / 128 against 648.4 / 2294.4 at 8192 (-1.4% and -0.2%, one run against the 3-run spread of 0.4% / 0.2%), so the 8192 default gains no throughput here, while the KV pool drops from 16362 parents (token capacity 17.36M) at 2048 to 12603 parents (11.59M) at 8192 (-23% parents, -33% tokens). Task 77 quoted 25.85M to 18.78M from a different readout.
+
+**Marlin startup OOM at 8192.** `--moe-backend marlin` (the registered name; `auto` now resolves to `mega_moe`) with the 8192 default dies with `torch.OutOfMemoryError` (226 MiB requested, 53 MiB free on the GPU) in `marlin_mxfp4_local_moe_apply` (`torch.zeros(num_tokens * top_k, hidden)`, `ops/moe/marlin.py:350`) while capturing the prefill-graph decoder bucket at rows 4096-6656 (1.0-1.7 GB free at the start of each capture). Run `d4b6cf4f-marlin-r1` is SESSION_FAILED; r2/r3 were not run. Workaround: `--prefill-graph-max-tokens 2048`, which starts and gives the Marlin rows above.
+
+### 11.3 Decision on the README chart
+
+`assets/perf/tokenspeed-sm120-performance.png` and the README numbers stay unchanged: the merged numbers are better than pre-merge by 2.6-5.1% or within 2% (TP2 C=512, -1.9%, which is the 8192 prefill-graph default and not a kernel regression). The chart keeps the `1b671310` measurements.
+
+Not done: the other task 77 models, agentX, V4.1 C=1 and C>=256, TP2 repeats of C<=128 (single runs), an A/B of the +2.6-5.1% gain.
