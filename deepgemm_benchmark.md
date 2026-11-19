@@ -3,6 +3,7 @@
 Tasks 40-48 of the SM120 spec. Served on 2026-11-12 on aws-raichu, GPUs 6 and 7. This is the detailed record.
 The short version is in [`deepgemm_report.md`](deepgemm_report.md) section 3, and the status-log entries are in
 [`deepgemm-analysis.md`](deepgemm-analysis.md) 9.44 and 9.45.
+The merged image against the previous one on all six models, RAG and agentX (tasks 80-82): [`deepgemm_benchmark_1118.md`](deepgemm_benchmark_1118.md).
 
 The question: what do the SM120 kernel and runtime changes (DeepGEMM SM120 pin, CuTe DSL / Triton attention
 leaves, NVFP4 and V4.1 fixes) change for served throughput and latency? Two images, six models, two client
