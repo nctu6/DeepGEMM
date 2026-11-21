@@ -33,7 +33,7 @@ agentX (AIPerf `inferencex-agentx-mvp`, 900 s, seed 1110):
 | Qwen3.8-27B-FP8 (TP1) | out tok/s 24.2 / 24.2 (1.00x)<br>TTFT p50 2709 / 2664 (1.02x)<br>TPOT p50 27.8 / 28.4 (0.98x) | out tok/s 31.2 / 32.8 (1.05x)<br>TTFT p50 1810 / 1074 (1.69x)<br>TPOT p50 91.3 / 87.2 (1.05x) | out tok/s 10.3 / 10.2 (0.99x)<br>TTFT p50 399248 / 390231 (1.02x)<br>TPOT p50 214.9 / 198.2 (1.08x) |
 | Qwen3.8-27B-NVFP4 (TP1) | out tok/s 24.2 / 24.2 (1.00x)<br>TTFT p50 2563 / 2553 (1.00x)<br>TPOT p50 25.0 / 25.9 (0.97x) | out tok/s 40.2 / 40.2 (1.00x)<br>TTFT p50 925 / 937 (0.99x)<br>TPOT p50 67.4 / 68.0 (0.99x) | out tok/s 11.9 / 11.6 (0.97x)<br>TTFT p50 403704 / 387665 (1.04x)<br>TPOT p50 194.5 / 249.7 (0.78x) |
 | Qwen3.6-35B-A3B BF16 (TP1) | out tok/s 72.1 / 73.9 (1.02x)<br>TTFT p50 723 / 709 (1.02x)<br>TPOT p50 12.0 / 12.1 (0.99x) | out tok/s 107.1 / 98.0 (0.92x)<br>TTFT p50 1274 / 840 (1.52x)<br>TPOT p50 22.2 / 23.3 (0.95x) | out tok/s 43.7 / 43.7 (1.00x)<br>TTFT p50 289680 / 296248 (0.98x)<br>TPOT p50 51.3 / 52.7 (0.97x) |
-| gemma-4-31B-it BF16 (TP1) | out tok/s 16.0 / 17.2 (1.08x)<br>TTFT p50 2225 / 2200 (1.01x)<br>TPOT p50 50.5 / 50.5 (1.00x) | out tok/s FAILED / 15.3<br>TTFT p50 - / 131541<br>TPOT p50 - / 98.5 | out tok/s FAILED / 12.5<br>TTFT p50 - / 130159<br>TPOT p50 - / 178.2 |
+| gemma-4-31B-it BF16 (TP1), `--chunked-prefill-size 1024` (section 4.4; the default-args runs are in 4.1) | out tok/s 15.97 / 15.97 (1.00x)<br>TTFT p50 2363 / 2309 (0.98x)<br>TPOT p50 50.5 / 50.4 (1.00x) | out tok/s 9.20 / 9.20 (1.00x)<br>TTFT p50 554433 / 549921 (0.99x)<br>TPOT p50 54.5 / 54.1 (0.99x) | out tok/s 3.84 / 3.84 (1.00x)<br>TTFT p50 267333 / 362066 (1.35x)<br>TPOT p50 54.7 / 53.9 (0.99x) |
 | Qwen3.5-122B-A10B-NVFP4 (TP2) | out tok/s 67.8 / 64.4 (0.95x)<br>TTFT p50 953 / 962 (0.99x)<br>TPOT p50 13.2 / 13.9 (0.95x) | out tok/s 118.9 / 116.5 (0.98x)<br>TTFT p50 700 / 680 (1.03x)<br>TPOT p50 18.5 / 19.3 (0.96x) | out tok/s 6.3 / 8.5 (1.36x)<br>TTFT p50 178573 / 182897 (0.98x)<br>TPOT p50 1178.3 / 1061.3 (1.11x) |
 | DeepSeek-V4.1-Flash 128-of-384 experts (TP2) | out tok/s 86.7 / 86.7 (1.00x)<br>TTFT p50 209 / 139 (1.50x)<br>TPOT p50 11.1 / 10.5 (1.06x) | out tok/s 150.9 / 155.9 (1.03x)<br>TTFT p50 175 / 153 (1.14x)<br>TPOT p50 11.4 / 10.7 (1.06x) | out tok/s 542.1 / 608.0 (1.12x)<br>TTFT p50 308 / 215 (1.43x)<br>TPOT p50 31.9 / 28.3 (1.13x) |
 
@@ -53,7 +53,7 @@ Headlines:
   34 vs 39 requests completed), V4.1 C=64 1.12x (542.1 vs 608.0), gemma-4 C=1 1.08x. TTFT p50 is lower on the new image for V4.1 at all C
   (139 / 153 / 215 ms against 209 / 175 / 308), and for FP8 and Qwen3.6 at C=16 (1074 against 1810 ms, 840 against 1274 ms). These are
   single runs of a heavy-tailed distribution. C=64 completes only 14-50 requests for the Qwen and gemma models, so I do not read ±15% there.
-  gemma-4 agentX C=16 / 64 is not comparable (section 4.1).
+  gemma-4 agentX with default arguments is not comparable at C=16 / 64 (section 4.1); the table row uses the chunk-1024 rerun (section 4.4, `b7607f59` as the new image).
 - Every gated probe passed. RAG: 84 of 84 runs done, 0 request errors, no server restart or crash. agentX: 36 runs, 2 FAILED (old gemma-4 C=16 / 64),
   and one engine kill (exit code -9) in the first attempt of old Qwen3.5-122B C=64, which was rerun once (section 4.2).
 ## 2. Testing conditions
@@ -499,6 +499,70 @@ so the 1.36x ratio (6.3 against 8.5 out tok/s) is a difference of a few requests
 - **V4.1 output is not meaningful.** The 128-of-384 subset gives plausible but wrong text (primes " 7, 9, 11, 13, 15, ..."). Its numbers measure speed, not quality, and the probe is recorded, not gated.
 - **Not run:** a no-op control (the same image twice), RAG repeats, the merged image with KV events on, the prefill graph at 2048 for these six models, and V4.1 with `--moe-backend marlin`
   (it does not start on the merged default, `deepgemm_benchmark.md` 11.2).
+### 4.4 gemma-4 agentX with `--chunked-prefill-size 1024` (task 84, replaces the default-args comparison of 4.1)
+Section 4.1 compared a 185,278-token old server with a 162,046-token new one, so the old image failed (gateway 400) and the new one refused 1 / 10 / 80 requests. That
+comparison was not clean. Here both servers admit the whole agentX corpus: BF16 KV cache (no `--kv-cache-dtype`), `--chunked-prefill-size 1024` on top of the
+section 2.4 flags (`--max-num-seqs 512 --gpu-memory-utilization 0.9 --max-model-len 262144`), the same agentX command (full mode, C=1/16/64, 900 s, seed 1110, `--use-server-token-count`).
+This chunk-1024 comparison replaces the default-args one for gemma-4 agentX. Results: `tokenspeed/tmp/bench_images_local/results/b1118g/gemma4-31b-it/<image>/agentx/c<C>/`
+(synced from aws-raichu; every number below is recomputed from `metrics.json`).
+
+| image | tag | commits | single-request limit (`max_input`) | GPU |
+|---|---|---|---|---|
+| old | `nctu6/tokenspeed:1b671310-20261114` | `1b671310` | 262,143 | 7 |
+| merged, before the task 85 fix | `nctu6/tokenspeed:d4b6cf4f-20261118` | `d4b6cf4f6` | 261,886 | 6 |
+| merged, with the task 85 fix | `nctu6/tokenspeed:b7607f59-20261121` | `fd8b26891` (fix), `b7607f59c` (docs) | 261,886 | 6 |
+
+No request was refused on either finished image: 0 errors in every run, `submission_valid` true. Times in ms, TPOT in ms, wall and warmup in s.
+`fixed/old` is `b7607f59` over `1b671310`.
+
+| C | metric | old `1b671310` | merged `d4b6cf4f` | fixed `b7607f59` | fixed / old |
+|---|---|---|---|---|---|
+| 1 | requests ok / errors | 11 / 0 | 11 / 0 | 11 / 0 | 1.00x |
+| 1 | out tok/s | 15.97 | 15.97 | 15.97 | 1.00x |
+| 1 | TTFT mean / p50 / p99 | 3987 / 2363 / 13297 | 3925 / 2315 / 13138 | 3918 / 2309 / 13130 | 0.98x / 0.98x / 0.99x |
+| 1 | TPOT mean / p50 / p99 | 50.6 / 50.5 / 52.1 | 50.4 / 50.4 / 51.4 | 50.4 / 50.4 / 51.4 | 1.00x / 1.00x / 0.99x |
+| 1 | wall s / warmup s | 992 / 56 | 990 / 56 | 990 / 56 | 1.00x / 0.99x |
+| 1 | ISL avg / OSL avg | 139874 / 1349.8 | 139874 / 1349.8 | 139874 / 1349.8 | 1.00x |
+| 16 | requests ok / errors | 7 / 0 | 7 / 0 | 7 / 0 | 1.00x |
+| 16 | out tok/s | 9.20 | 9.20 | 9.20 | 1.00x |
+| 16 | TTFT mean / p50 / p99 | 456098 / 554433 / 699357 | 444527 / 550142 / 694649 | 444319 / 549921 / 694377 | 0.97x / 0.99x / 0.99x |
+| 16 | TPOT mean / p50 / p99 | 95.7 / 54.5 / 208.8 | 83.1 / 54.1 / 202.5 | 83.1 / 54.1 / 202.5 | 0.87x / 0.99x / 0.97x |
+| 16 | wall s / warmup s | 1977 / 1032 | 1969 / 1024 | 1968 / 1023 | 1.00x / 0.99x |
+| 16 | ISL avg / OSL avg | 130199 / 1235.6 | 130199 / 1235.6 | 130200 / 1235.6 | 1.00x |
+| 64 | requests ok / errors | 4 / 0 | FAILED (stalled) | 4 / 0 | 1.00x |
+| 64 | out tok/s | 3.84 | FAILED | 3.84 | 1.00x |
+| 64 | TTFT mean / p50 / p99 | 269693 / 267333 / 536258 | FAILED | 339817 / 362066 / 627959 | 1.26x / 1.35x / 1.17x |
+| 64 | TPOT mean / p50 / p99 | 141.8 / 54.7 / 398.6 | FAILED | 97.2 / 53.9 / 227.7 | 0.69x / 0.99x / 0.57x |
+| 64 | wall s / warmup s | 6248 / 5303 | FAILED | 6092 / 5147 | 0.97x / 0.97x |
+| 64 | ISL avg / OSL avg | 128536 / 902.8 | FAILED | 128537 / 902.8 | 1.00x |
+
+**Out tok/s is identical across the images on purpose.** Only 4-11 requests complete inside the 900 s window and the traces are seeded identically (seed 1110), so
+the same requests complete on both images; out tok/s is the output tokens of that set divided by 900 s, which cannot differ. Only TTFT, TPOT and the completed set can differ.
+They differ by little at C=1 and C=16 (TTFT p50 0.98-0.99x, TPOT p50 0.99-1.00x). C=64 completes 4 requests per image, so its TTFT p50 ratio 1.35x (267 s against 362 s)
+and the TPOT mean / p99 ratios (0.69x / 0.57x, one slow request) are not distinguishable from noise with one run per point; I did not repeat them.
+
+**Failed run: merged `d4b6cf4f`, C=64 (before the task 85 fix).** C=1 and C=16 finished (`DONE`); the C=64 warmup returned 6 of 59 requests and then stopped making progress, with no
+`metrics.json`. The last scheduler batch line was at 01:01:16 (decode, 3 running, 5 queued, pages 535/1692/2227), then only `ts_request_accepted` events for 2.5 h, GPU utilization 0 %, and the gateway
+logged "Worker vetoed by liveness" (request timeouts of 1800 s). The host rank process was at 100 % CPU for 3.4 h in its control thread (empty rounds), the forward thread parked in `Channel<Op>::recv`.
+Cause (task 85): a paced L2 write-back (`[L2] writeback queued: operations=1 blocks=545 slice=64`, 9 slices, one per plan) pins its Device pages until the last slice is acknowledged; the merged event loop
+keeps a round whose plan has no device work off the data plane, so once the running requests were aborted no plan carried device work, slices 4-9 never launched, and the pages were never released.
+The fix (`fd8b26891`) makes the control thread's cache-event poll queue one `Op::PumpCacheWrites` on the forward thread while a paced write-back has slices left. With it the merged image finishes C=64
+(column `fixed`). No scheduler, KV-event, abort-limit or sliding-window fault was involved. The old image has the old loop, which dispatched an empty plan every round, so it did not stall.
+
+**Comparison with earlier gemma-4 agentX runs.**
+
+| source | image | args | C=1 out tok/s / TTFT p50 | C=16 | C=64 |
+|---|---|---|---|---|---|
+| task 81 (4.1) | old `1b671310` | default (limit 185,278) | 16.0 / 2225 | FAILED (gateway 400) | FAILED (gateway 400) |
+| task 81 (4.1) | merged `d4b6cf4f` | default (limit 162,046) | 17.2 / 2200 (1 aborted) | 15.3 / 131541 (10 aborted) | 12.5 / 130159 (80 aborted) |
+| task 52 (`results/fix52/`) | `ef057889` | `--chunked-prefill-size 1024` (limit 262,143) | 15.97 / 2351 | 9.20 / 554379 | 3.84 / 267216 |
+| task 84 | old `1b671310` | `--chunked-prefill-size 1024` | 15.97 / 2363 | 9.20 / 554433 | 3.84 / 267333 |
+| task 84 | merged + fix `b7607f59` | `--chunked-prefill-size 1024` | 15.97 / 2309 | 9.20 / 549921 | 3.84 / 362066 |
+
+The task 81 numbers of the merged image (17.2 / 15.3 / 12.5) are measured on the requests that were not refused (all under 162,046 tokens) and are not comparable to the chunk-1024 numbers, which include
+the 160K-260K prompts. The old image's task 84 run reproduces the task 52 `ef057889` run within the usual spread (out tok/s equal, TTFT p50 within 0.1 % at C=16 and C=64, 0.5 % at C=1).
+Not done: a repeat per point and the merged image with `--kv-cache-dtype fp8`. The merged servers admit at most 261,886 tokens (cache bound), 257 fewer than the old 262,143; no request was refused.
+
 ## 5. Reproduce
 ```bash
 cd <tokenspeed>/tmp/bench_images_local   # harness: run_bench.py, bench_queue.py, compare80.py, compare81.py
