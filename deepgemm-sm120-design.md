@@ -90,7 +90,7 @@ hardware.
 | DeepGEMM (`https://github.com/nctu6/DeepGEMM`) | `nctu6` | `970b868` kernels, host code, tests, scripts; `3070f4c` setup.py header fallback; `e350464`, `49f3fe1`, `b5adf0e`, `f6bd900` block-scaled FP4 / UE8M0 FP8 GEMMs; `b419c02` PDL, narrow tiles, 8 warps, stage staging, 64-byte FP4 K, PSUM, BF16; `b19d5e8` sweep / fit / check scripts; `eff4cea` joint-mode refit, `eb61610`+`4659181` NVFP4 + alpha/accumulate/FP32, `bfb637c` tf32 hc, `5dfd734` einsum, `38ef2a2` MQA head dim 64; `1b065a2` cost-model refit; `74e1f61` MN-major BF16, native einsum, k-grouped BF16; `9704db0` BF16 / einsum tests on SM120; `4a95a00` stream-K range after `setmaxnreg`; `a765e73` mixed UE8M0 / FP32 scale pair; `9f19e0a` 1D2D SFA row offsets; `24ff5d4` MN-major FP8; `f3a533a` k-grouped FP8; `bc604f7` MN-major `fp8_einsum`; `0285421` paged MQA head dim 32/64; `6a7d45e` batched `fp8_einsum` launch; `2552171` 1D1D 16x32 stream-K spill; `76dc545` early PDL trigger for FP4, `2f4e3e0` its comment fix | `nctu6` head: the docs commit after `2f4e3e0` |
 | TokenSpeed | `nctu6` | `1c7a96a73` kernel integration; `0623d1552` PDL sync; `9617cda2c` submodule + install.sh + Docker; `b4cf963fc` SM120 auto-detect in install; `f798e68b4`, `f07f3cc54`, `8222224b8`, `63aaaf957` MXFP4 leaves; `5a532c016` mHC on SM120; `8a33e3341` SM100-only leaves capped; `019b65c04`, `469fc9c4a` NVFP4 fixes; `24a47e492` DeepGEMM submodule pin to `7804663`; `36211b436` batch-invariant SM120 DSA attention; `990e3e6cd` free ports in `test_control_server.py`; final pin to the DeepGEMM docs head | `nctu6` head: the DeepGEMM pin bump after the docs commit (below) |
 
-Test machine: aws-raichu, 8x RTX PRO 6000 Blackwell Server Edition (96 GB,
+Test machine: an 8x RTX PRO 6000 Blackwell Server Edition (96 GB,
 188 SMs), CUDA 13.2, driver 595.99.02, PCIe only (no NVLink). All tests and
 benchmarks ran on GPU 7 only.
 
@@ -1171,7 +1171,7 @@ hardware.
   can't be populated (offline, or not a git checkout), the image keeps the
   published wheel instead of failing the build.
 
-Verified on aws-raichu, using a scratch checkout and a relocated copy of the
+Verified on the benchmark host, using a scratch checkout and a relocated copy of the
 TokenSpeed venv so the live venv was untouched:
 - Plain `./scripts/install.sh` on GPU 7 (compute_cap 12.0): auto-detected
   SM120, replaced the wheel, and verified the source build. No flag.
@@ -1330,7 +1330,7 @@ Other notes:
 
 ## 11. Reproducing
 
-All commands run on aws-raichu with `CUDA_VISIBLE_DEVICES=7` and
+All commands run on the benchmark host with `CUDA_VISIBLE_DEVICES=7` and
 `CUDA_HOME=/usr/local/cuda`.
 
 - Build and test DeepGEMM:

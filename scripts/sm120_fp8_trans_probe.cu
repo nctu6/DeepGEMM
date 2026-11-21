@@ -25,7 +25,7 @@
 //      use the K-major `ldmatrix`
 //   4: (d) `ldmatrix.m16n16.x2.trans.b8`
 //
-// Build and run (on aws-raichu, GPU 7 only):
+// Build and run (on the benchmark host, GPU 7 only):
 //   nvcc -gencode arch=compute_120a,code=sm_120a -O3 -o /tmp/fp8_trans_probe scripts/sm120_fp8_trans_probe.cu
 //   CUDA_VISIBLE_DEVICES=7 /tmp/fp8_trans_probe
 #include <cstdint>

@@ -1,5 +1,5 @@
 # Serving benchmark: TokenSpeed image `1b671310-20261114` vs merged image `d4b6cf4f-20261118` on RTX PRO 6000 (SM120)
-Tasks 80-82 of the SM120 spec. Served on 2026-11-18 and 2026-11-19 on aws-raichu, GPUs 6 and 7. This is the detailed record.
+Tasks 80-82 of the SM120 spec. Served on 2026-11-18 and 2026-11-19 on the benchmark host, GPUs 6 and 7. This is the detailed record.
 The merge and its fixes are in [`deepgemm-analysis.md`](deepgemm-analysis.md) (upstream merge verification, tasks 75-78); the
 earlier two-image benchmark (`e27cee86` against `ef057889`) is [`deepgemm_benchmark.md`](deepgemm_benchmark.md). The short version is in
 [`deepgemm_report.md`](deepgemm_report.md) section 3.
@@ -60,7 +60,7 @@ Headlines:
 ### 2.1 Hardware and host
 | item | value | source |
 |---|---|---|
-| host | aws-raichu, 2x Intel Xeon Platinum 8559C, 2 TB RAM (1999 GiB in `free -g`), Ubuntu 24.04.4 LTS, kernel 7.0.0-1014-aws, Docker 29.1.3 | `lscpu`, `free -g`, `/etc/os-release`, `docker --version` read on 2026-11-19 |
+| host | benchmark host, 2x Intel Xeon Platinum 8559C, 2 TB RAM (1999 GiB in `free -g`), Ubuntu 24.04.4 LTS, kernel 7.0.0-1014-aws, Docker 29.1.3 | `lscpu`, `free -g`, `/etc/os-release`, `docker --version` read on 2026-11-19 |
 | GPUs | 8x NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120), 97887 MiB each, PCIe only | `deepgemm_benchmark.md` 2.1 (not re-read) |
 | GPUs used | 6 and 7 only (same PCIe switch per `deepgemm_benchmark.md` 2.1, not re-read). GPUs 0-5 belong to other users and were not touched | harness `--gpus 6` / `--gpus 7` |
 | driver / CUDA | driver 595.99.02, CUDA 13.2 (driver API); the images ship the CUDA 13.0 runtime (`torch 2.14.0+cu130`) | `nvidia-smi` on 2026-11-19, the day after the runs |
@@ -84,7 +84,7 @@ not re-read.
 | deep_gemm | 2.8.2+local | 2.8.2+local |
 | smg / smg-grpc-servicer | 1.13.0 / 0.14.0 (the `smg/` fork) | 1.13.0 / 0.14.0 (the `smg/` fork; the fork is still 1.13 while the pyproject pins 1.16) |
 | other | nvidia-cutlass-dsl 4.8.0, transformers 5.12.0, cuda-bindings 13.5.0 | same |
-Image IDs and creation times are from `docker images` on aws-raichu, the versions from `importlib.metadata` inside each image
+Image IDs and creation times are from `docker images` on the benchmark host, the versions from `importlib.metadata` inside each image
 (`tmp/` script, run on a CPU-only container on 2026-11-19). Commits come from the tags and the build record of tasks 68 and 77, as in
 `deepgemm_benchmark.md` 2.2; I did not re-hash the files inside the images for this document. Both images were built from
 `docker/Dockerfile.nvidia.unieai` with arches 9.0a 10.0a 12.0a, and run unmodified: only `/models` and the Hugging Face cache are mounted
@@ -123,7 +123,7 @@ One `docker run` per (image, model, phase), identical arguments in both images (
 ```bash
 docker run --rm --init -d --name bench-nctu6-g<gpus>-<model>-<image>-main --gpus "device=<gpus>" --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 -p 127.0.0.1:<18061+gpu>:8000 \
-  -v /models:/models:ro -v /unieai/.cache/huggingface:/root/.cache/huggingface:ro \
+  -v /models:/models:ro -v <hf-cache>:/root/.cache/huggingface:ro \
   -e HF_HUB_OFFLINE=1 -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
   nctu6/tokenspeed:<tag> \
   tokenspeed serve <model path> --served-model-name <name> --host 0.0.0.0 --port 8000 --trust-remote-code \
@@ -483,7 +483,7 @@ out-of-memory message before the exit line. Exit code -9 means the process recei
 **The cause is unknown.** The kernel journal of the host (`journalctl -k`, 2026-11-19 08:00-08:40, read afterwards) has 13 lines, all `veth` / `docker0` network
 messages from container starts, and no OOM-killer line. I did not check the host's memory use or other users' jobs at that time, so I cannot say whether it was
 another user's action, the container runtime, or something in the engine. `session.json` shows only the last launch (`restarts: 0`, `crashes: []`). The C=1 and C=16 runs come from the first launch (07:20:12), and the session
-was relaunched at 12:30:42 for C=64 only (startup 592 s) through `b1118_agx_retry_queue.txt` (on aws-raichu under `tmp/bench_images/`, next to the other queues). The retry finished (`DONE`, 34 ok, 0 failed, `submission_valid` true) and is the number in the tables. It completed 34 requests against 39 on the new image,
+was relaunched at 12:30:42 for C=64 only (startup 592 s) through `b1118_agx_retry_queue.txt` (on the benchmark host under `tmp/bench_images/`, next to the other queues). The retry finished (`DONE`, 34 ok, 0 failed, `submission_valid` true) and is the number in the tables. It completed 34 requests against 39 on the new image,
 so the 1.36x ratio (6.3 against 8.5 out tok/s) is a difference of a few requests, not a measured speed-up.
 ### 4.3 Caveats
 - **One run per point.** The repeat spread of RAG output tok/s in earlier runs is about 1% (`deepgemm_benchmark.md` 3.10, 11.1), but this
@@ -504,7 +504,7 @@ Section 4.1 compared a 185,278-token old server with a 162,046-token new one, so
 comparison was not clean. Here both servers admit the whole agentX corpus: BF16 KV cache (no `--kv-cache-dtype`), `--chunked-prefill-size 1024` on top of the
 section 2.4 flags (`--max-num-seqs 512 --gpu-memory-utilization 0.9 --max-model-len 262144`), the same agentX command (full mode, C=1/16/64, 900 s, seed 1110, `--use-server-token-count`).
 This chunk-1024 comparison replaces the default-args one for gemma-4 agentX. Results: `tokenspeed/tmp/bench_images_local/results/b1118g/gemma4-31b-it/<image>/agentx/c<C>/`
-(synced from aws-raichu; every number below is recomputed from `metrics.json`).
+(synced from the benchmark host; every number below is recomputed from `metrics.json`).
 
 | image | tag | commits | single-request limit (`max_input`) | GPU |
 |---|---|---|---|---|

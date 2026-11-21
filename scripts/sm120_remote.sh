@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Development helper for the SM120 port, run on the test machine (aws-raichu). GPU via DG_GPU (default 7); 6 is also free
+# Development helper for the SM120 port, run on the test machine (the benchmark host). GPU via DG_GPU (default 7); 6 is also free
 #   sm120_remote.sh build            rebuild both the DeepGEMM venv (py3.15) and the TokenSpeed-venv build (py3.12)
 #   sm120_remote.sh dg  <args...>    run python in the DeepGEMM venv (repo root on PYTHONPATH)
 #   sm120_remote.sh ts  <args...>    run python in the TokenSpeed venv with this DeepGEMM build first on PYTHONPATH
 #   sm120_remote.sh idle [secs] [max] wait until GPU 7 has been idle for `secs` seconds (it is shared)
 set -euo pipefail
-DG=/workspace/nctu6/infra/DeepGEMM
-TS_PY=/workspace/nctu6/infra/tokenspeed/.venv/bin/python
+DG=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TS_PY=$DG/../tokenspeed/.venv/bin/python
 # GPU is configurable (DG_GPU, default 7); GPU 6 is now also available for builds/tests while 7 runs benchmarks
 GPU=${DG_GPU:-7}
 export CUDA_HOME=/usr/local/cuda CUDA_VISIBLE_DEVICES=$GPU

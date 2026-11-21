@@ -6,7 +6,7 @@
 // single m16n8k32 E4M3 MMA with per-row A scales and per-column B scales, and
 // compare against a host reference that decodes the UE8M0 byte as 2^(b-127).
 //
-// Build (on aws-raichu, GPU 7):
+// Build (on the benchmark host, GPU 7):
 //   nvcc -arch=sm_120a -o /tmp/bsprobe scripts/sm120_blockscale_probe.cu
 //   CUDA_VISIBLE_DEVICES=7 /tmp/bsprobe
 //

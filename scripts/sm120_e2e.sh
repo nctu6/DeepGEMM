@@ -4,9 +4,9 @@
 #   sm120_e2e.sh base|dg <model_path> <port> <out_json>
 set -euo pipefail
 mode=$1 model=$2 port=$3 out=$4
-DG=/workspace/nctu6/infra/DeepGEMM
-TS=/workspace/nctu6/infra/tokenspeed/.venv/bin
-OVERLAY=/workspace/nctu6/infra/tmp/ts_sm120_overlay/pkg
+DG=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TS=$DG/../tokenspeed/.venv/bin
+OVERLAY=$DG/../tmp/ts_sm120_overlay/pkg
 export CUDA_VISIBLE_DEVICES=7 CUDA_HOME=/usr/local/cuda PATH=$TS:$PATH
 if [ "$mode" = dg ]; then
     export PYTHONPATH=$(ls -d $DG/build312/lib.*):$OVERLAY DG_JIT_CACHE_DIR=/tmp/dg_cache_nctu6_312

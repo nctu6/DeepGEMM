@@ -1,6 +1,6 @@
 # Serving benchmark of two TokenSpeed images on RTX PRO 6000 (SM120)
 
-Tasks 40-48 of the SM120 spec. Served on 2026-11-12 on aws-raichu, GPUs 6 and 7. This is the detailed record.
+Tasks 40-48 of the SM120 spec. Served on 2026-11-12 on the benchmark host, GPUs 6 and 7. This is the detailed record.
 The short version is in [`deepgemm_report.md`](deepgemm_report.md) section 3, and the status-log entries are in
 [`deepgemm-analysis.md`](deepgemm-analysis.md) 9.44 and 9.45.
 The merged image against the previous one on all six models, RAG and agentX (tasks 80-82): [`deepgemm_benchmark_1118.md`](deepgemm_benchmark_1118.md).
@@ -79,7 +79,7 @@ Headlines:
 
 | item | value | source |
 |---|---|---|
-| host | aws-raichu, 2x Intel Xeon Platinum 8559C (192 threads), 2 TB RAM, Ubuntu 24.04.4 LTS, kernel 7.0.0-1014-aws, Docker 29.1.3 | `lscpu`, `free`, `/etc/os-release`, `docker --version` |
+| host | benchmark host, 2x Intel Xeon Platinum 8559C (192 threads), 2 TB RAM, Ubuntu 24.04.4 LTS, kernel 7.0.0-1014-aws, Docker 29.1.3 | `lscpu`, `free`, `/etc/os-release`, `docker --version` |
 | GPUs | 8x NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120, compute capability 12.0), 97887 MiB each, PCIe only (no NVLink) | `nvidia-smi` |
 | GPUs used | 6 and 7 only: same PCIe switch (`PIX`), NUMA node 1, CPU affinity 48-95,144-191. Other users' jobs ran on GPUs 0-5 | `nvidia-smi topo -m` |
 | driver / CUDA | driver 595.99.02, CUDA 13.2 (driver API). The images ship the CUDA 13.0 runtime (`nvidia-cuda-runtime` 13.0.96, `torch 2.14.0+cu130`) | `nvidia-smi`, `pip list` in the images |
@@ -119,7 +119,7 @@ every session):
 ```bash
 docker run --rm --init -d --name bench-nctu6-g<gpus>-<model>-<image>-<variant> --gpus "device=<gpus>" --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 -p 127.0.0.1:<18061+gpu>:8000 \
-  -v /models:/models:ro -v /unieai/.cache/huggingface:/root/.cache/huggingface:ro \
+  -v /models:/models:ro -v <hf-cache>:/root/.cache/huggingface:ro \
   -e HF_HUB_OFFLINE=1 -e FLASHINFER_DISABLE_VERSION_CHECK=1 -e SMG_TOKENSPEED_SERVICER_KV_EVENTS=0 \
   nctu6/tokenspeed:<tag> \
   tokenspeed serve <model path> --served-model-name <name> --host 0.0.0.0 --port 8000 --trust-remote-code \
@@ -243,7 +243,7 @@ is free. The TP2 sessions run only on the GPU 6 worker, after every TP1 session 
 2 min. Within a session, one server serves all runs in this order: RAG C = 1, 16, 32, 64, 128, 256, 512, then
 agentX C = 1, 16, 64. The server is removed after the session.
 
-Server launches (2026-11-12, local time of aws-raichu), from `gpu_at_launch.txt` and the runs' `DONE` / `FAILED`
+Server launches (2026-11-12, local time of the benchmark host), from `gpu_at_launch.txt` and the runs' `DONE` / `FAILED`
 markers (`finished` time):
 
 | # | server launch | session (`<model>/<image>`) | GPUs | startup s | runs served, in order | last run ends |
@@ -917,7 +917,7 @@ The 128-expert subset MoE cost is a third of the full model's (section 7), so th
 
 ## 4. Failures
 
-Raw logs are on aws-raichu under `/workspace/nctu6/infra/tokenspeed/tmp/bench_images/` (paths below are
+Raw logs are on the benchmark host under `<TokenSpeed repo>/tmp/bench_images/` (paths below are
 relative to it). The local copy (`tokenspeed/tmp/bench_images_local/results/`) has the markers, `metrics.json`
 and the `SESSION_FAILED` files with the log tail, but no server logs or AIPerf artifacts.
 
@@ -1159,10 +1159,10 @@ before the workers existed.
 
 Harness: `tokenspeed/tmp/bench_images_local/` (git-ignored scratch in the TokenSpeed checkout; `README.md` there
 documents the harness, the watchdog, agentX full mode, the KV-event crash and the gemma details). The live copy
-and all raw results are on aws-raichu in `/workspace/nctu6/infra/tokenspeed/tmp/bench_images/`.
+and all raw results are on the benchmark host in `<TokenSpeed repo>/tmp/bench_images/`.
 
 ```bash
-cd /workspace/nctu6/infra/tokenspeed/tmp/bench_images           # aws-raichu
+cd <TokenSpeed repo>/tmp/bench_images           # the benchmark host
 python3 build_rag_prompts.py                                    # once: data/rag-12000-500-seed0.jsonl
 tmux new-session -d -s bench  'TMPDIR=$PWD/../bt/g6 python3 -u bench_queue.py --gpus 6 2>&1 | tee -a logs/worker-gpu6.out'
 tmux new-session -d -s bench7 'TMPDIR=$PWD/../bt/g7 python3 -u bench_queue.py --gpus 7 2>&1 | tee -a logs/worker-gpu7.out'

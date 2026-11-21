@@ -116,7 +116,7 @@ Latest run 2026-11-14 (task 65, analysis 9.58), DeepGEMM head `1a01289` (kernels
 - Real weights (task 22, analysis 9.27): V4.1 checkpoint on GPUs 6+7 with its first 128 experts. MegaMoE DP2/EP2 (`deep_gemm_sm120_mxfp4_mega_moe_apply` selected), Marlin TP2 and forced portable TP2 all have the same single-layer error against a float32 reference (layers 0 and 2). Moonlight-16B MLA answers correctly; its greedy decode matches the portable path up to near-ties, and two SM120 runs are bit-identical. The V4 checkpoint does not load (TokenSpeed has no V4 model class since upstream `0c1bc3ed3`).
 - Environment-only failures: `test_locality_domain` (MLOPart), `test_mega_moe` (NVLink), the sanitizer's `test_legacy` entry (no triton in the venv).
 
-Test machine: aws-raichu, 8x RTX PRO 6000 Blackwell Server Edition (96 GB, 188 SMs), CUDA 13.2, driver 595.99.02, PCIe only. Tests and benchmarks ran on GPUs 6 and 7.
+Test machine: an 8x RTX PRO 6000 Blackwell Server Edition (96 GB, 188 SMs), CUDA 13.2, driver 595.99.02, PCIe only. Tests and benchmarks ran on GPUs 6 and 7.
 
 ## 6. Build and use
 
@@ -127,7 +127,7 @@ TokenSpeed carries DeepGEMM as the `DeepGEMM/` submodule (`https://github.com/nc
 ./scripts/install.sh --force-deepgemm     # force the source build on any GPU (or FORCE_SM120=1)
 ```
 
-In the DeepGEMM checkout (aws-raichu, `CUDA_VISIBLE_DEVICES=7`):
+In the DeepGEMM checkout (the benchmark host, `CUDA_VISIBLE_DEVICES=7`):
 
 ```bash
 scripts/sm120_remote.sh build

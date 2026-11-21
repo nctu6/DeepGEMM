@@ -2,7 +2,7 @@
 #
 # Run with the TokenSpeed venv and this DeepGEMM build on PYTHONPATH (from a cwd outside the repo), e.g.
 #   PYTHONPATH=$DG/build312/lib.linux-x86_64-cpython-312:$DG/scripts \
-#       /workspace/nctu6/infra/tokenspeed/.venv/bin/python -m sm120_vs_tokenspeed
+#       <TokenSpeed repo>/.venv/bin/python -m sm120_vs_tokenspeed
 #
 # Every implementation is called exactly as TokenSpeed calls it: canonical FP32 scales
 # (A: [M, K / 128] row-major from the activation quantizer, B: [N / 128, K / 128] from the checkpoint),
