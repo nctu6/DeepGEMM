@@ -1,5 +1,5 @@
 # Serving benchmark: TokenSpeed against vLLM on RTX PRO 6000 (SM120), before and after tuning
-Tasks 91, 92 and 95 of the SM120 spec. Served on 2026-11-21 and 2026-11-22 on the benchmark host, GPUs 6 and 7.
+Tasks 91, 92 and 95 of the SM120 spec. Served on 2026-11-21 to 2026-11-23 on the benchmark host, GPUs 6 and 7.
 This is the detailed record. The short version is in [`deepgemm_report.md`](deepgemm_report.md) section 3, the status
 log row is in [`deepgemm-analysis.md`](deepgemm-analysis.md), and the earlier TokenSpeed-only image benchmarks are
 [`deepgemm_benchmark.md`](deepgemm_benchmark.md) and [`deepgemm_benchmark_1118.md`](deepgemm_benchmark_1118.md).
@@ -13,7 +13,7 @@ the other scratch scripts, not committed), which also checks the numbers that th
 
 ## 1. Summary
 ### 1.1 What was compared
-- **TokenSpeed:** the serve scripts of branch `perf-vs-vllm` (head `b0c94233f`, 17 commits over the integration head
+- **TokenSpeed:** the serve scripts of branch `perf-vs-vllm` (head `e2b96c162`, 23 commits over the integration head
   `d93a073df`; list in section 2.2), run with their defaults plus only the knobs that make the server flags equal to
   the vLLM ones (`--max-num-seqs`, `--gpu-memory-utilization`, `--max-model-len`).
 - **vLLM:** `vllm/vllm-openai:latest` = vLLM 0.32.0 (image `befccf0e7e40`, created 2026-10-18), one `docker run` per
@@ -49,22 +49,22 @@ RAG protocol (500 prompts, 100 at C=1, 256 output tokens, ignore EOS, seed 0). v
 |  | C=64 | 1 | 869.1 / 2735 / 62.6 | 1.07x / 0.32x / 1.09x | 1.07x / 0.30x / 1.09x | 3 | 931.1 (0.5) |
 |  | C=256 | 1 | 975.2 / 20749 / 123.8 | 1.13x / 1.49x / 0.80x | 1.12x / 1.48x / 0.81x | 3 | 1088.6 (4.0) |
 | Qwen3.6-35B-A3B BF16 (TP1) | C=1 | 2 | 155.7 / 67 / 6.2 | 1.10x / 0.91x / 0.91x | 1.09x / 0.92x / 0.91x | 1 | 170.0 (-) |
-|  | C=16 | 2 | 699.2 / 234 / 22.0 | 1.04x / 1.35x / 0.94x | 1.04x / 1.31x / 0.95x | 12 | 725.7 (0.9) |
-|  | C=64 | 2 | 1385.5 / 525 / 43.8 | 0.99x / 1.59x / 0.98x | 0.99x / 1.65x / 0.98x | 12 | 1370.4 (1.5) |
-|  | C=256 | 2 | 2208.6 / 2453 / 79.0 | 0.98x / 1.50x / 0.85x | 1.01x / 1.44x / 0.86x | 12 | 2232.3 (4.2) |
-| Qwen3.5-122B-A10B FP8 (TP2) | C=1 | 1 | 131.5 / 99 / 7.2 | 0.86x / 1.04x / 1.16x | 0.84x / 0.87x / 1.20x | 3 | 110.8 (0.2) |
-|  | C=16 | 1 | 642.5 / 458 / 23.0 | 0.90x / 1.80x / 1.04x | 0.99x / 1.42x / 0.97x | 5 | 638.7 (4.7) |
-|  | C=64 | 1 | 1186.6 / 1007 / 49.5 | 0.79x / 2.27x / 1.20x | 0.96x / 1.86x / 0.98x | 5 | 1142.6 (1.8) |
-|  | C=256 | 1 | 2070.8 / 2154 / 110.6 | 0.68x / 4.00x / 0.93x | 0.80x / 3.30x / 0.79x | 5 | 1666.0 (2.3) |
+|  | C=16 | 2 | 699.2 / 234 / 22.0 | 1.04x / 1.35x / 0.94x | 1.04x / 1.26x / 0.95x | 9 | 725.1 (0.5) |
+|  | C=64 | 2 | 1385.5 / 525 / 43.8 | 0.99x / 1.59x / 0.98x | 0.99x / 1.65x / 0.98x | 9 | 1369.4 (1.5) |
+|  | C=256 | 2 | 2208.6 / 2453 / 79.0 | 0.98x / 1.50x / 0.85x | 1.02x / 1.30x / 0.94x | 9 | 2261.9 (3.3) |
+| Qwen3.5-122B-A10B FP8 (TP2) | C=1 | 1 | 131.5 / 99 / 7.2 | 0.86x / 1.04x / 1.16x | 1.28x / 0.83x / 0.78x | 3 | 168.2 (0.1) |
+|  | C=16 | 1 | 642.5 / 458 / 23.0 | 0.90x / 1.80x / 1.04x | 1.04x / 1.27x / 0.93x | 3 | 666.1 (0.6) |
+|  | C=64 | 1 | 1186.6 / 1007 / 49.5 | 0.79x / 2.27x / 1.20x | 0.99x / 1.83x / 0.94x | 3 | 1178.9 (0.9) |
+|  | C=256 | 1 | 2070.8 / 2154 / 110.6 | 0.68x / 4.00x / 0.93x | 0.95x / 2.86x / 0.93x | 3 | 1973.0 (1.9) |
 | Qwen3.5-122B-A10B NVFP4 (TP2) | C=1 | 1 | 112.7 / 88 / 8.6 | 1.20x / 0.81x / 0.83x | 1.19x / 0.82x / 0.83x | 2 | 134.5 (0.4) |
-|  | C=16 | 1 | 767.8 / 449 / 19.0 | 1.06x / 1.28x / 0.90x | 1.07x / 1.13x / 0.91x | 3 | 818.1 (4.8) |
-|  | C=64 | 1 | 1484.4 / 944 / 39.2 | 1.01x / 1.63x / 0.93x | 1.00x / 1.72x / 0.92x | 3 | 1491.4 (1.3) |
-|  | C=256 | 1 | 2413.7 / 1617 / 95.5 | 0.97x / 3.41x / 0.89x | 0.97x / 3.29x / 0.90x | 3 | 2348.5 (2.1) |
+|  | C=16 | 1 | 767.8 / 449 / 19.0 | 1.06x / 1.28x / 0.90x | 1.07x / 1.12x / 0.91x | 4 | 819.7 (5.1) |
+|  | C=64 | 1 | 1484.4 / 944 / 39.2 | 1.01x / 1.63x / 0.93x | 1.00x / 1.75x / 0.92x | 4 | 1490.9 (1.4) |
+|  | C=256 | 1 | 2413.7 / 1617 / 95.5 | 0.97x / 3.41x / 0.89x | 0.97x / 3.31x / 0.90x | 4 | 2350.4 (4.1) |
 
 Embedding and transcription (the first pass is a warm-up and is discarded):
 | Model | unit | n vLLM | vLLM | BEFORE TS/vLLM | AFTER TS/vLLM | n AFTER | AFTER req/s (sd) |
 |---|---|---|---|---|---|---|---|
-| Qwen3-Embedding-8B (TP1), C=64 | inputs/s / p50 latency s | 1 | 61.31 / 0.996 | 0.84x / 1.11x | 0.94x / 0.89x | 2 | 57.72 (0.69) |
+| Qwen3-Embedding-8B (TP1), C=64 | inputs/s / p50 latency s | 1 | 61.31 / 0.996 | 0.84x / 1.11x | 0.99x / 0.85x | 12 | 60.60 (3.25) |
 | whisper-large-v3 (TP1), C=16 | req/s / p50 latency s | 1 | 33.35 / 0.478 | 1.66x / 0.60x | 1.66x / 0.60x | 4 | 55.39 (0.25) |
 
 MiniMax against vLLM-omni (5 requests per video point, 10 per 512 px image and 8 s music point, 5 otherwise; video is
@@ -91,17 +91,17 @@ TokenSpeed alone, cells `output tok/s / TTFT p50 ms / TPOT p50 ms`:
 | DSPARK off, MegaMoE, `MAX_NUM_SEQS=512` | 109.3 / 81 / 8.8 (n=1) | 663.7 / 530 / 21.9 (n=1) | 1568.1 / 861 / 37.0 (n=1) | 3265.2 / 2455 / 67.5 (n=1) |
 
 ### 1.3 Headlines
-- **Output tok/s after tuning is within 3 % of vLLM or better at 20 of 24 LLM points.** Below 0.98x only: Qwen3.5-122B-A10B FP8 (TP2) C=1 0.84x, Qwen3.5-122B-A10B FP8 (TP2) C=64 0.96x, Qwen3.5-122B-A10B FP8 (TP2) C=256 0.80x, Qwen3.5-122B-A10B NVFP4 (TP2) C=256 0.97x. Examples: gemma-3 1.07x at C=64, gemma-4 TP1 0.99x / 1.00x at C=64 / 256 (was 0.91x / 0.90x),
-  gemma-4 TP2 1.12x at C=256, Qwen3.6 1.01x at C=256 (was 0.98x), Qwen3.5-122B NVFP4 1.19x at C=1.
-- **Qwen3.5-122B FP8 (TP2) went from 0.90x / 0.79x / 0.68x to 0.99x / 0.96x / 0.80x** at C=16 / 64 / 256
-  with wider tiles in the Triton block-FP8 MoE kernel (section 3.1). C=256 stays at 0.80x and C=1 at
-  0.84x (sections 5.1, 5.2).
-- **Embedding 0.94x of vLLM** (was 0.84x): three changes of the server's host path and a crash fix; the rest is the forward (sections 3.2-3.4, 5.2).
+- **Output tok/s after tuning is within 3 % of vLLM or better at 22 of 24 LLM points.** Below 0.98x only: Qwen3.5-122B-A10B FP8 (TP2) C=256 0.95x, Qwen3.5-122B-A10B NVFP4 (TP2) C=256 0.97x. Examples: gemma-3 1.07x at C=64, gemma-4 TP1 0.99x / 1.00x at C=64 / 256 (was 0.91x / 0.90x),
+  gemma-4 TP2 1.12x at C=256, Qwen3.6 1.02x at C=256 (was 0.98x), Qwen3.5-122B NVFP4 1.19x at C=1.
+- **Qwen3.5-122B FP8 (TP2) went from 0.90x / 0.79x / 0.68x to 1.04x / 0.99x / 0.95x** at C=16 / 64 / 256
+  with wider tiles in the Triton block-FP8 MoE kernel (3.1), a KV-group split that doubles the request pool (3.11, C=256 0.81x -> 0.92x) and a route-parallel MoE for decode at batch 1 (3.13, C=1 0.84x -> 1.11x).
+  The block-FP8 attention and GDN projections (3.14, now the script default on SM120) add +14.9 / +4.8 / +3.3 / +3.8 % at C=1 / 16 / 64 / 256 (n 3): 1.28x / 1.04x / 0.99x / 0.95x of vLLM; the 1.2 table is the set with them (`q122-fp8-rtap-a..c`, sections 5.1, 5.2).
+- **Embedding 0.99x of vLLM** (was 0.84x): three changes of the server's host path, a crash fix and the FA4 prefill leaf for SM120 (sections 3.2-3.4, 3.12, 5.2).
   Whisper is 1.66x of vLLM in requests/s with 0.60x its p50 latency, unchanged by tuning.
 - **MiniMax-H3 went from 1.31x / 1.43x / 1.15x of vLLM-omni's mean latency (slower) to 0.96x / 0.79x / 0.89x (faster)** at 2 steps C=1 / 2 steps C=2 / default steps C=1 by
   defaulting to Ulysses degree 2 (section 3.7). Music3 is 0.83x / 0.85x of vLLM-omni's latency (faster). H3-Image runs
   on TokenSpeed (5.14 s at 512 px) and not on vLLM-omni.
-- **TTFT p50 is the weak spot on the Qwen models at C >= 16**: 1.65x vLLM (Qwen3.6, C=64), 3.30x (122B FP8, C=256) and 3.29x (122B NVFP4, C=256), while the gemma
+- **TTFT p50 is the weak spot on the Qwen models at C >= 16**: 1.65x vLLM (Qwen3.6, C=64), 2.86x (122B FP8, C=256) and 3.31x (122B NVFP4, C=256), while the gemma
   models are at 0.30x-0.91x of vLLM's TTFT at C=16 and 64. Section 5.3.
 - **V4.1 DSPARK stays the default**: 277 / 2182 output tok/s at C=1 / 64 against 111 / 1568 without it, 0.99x at C=256 (section 3.9).
 
@@ -144,7 +144,11 @@ Commits of branch `perf-vs-vllm` (all signed off, none pushed; the base is the i
 | `61685cc14`, `6c33b2f77` | opt-in FP8-activation block-FP8 MoE leaf and its docs | 3.8 |
 | `e45caa25f` | serialize embedding responses with orjson | 3.3 |
 | `2eca88e9f` | gemma-4 script: decode CUDA-graph ladder capped at 128 on one SM120 GPU | 3.5 |
-| `b0c94233f` (head) | hold pooling prompts against one round's token budget | 3.4 |
+| `b0c94233f` | hold pooling prompts against one round's token budget | 3.4 |
+| `656e3b3a0`, `af02230d8` (`ef4646b7a` docs) | Qwen3.5 attention layers split into KV groups until the GDN-state groups fill the parent | 3.11 |
+| `c5daac963` | FA4 prefill leaf for SM120 (embedding and other head-dim <= 128 prefill) | 3.12 |
+| `b650dca90` | route-parallel Triton block-FP8 MoE up to 8 tokens (decode at batch 1) | 3.13 |
+| `e2b96c162` (head) | Qwen3.5-122B script: block-FP8 attention and GDN projections on by default with online FP8 on SM120 | 3.14 |
 
 ### 2.3 vLLM server commands
 One `docker run` per model. The container name and owner label are shortened here (`bench-vllm-<model>-g<gpus>`,
@@ -241,7 +245,7 @@ succeeds and its output validates (MP4: ffprobe streams, resolution, duration; P
   per-queue locks and no GPU pins remain.
 - **Spread rule.** A difference under about 1 % of the mean (the spread of repeats on one server) is no effect. Across the AFTER sets the standard deviation of output tok/s
   is 0.00-0.93 % of the mean (TTFT is noisier and is not used for decisions).
-- **Single and repeated runs.** vLLM: one run per point, two for gemma-3 and Qwen3.6. TokenSpeed BEFORE: one run per point. TokenSpeed AFTER: 1-12 runs per point
+- **Single and repeated runs.** vLLM: one run per point, two for gemma-3 and Qwen3.6. TokenSpeed BEFORE: one run per point. TokenSpeed AFTER: 1-10 runs per point
   (the `n` column), each a fresh server. MiniMax: 5-10 requests per point, one server per engine; the AFTER H3 sets have 1-3 servers.
 
 ### 2.7 AFTER sets
@@ -250,10 +254,10 @@ succeeds and its output validates (MP4: ffprobe streams, resolution, duration; P
 | gemma-3 | `g3-rep-g7`, `g3-rep2-g7`, `g3-rep3-a`, `g3-rep3-b`, `g3-rep4-a` | no change; repeats of the BEFORE configuration |
 | gemma-4 TP1 | `g4-def-tp1-a..e` (script defaults after `2eca88e9f`) and `g4-cap128-final`, `g4-cap128-rep-tp1`, `g4-cap128-rep3`, `g4-cap128-rep4`, `g4-pg1024-cap128-g7` (same effective flags set by hand before the default existed) | prefill graphs up to 1024 tokens and decode graphs up to 128 |
 | gemma-4 TP2 | `g4-final-tp2`, `g4-rep4-tp2`, `g4-rep5-tp2`; `g4-rep9-tp2` is listed and excluded (section 5.4) | prefill graphs up to 1024 tokens |
-| Qwen3.6 | `q36-final-g7`, `q36-rep4-b-g7`, `q36-rep5-b-g7`, `q36-rep6-b-g7`, `q36-rep6-g7`..`q36-rep12-d-g7`, `q36-rep14-d-g7` (all finished after `97b632262`, script defaults) | prefill graphs up to 1024 tokens |
-| Qwen3.5-122B FP8 | `q122-fp8-moetile`, `-moetile-b`, `-mt-rep`, `-mt-rep2`, `-actbase2` (the new Triton MoE tiles, no extra flags) | `758ba1ac8` |
-| Qwen3.5-122B NVFP4 | `q122-nvfp4-rep`, `-rep2`, `-rep5` | no change |
-| embedding | `emb-budget-c64c`, `emb-budget-c64d` (code of `6a6c1db8f` + `e45caa25f` + `b0c94233f` through the overlay `embsrc_c`) | the three embedding commits |
+| Qwen3.6 | `q36-kv-b-14656`, `q36-kv-b-4951`, `q36-kvb-rep1-g7`..`q36-kvb-rep6-g7`, `q36-kvb-rep8-g7` (after `656e3b3a0`); C=1 from `q36-final-g7` (the split does not change it). The earlier set `q36-final-g7`, `q36-rep4-b-g7`.. (after `97b632262` only) is the reference of 3.6 and 3.11 | prefill graphs up to 1024 tokens, KV-group split |
+| Qwen3.5-122B FP8 | `q122-fp8-rtap-a`, `-rtap-b`, `-rtap-c` (tiles + KV-group split + route-parallel MoE + block-FP8 projections: the script default of `e2b96c162`; the same without the projections is `q122-fp8-rt-a..c`, section 3.14). The earlier set `q122-fp8-moetile`, `-moetile-b`, `-mt-rep`, `-mt-rep2`, `-actbase2` (new tiles only) is the reference of 3.1 | `758ba1ac8`, `656e3b3a0`, `b650dca90`, `e2b96c162` |
+| Qwen3.5-122B NVFP4 | `q122-nvfp4-rep`, `-rep2`, `-rep5` (before the split), `q122-nvfp4-kv-b` (after) | `656e3b3a0` (no effect) |
+| embedding | `emb-fa4fix-1`..`-10` (without `-4`, which died at startup) and `emb-kern2-1`..`-3` (the three embedding commits + `c5daac963`; the earlier `emb-budget-c64c`, `-c64d` have the three commits only) | `c5daac963` |
 | whisper | `whisper-rep-g7`, `whisper-rep2-g7`, `whisper-rep3-g7`, `whisper-rep4-g7` | no change |
 | MiniMax-H3 | `mm-h3-default-usp`, `mm-h3-nooffload3` (script default after `e8387a7bc`), `mm-h3-usp2b` (same layout, `ULYSSES_DEGREE=2` set by hand) | `e8387a7bc` |
 
@@ -269,7 +273,7 @@ is not slower by kind, only by tile choice. The kernel used 32 weight columns pe
 tile up to 16 routed rows per expert and 32 rows above, 1.08x at 1 token, 1.38x at 256, 1.65x at 4096 and 1.61x at 8192: 0.107 -> 0.099 ms (T=1), 1.186 -> 0.861 ms (T=256), 3.056 ->
 1.849 ms (T=4096), 5.491 -> 3.401 ms (T=8192). Served (TP2, RAG, C=16 / 64 / 256): before `q122-fp8-base3` 589.0/932.6/1406.2 (TTFT p50 725/2109/8587 ms),
 after `q122-fp8-moetile` 636.2/1140.8/1664.1 (608/1778/7143 ms); mean of the five AFTER runs 638.7/1142.6/1666.0. Against vLLM
-(642.5 / 1186.6 / 2070.8) the ratio went from 0.90x / 0.79x / 0.68x (first run) to 0.99x / 0.96x / 0.80x.
+(642.5 / 1186.6 / 2070.8) the ratio went from 0.90x / 0.79x / 0.68x (first run) to 1.04x / 0.99x / 0.95x.
 The same kernel serves Qwen3.6 FP8 on one GPU (`QUANTIZATION=fp8 MOE_BACKEND=triton`, not the Qwen3.6 default): old tiles `q36-fp8-base-g7` 1018.3/1670.9/2966.9, new tiles
 (three runs) 1097.2/2033.5/3491.4. The compile-guard test follows the new row-tile rule.
 
@@ -389,6 +393,61 @@ Scripts run with no per-GPU arch env. `aae4a4639` widens the arch test from exac
 | `results2/v41-probe-default2` | DONE | True | mode=chat, chat_paris=True, compl_paris=True, primes_ok=False |
 The first-run failures of gemma-4 (TP1 256K and TP2) were a probe bug, not a server bug: a raw completion without `<bos>` answers junk on gemma-4 by design (task 87, same on vLLM), so the probe now checks an explicit `<bos>` prompt. The H3-Image probe failed on `json.dump` of a numpy bool; the image itself was fine. `qwen3.5-122b-a10b-fp8-moeauto` is an expected crash (the TRT-LLM FP8 MoE has no SM120 leaf, section 2.4). The V4.1 MegaMoE session failed the strict completion and primes expectations on its first run and passed after the expectations were set for it (`results2`).
 
+### 3.11 Qwen3.5/3.6: KV-group split for the GDN-state parents (`656e3b3a0`, `af02230d8`; design note in `docs/design/cache-concepts.md`, `ef4646b7a`)
+Cause of the 122B FP8 C=256 gap, found by reading the `Cache profile` line (old text of 5.1): the parent is 48 MiB because the 12 attention layers' K and V sit in one KV group (24 segments),
+one 2 MiB SSM state goes into each segment, so the 36 GDN layers fill two state groups of 18 states and 6 of 24 segments of every state parent stay empty (36.75 of 48 MiB used). A request holds one parent per state group and
+the pool was full at C=256 (202 running, 54 queued, `#pages(active/cached/total)` 432/435). `QwenGDNRecipe._num_kv_groups` now deals the attention layers round-robin into `full_attention_<i>` groups (as Nemotron-H does)
+and takes the group count that minimizes the state-parent bytes per request (ties: fewer groups; Qwen4-Exp keeps one group because its QSA/PLE planes name `full_attention`; a draft layer with other K/V bytes keeps one group).
+Qwen3.5-122B at TP2 now has two KV groups, three state groups and a 24.4 MiB parent: 856 parents with FP8 weights (was 435), 73.5 MiB of state parents per request instead of 96; Qwen3.6 TP1 396 -> 775 parents; NVFP4 844 -> 1660
+(the numbers are the `Cache profile` log lines of the sessions). Tests go through the real recipe and `prepare_cache_setup` (`test_qwen_splits_attention_layers_until_state_groups_fill_the_parent`,
+`test_qwen_kv_group_split_holds_more_requests_in_one_budget`, `test_qwen_conv_windows_fill_a_free_state_segment`). Served, same overlay except the change, out tok/s at C=16 / 64 / 256:
+| model | before (A) | after (B) | change |
+|---|---|---|---|
+| Qwen3.5-122B FP8 TP2 | `q122-fp8-kv-a` 642.4/1143.9/1667.7 | `q122-fp8-kv-b` 642.3/1141.4/1899.1 | -0.0 / -0.2 / +13.9 % |
+| Qwen3.6 TP1 (mean, n 2 / 9) | 725.9/1369.5/2234.5 | 725.1/1369.4/2261.9 (C=256 sd 3.3) | -0.1 / -0.0 / +1.2 % |
+| Qwen3.5-122B NVFP4 TP2 | 818.1/1491.4/2348.5 (n 3) | `q122-nvfp4-kv-b` 824.6/1489.6/2356.0 | +0.8 / -0.1 / +0.3 % |
+The 122B FP8 ratio at C=256 went from 0.805x to 0.917x. NVFP4 does not change: it was not pool-bound (C=256 ran 256 requests on 553 of its 844 parents), so its 0.97x is
+not the pool (3.15). An accuracy probe (`acc_c64`, 128 arithmetic items) gave 0.961 in both A and B with 121 of 128 and 53 of 64 continuations identical (two runs of one baseline on Qwen3.6 agree on 115 of 128 and 47 of 64).
+
+### 3.12 FA4 prefill leaf for SM120 (`c5daac963`)
+Qwen3-Embedding-8B is GPU-bound, and the profile (torch profiler through the offline engine, 10.13 of 10.32 s busy) puts 80.5 % in dense BF16 GEMMs, 10.4 % in the portable Triton prefill attention (1831 us per call), 4.1 % in SiLU-mul and 3.4 % in the fused add-RMSNorm.
+FA4's SM80-class CuTe DSL kernel (`flash_attn.cute`, which fits the 99 KB of SM120 shared memory for head dim up to 128) runs the attention 3.2-3.4x faster in a microbench (16 x 811 tokens 1.296 -> 0.410 ms; 1 x 8192 tokens 6.764 -> 1.983 ms; at most one BF16 ulp apart; head dim 256 does not compile).
+`fa4_mha_prefill_sm120` (registry leaf, short-prefill variant warmed in `kernel_warmup`) cut attention to 3.0 % of the profile (488 us per call).
+**A crash on the way.** The first server runs died after 31-32 s with `CUDA error: an illegal memory access` in two of three runs while every offline run was clean. Cause: FA4's varlen kernel launches surplus grid tiles after the last sequence
+(the grid is `(4 * total_q + num_batch * 127) // 128` blocks) and reads `cu_seqlens[num_batch + 1]` for them, one int32 past the end of the `bs + 1` tensor the engine passes. The neighbouring bytes became that tile's sequence length, or the read hit unmapped memory when
+the tensor ended a mapped segment, which is why it needed a server with many small tensors and 90 % of memory in use. Found by logging every `cu_seqlens` and stride set of a crashing server, replaying it offline, and placing each input flush against an unmapped page with the driver VMM API.
+The leaf now passes `torch.cat((cu, cu[-1:]))[:-1]`, so surplus tiles have length 0 (`test_fa4_prefill_does_not_read_past_cu_seqlens` fails with `CUDA_ERROR_ILLEGAL_ADDRESS` without the copy). Served, C=64, req/s (vLLM 61.31):
+leaf `emb-fa4fix-1..10` 60.26 (n 9, no crash; `emb-fa4fix-4` died at startup because another user's container held the GPU), with the three later `emb-kern2-*` runs 60.60 (sd 3.25, n 12; one run, `emb-fa4fix-3`, ran at 50.39 with a 7 s stall while a foreign container started on the same GPU) against the Triton leaf `emb-fa4base-*` 57.94 (sd 0.63, n 5):
++4.6 % (0.988x of vLLM, was 0.945x). Gemma-3 TP1 (head dim 256 stays on the Triton leaf) is unchanged (698.3/698.5 against 697.9/696.9).
+
+### 3.13 Route-parallel Triton block-FP8 MoE for up to 8 tokens (`b650dca90`)
+Qwen3.5-122B FP8 at C=1 ran 110.5 tok/s against vLLM's 131.5. The torch profiler on the offline engine (48 decode tokens, TPOT 9.0 ms, GPU 10.2 ms per step inflated by the profiler) put 40 % in the Triton MoE `_stage1_kernel` (2.45 ms) and
+`_stage2_kernel` (1.56 ms): 51 + 33 us per layer for 25 + 12 MB of expert weights that read in 14 + 7 us. The same profile of vLLM (profiler config over `/start_profile`): `fused_moe_kernel` 2 x 23.6 us per layer = 2.3 ms; the rest is close (cutlass FP8 GEMMs 2.6 ms against TokenSpeed's bf16 skinny GEMMs 2.57 ms
+plus DeepGEMM 0.9 ms; all-reduce 0.78 against 0.69 ms; LM head 0.72 against 0.53 ms). The gap is the grouped kernel: at one token a stage has `min(SMs, routes * columns / tile)` = 32 persistent programs, each scanning all 256 expert counts, plus a routing pass and a zeroed route buffer.
+`_route_parallel_fp8_moe` runs one program per (route, column tile) up to 64 routed rows (8 decode tokens at top-8), no routing pass, bit-identical output. Per layer (CUDA-graph timed): 75.3 -> 14.9 us at 1 token (5.1x), 78.9 -> 19.3 at 2, 91.4 -> 49.9 at 4, 202.6 -> 187.2 at 8; from 16 tokens the grouped kernel stays.
+Test `test_triton_fp8_route_parallel_matches_grouped_bitwise` (1, 2 and 8 tokens, silu and clamped swiglu, unrouted ids -1 and E). Served (out tok/s C=1 / 16 / 64 / 256): 146.4/635.5/1141.3/1900.5 (`q122-fp8-rt-a..c`, n 3) against 110.5 at C=1 before (`q122-fp8-base-c1`, `q122-fp8-kvb-c1`) and 642.3/1141.4/1899.1 (C=16 / 64 / 256, `q122-fp8-kv-b`):
+C=1 +32.4 % (1.11x of vLLM, was 0.84x); C=16 / 64 / 256 are inside the spread. The batch-1 `nsys start` of the `ts serve` engine stalled it (`q122-fp8-c1-nsys`), so the profile came from the offline engine.
+
+### 3.14 Block-FP8 attention and GDN projections: script default on SM120 for online FP8 (`e2b96c162`)
+`--enable-fp8-attn-proj` (existing option) quantizes the QKV/O and GDN QKVZ/output projections of the Qwen3.5 target model to block-FP8 at load; it had never been measured. Decision rule: default on only if accuracy on the 400-item set is inside the run-to-run spread, and the throughput gain is above about 1 %.
+Throughput (TP2, same overlay, out tok/s at C=1 / 16 / 64 / 256): with 168.2/666.1/1178.9/1973.0 (`q122-fp8-rtap-a`, `q122-fp8-rtap-b`, `q122-fp8-rtap-c`, n 3), without 146.4/635.5/1141.3/1900.5 (`q122-fp8-rt-a..c`):
++14.9 / +4.8 / +3.3 / +3.8 %, all above the 0.00-0.93 % spread.
+Accuracy (`accbig_client.py`, 400 eight-shot word problems, greedy, 2 repeats per server): without `q122-fp8-accbig-base` 0.9375 / 0.9375, with `q122-fp8-accbig-ap` 0.9350 / 0.9375: a difference of one item in one repeat.
+The two repeats of one server give the same answer text in 399 (without) and 399 (with) of 400 items; with against without differ in 6 and 6 items (both repeats), so the quantized projections change about 1.5 % of the answer texts and not the score.
+The small `acc_c64` probe (128 arithmetic items) gave 0.9375 with the option against 0.961 for the earlier base (3 items of 128, inside its standard error of about 2 points).
+Shipped as the default in `scripts/qwen3.5-122b-a10b.sh` on SM120 when `QUANTIZATION=fp8` (`ENABLE_FP8_ATTN_PROJ=0` turns it off; the NVFP4 checkpoint and sm90 are unchanged; `test_serve_script_defaults.py`). It is not an engine default.
+
+
+### 3.15 Qwen3.5-122B NVFP4 C=256, 0.97x
+NVFP4 TP2 at C=256 is 0.974x of vLLM in output tok/s (2350.4 against 2413.7), TTFT p50 3.31x (5345 against 1617 ms).
+TokenSpeed profile at C=256 (`q122-prof-nvfp4-c256b`, torch profiler on the engine, 61 decode steps, rank 0, 4279.6 ms of kernel time over a 4147.3 ms span): GDN decode kernel 36.2 % (706 us per call, 2196 calls), the CUTLASS grouped FP4 MoE GEMMs 23.1 % + 10.9 % (338 + 159 us per call),
+fused all-reduce 7.6 % (55 us per call), NCCL all-gather 3.4 %, BF16 GEMMs about 8 %. The GDN kernel reads and writes one 2 MiB float32 state per request and layer and runs at about 85 % of the float32 state-traffic floor, so the decode kernels have little slack; vLLM keeps the Qwen3.5 SSM state in float32 as well (section 4), so both engines move the same bytes.
+**vLLM kernel profile: not obtained.** `vllmprof-nvfp4-c256` (torch profiler with stacks, 4 s window) wrote 2.4 M CPU-side events and no GPU kernel record (and stretched the second round to 254.6 s from about 50 s); `vllmprof-nvfp4-c256b` (no stacks, 3 s window) wrote 58 events. The batch-1 profile of the same image worked (3.13),
+so the kernel mix of the two engines at C=256 is not compared and **the cause is not isolated**. What the numbers allow: TokenSpeed's kernels are near their floors and the pool is not the limit (3.11), while TTFT p50 is 3.31x vLLM's. vLLM mixes prefill chunks into its decode steps; TokenSpeed's Qwen default is `--enable-mixed-batch` off (separate prefill and decode steps), which lost on the FP8 model (4: `q122-fp8-mt-mixed`, TPOT 142.8 ms, TTFT p50 25 s at C=256).
+A served A/B on NVFP4 (`q122-nvfp4-kvb-mixed`, `--enable-mixed-batch`): C=64 / 256 1131.6 / 1069.0 against 1490.9 / 2350.4 (TTFT p50 at C=256 24745 against 5345 ms).
+Mixed batches lose on NVFP4 as well, so the default stays. No code or script default changed for this point. A next step needs a profile window that covers prefill and decode steps of both engines (for vLLM, `max_iterations` of the profiler config, not a timed `/stop_profile`).
+
+
 ## 4. What was tried and not shipped
 Reference sets for the percentages in the text: gemma-4 TP1 before 341.9 / 342.4 (C=64 / 256), 1024 prefill graphs 366.5 / 367.1, shipped 375.3 / 377.2;
 Qwen3.6 before 1369.5 / 2132.3, shipped 1370.4 / 2232.3; Qwen3.5-122B FP8 old tiles `q122-fp8-base3` 932.6 / 1406.2, new tiles (`758ba1ac8`) 1142.6 / 1666.0.
@@ -418,32 +477,30 @@ Every session is in section 6.10 with its flags. A change counts only if it is o
 | engine reserve fix for decode graphs (gemma-4) | see 3.5 | | not made |
 
 ## 5. Remaining gaps and caveats
-### 5.1 Qwen3.5-122B FP8, C=256: 0.80x
-TokenSpeed 1666.0 (sd 2.3, n 5) against vLLM 2070.8; TTFT p50 7106 ms against 2154 ms (3.30x). No scheduler or runtime knob moves it (section 4). The causes, in the order of their size:
-1. **GDN-state cache layout.** The server logs `Cache profile: parent_bytes=50331648 ... parents=435 ... groups={'full_attention': 64, 'linear_attention_0': 1, 'linear_attention_1': 1}`
-   (`q122-fp8-mt-rep2`). Each running request holds one KV parent and two GDN-state parents of 48 MiB; the pool is full at C=256, so TokenSpeed runs 202 requests with 54 queued (`#pages(active/cached/total): 433/2/435`) where vLLM's log shows 234-246 running (KV 92-97 %). The compact Host block, the real payload, is 38535168 B (36.75 MiB): 49 KV blocks of 786432 B. `QwenGDNRecipe` (`recipes/qwen35.py`) maps one 2 MiB SSM state to each of
-   the KV group's 24 K/V segments (12 attention layers), so the 36 GDN layers become 2 state groups of 18 states, and each state block leaves about 6 of 24 segments empty: 23.4 % of every state parent is
-   padding (budget 25 %). A layout where a parent matches the 36.75 MiB payload would give about 568 parents instead of 435 (+30 %). Evidence on the size of the effect: bf16 states (872 parents) +28.6 % at C=256,
-   `GPU_MEMORY_UTILIZATION=0.94` (515 parents) +3.8 %. The segment layout is the recipe's documented design, so it is left to the core team.
-2. **All-reduce over PCIe in the prefill step.** The prefill-heavy nsys window (`q122-fp8-mt-nsys`, both ranks, 6 s) spends 27.3 % in NCCL `AllReduce_Sum_bf16_RING_LL` (1940 calls at 1.76 ms each, about 28 GB/s). A 2-rank
+### 5.1 Qwen3.5-122B FP8, C=256: 0.95x (0.92x without the block-FP8 projections of 3.14)
+TokenSpeed 1973.0 (sd 1.9, n 3) against vLLM 2070.8; TTFT p50 6171 ms against 2154 ms (2.86x). No scheduler or runtime knob moves it (section 4). The causes, in the order of what was found:
+1. **GDN-state cache layout: fixed** (3.11). The pool held 435 parents and ran 202 requests with 54 queued; it now holds 856 and the C=256 ratio went from 0.81x to 0.92x.
+2. **All-reduce over PCIe in the prefill step (open).** The prefill-heavy nsys window (`q122-fp8-mt-nsys`, both ranks, 6 s) spends 27.3 % in NCCL `AllReduce_Sum_bf16_RING_LL` (1940 calls at 1.76 ms each, about 28 GB/s). A 2-rank
    all-reduce moves S bytes each way, so the floor is about S / 48.8 GB/s, and NCCL reaches about 60 % of it; protocol, channel, buffer and P2P-level settings do not change that, and the workspace all-reduce saves at most 0.071 ms of 1.744 ms per call (50 MB).
-   The way down is fewer bytes or overlap of the all-reduce with the next GEMM (a two-micro-batch overlap in the prefill step), a design change left to the core team.
-3. **MoE GEMM share.** Triton MoE `_stage1/_stage2` is 18.1 % + 12.6 % of that prefill window and 57.9 % of the decode window; the BF16 cutlass GEMMs 7.0 % + 3.4 %. The FP8-activation leaf is +1-3.3 % (3.8). vLLM's log shows prompt throughput of up to 19240 tok/s in 10 s intervals on this workload; TokenSpeed's batch log has no input-rate figure, so the prefill rate is not compared directly.
-4. Smaller items in the same window: `_transfer_cache_blocks_kernel` 3.7 % (retraction copies while the pool is full), zero-fill of the MoE route buffer 1.8 %, fused one-shot all-reduce 5.1 % in decode, GDN decode 22.5 %.
+   `ar-overlap-1` (`ar_overlap_bench.py`, an all-reduce on a second stream beside an independent GEMM of the same token count, both GPUs) measures what an overlap with the next GEMM could hide: all-reduce 1.72 ms and GEMM 4.66 ms alone, 4.57 ms together at 8192 tokens
+   (overlap efficiency 1.05; 0.96 / 0.96 / 0.90 at 2048 / 4096 / 16384 tokens), so the all-reduce hides almost completely behind a GEMM of the same step. Using that needs two micro-batches per prefill step, so that one micro-batch's all-reduce overlaps the other's GEMM:
+   a change of the scheduler, the model forward and the cache plan together (one execution path, no second mode). The upper bound is the 27.3 % all-reduce share of the prefill window, and a C=256 run spends only part of its time in prefill windows (the share is not measured), so the gain on the table's points is a few percent at most. Not prototyped; it is left to the core team.
+3. **MoE GEMM share.** Triton MoE `_stage1/_stage2` is 18.1 % + 12.6 % of that prefill window and 57.9 % of the decode window (before 3.1); the BF16 cutlass GEMMs 7.0 % + 3.4 %. The FP8-activation leaf is +1.2-3.5 % (3.8; `q122-fp8-kv-act-b` 649.8/1164.2/1964.8 on the new cache layout) and stays opt-in. vLLM's log shows prompt throughput of up to 19240 tok/s in 10 s intervals on this workload; TokenSpeed's batch log has no input-rate figure, so the prefill rate is not compared directly.
+   A whole block-FP8 MoE on DeepGEMM's `m_grouped_fp8_gemm_nt_contiguous` (device-side expert layout, no host sync; `moe_dg_proto.py`) was slower than the Triton FP8-activation leaf at every size: 1.508 / 1.846 / 2.332 / 3.396 / 5.777 ms at 1024 / 2048 / 4096 / 8192 / 16384 tokens against 0.990 / 1.129 / 1.528 / 2.625 / 4.888 ms (0.61-0.85x), the same 4.39 % error. The two GEMMs alone are 1.5 ms at 8192 tokens; quantize, scatter, SiLU, gather and the worst-case row padding (E x 127 rows) cost the rest. A win needs a fused scatter/quantize and a tight row count; not done.
+4. Smaller items in the same window: `_transfer_cache_blocks_kernel` 3.7 % (retraction copies while the pool is full; less with 856 parents), zero-fill of the MoE route buffer 1.8 %, fused one-shot all-reduce 5.1 % in decode, GDN decode 22.5 %.
 The prefix cache hit is 0 in both engines on this workload, so it is not a factor.
 
 ### 5.2 Other model-level gaps
-- **Qwen3.5-122B FP8, C=1: 0.84x** (110.8 against 131.5 tok/s, TPOT 8.71 ms against 7.24). The MoE tile change moved the 1-token kernel by only 0.107 -> 0.099 ms per layer,
-  so it is not the kernel. Not profiled at C=1; open. (NVFP4 at C=1 is 1.19x faster than vLLM, so the gap is specific to the FP8 path.)
-- **Embedding, 0.94x.** TokenSpeed 57.7 req/s (2 runs; 58.2, 0.95x, without the token budget, n 4) against 61.3; p99 latency 2.80 s against 2.35 s while p50 is
-  0.885 s against 0.996 s. After the orjson change the host side is 391 active samples against 1050, and the request formats give the same throughput, so
-  what is left is the forward of the 8B model at 392-token prompts. It is not profiled: `nsys launch` hangs the server at `nsys stop`, `nsys profile` of an offline engine bench found no kernel data, and that bench died on the partial-prefill error before `b0c94233f`.
+- **Qwen3.5-122B FP8, C=1: 1.28x** (168.2 against 131.5 tok/s, TPOT 5.63 ms against 7.24). The tile change of 3.1 moved the 1-token kernel by only 0.107 -> 0.099 ms per layer; the grouped kernel's launch shape was the cause and the route-parallel kernel of 3.13 fixed it (C=1 was 110.5 tok/s, 0.84x).
+  With the block-FP8 projections of 3.14 C=1 is 168.2 tok/s, 1.28x. (NVFP4 at C=1 is 1.19x of vLLM.)
+- **Embedding, 0.99x.** TokenSpeed 60.6 req/s (12 runs; 58.2, 0.95x, with the orjson change only, n 4) against 61.3; p99 latency 3.23 s against 2.35 s while p50 is
+  0.844 s against 0.996 s. After the orjson change the host side is 391 active samples against 1050, and the request formats give the same throughput. The torch profiler on the offline engine then showed the forward (3.12): the FA4 leaf took the attention from 10.4 % to 3.0 % of GPU time, and the AFTER set is 0.988x (mean of 12 runs including one stalled by a foreign container; sd 3.25 req/s, so the ratio is a tie). What is left is the 80.5 % of dense BF16 GEMMs in cuBLAS.
 - **gemma-4 TP1 KV capacity.** 2371 parents (23.16 GiB) against vLLM's 23.39 GiB; both are KV-bound. The remaining 1.40 GB graph reserve is the sampler tail and an unexplained half (3.5).
 - **gemma-4 TP1 C=256 TPOT** is 0.68x because TokenSpeed's TTFT at C=256 is 1.07x (queueing in a KV-bound server), not because decode is faster. gemma-4 TP2 TTFT at C=256 is 1.48x.
 
 ### 5.3 Qwen TTFT at C >= 16
-Qwen3.6 TTFT p50 is 1.31x / 1.65x / 1.44x of vLLM at C=16 / 64 / 256 (867 against 525 ms at C=64), the 122B NVFP4
-1.13x / 1.72x / 3.29x, the 122B FP8 1.42x / 1.86x / 3.30x. It is not the chunk size, the GDN kernel, mixed batches or any other knob in section 4. Only short-prefill-first changes the
+Qwen3.6 TTFT p50 is 1.26x / 1.65x / 1.30x of vLLM at C=16 / 64 / 256 (867 against 525 ms at C=64), the 122B NVFP4
+1.12x / 1.75x / 3.31x, the 122B FP8 1.27x / 1.83x / 2.86x. It is not the chunk size, the GDN kernel, mixed batches or any other knob in section 4. Only short-prefill-first changes the
 p50 (-39 % on the 122B FP8 and -53 % on Qwen3.6 at C=256), by reordering. The pool size of 5.1 is a known contributor on the 122B; a split of TTFT into queueing and prefill time is not measured.
 
 ### 5.4 Failures and what vLLM cannot serve
@@ -462,7 +519,7 @@ p50 (-39 % on the 122B FP8 and -53 % on Qwen3.6 at C=256), by reordering. The po
 - **vLLM is mostly one run per point.** gemma-3 and Qwen3.6 repeats agree within 0.3 %; no other vLLM point has a repeat, so a ratio within about 1-2 % of 1.00x is a tie.
 
 ## 6. Per-run detail
-Cells are `output tok/s / TTFT p50 ms / TPOT p50 ms`; `-` is a point that was not run in that session. Times are the finish time of the last point (UTC, 2026-11-21/22).
+Cells are `output tok/s / TTFT p50 ms / TPOT p50 ms`; `-` is a point that was not run in that session. Times are the finish time of the last point (UTC, 2026-11-21/23).
 ### 6.1 gemma-3-27b-it (TP1)
 | engine | session | GPU | finished (UTC) | C=1 | C=16 | C=64 | C=256 |
 |---|---|---|---|---|---|---|---|
@@ -507,29 +564,24 @@ Cells are `output tok/s / TTFT p50 ms / TPOT p50 ms`; `-` is a point that was no
 | vLLM 0.32.0 | `qwen3.6-35b-a3b` | 6 | 11-21 14:06 | 155.7 / 67 / 6.2 | 699.2 / 236 / 22.0 | 1385.8 / 530 / 43.7 | 2205.3 / 2471 / 79.1 |
 | vLLM 0.32.0 | `qwen3.6-35b-a3b-r2` | 6 | 11-21 14:06 | 155.6 / 68 / 6.2 | 699.2 / 232 / 22.0 | 1385.2 / 519 / 43.9 | 2211.8 / 2435 / 79.0 |
 | TokenSpeed before | `qwen3.6-35b-a3b` | 6 | 11-21 16:09 | 170.8 / 61 / 5.6 | 726.2 / 315 / 20.7 | 1370.3 / 836 / 43.1 | 2154.4 / 3679 / 67.0 |
-| TokenSpeed after | `q36-final-g7` | 7 | 11-22 05:04 | 170.0 / 62 / 5.6 | 726.1 / 311 / 20.7 | 1371.4 / 877 / 42.8 | 2232.7 / 3551 / 67.9 |
-| TokenSpeed after | `q36-rep4-b-g7` | 6 | 11-22 13:11 | - | 724.8 / 312 / 20.8 | 1370.3 / 812 / 43.2 | 2233.1 / 3490 / 68.3 |
-| TokenSpeed after | `q36-rep5-b-g7` | 6 | 11-22 13:19 | - | 725.9 / 320 / 20.7 | 1368.3 / 950 / 42.7 | 2234.6 / 3525 / 67.5 |
-| TokenSpeed after | `q36-rep6-b-g7` | 7 | 11-22 14:56 | - | 725.6 / 287 / 20.9 | 1371.3 / 840 / 42.8 | 2232.4 / 3566 / 68.2 |
-| TokenSpeed after | `q36-rep6-g7` | 6 | 11-22 07:23 | - | 724.7 / 317 / 20.8 | 1370.9 / 884 / 42.8 | 2234.0 / 3508 / 68.1 |
-| TokenSpeed after | `q36-rep7-g7` | 7 | 11-22 12:55 | - | 725.5 / 289 / 20.8 | 1373.1 / 826 / 43.1 | 2221.0 / 3527 / 68.7 |
-| TokenSpeed after | `q36-rep8-g7` | 6 | 11-22 15:49 | - | 728.1 / 350 / 20.5 | 1370.8 / 841 / 43.0 | 2230.9 / 3565 / 68.0 |
-| TokenSpeed after | `q36-rep9-c-g7` | 7 | 11-22 16:03 | - | 726.3 / 286 / 20.8 | 1371.4 / 866 / 42.7 | 2239.3 / 3452 / 67.7 |
-| TokenSpeed after | `q36-rep10-c-g7` | 7 | 11-22 16:35 | - | 726.0 / 287 / 20.8 | 1370.4 / 949 / 42.6 | 2233.8 / 3482 / 68.2 |
-| TokenSpeed after | `q36-rep11-c-g7` | 6 | 11-22 16:37 | - | 725.4 / 288 / 20.9 | 1367.9 / 779 / 43.4 | 2230.3 / 3602 / 67.7 |
-| TokenSpeed after | `q36-rep12-d-g7` | 7 | 11-22 17:48 | - | 725.5 / 312 / 20.8 | 1369.0 / 949 / 42.6 | 2232.6 / 3500 / 67.9 |
-| TokenSpeed after | `q36-rep14-d-g7` | 7 | 11-22 18:01 | - | 724.9 / 312 / 20.8 | 1369.8 / 837 / 43.0 | 2232.7 / 3610 / 67.4 |
+| TokenSpeed after | `q36-kv-b-14656` | 7 | 11-22 23:35 | - | 725.4 / 288 / 20.9 | 1370.3 / 869 / 42.7 | 2258.2 / 3312 / 73.8 |
+| TokenSpeed after | `q36-kv-b-4951` | 7 | 11-22 23:43 | - | 725.3 / 311 / 20.7 | 1368.0 / 850 / 42.9 | 2260.4 / 3182 / 74.2 |
+| TokenSpeed after | `q36-kvb-rep1-g7` | 7 | 11-23 01:18 | - | 725.5 / 287 / 20.8 | 1371.3 / 892 / 42.8 | 2266.7 / 3159 / 73.8 |
+| TokenSpeed after | `q36-kvb-rep2-g7` | 6 | 11-23 01:20 | - | 725.6 / 287 / 20.9 | 1371.7 / 853 / 42.8 | 2259.3 / 3198 / 74.1 |
+| TokenSpeed after | `q36-kvb-rep3-g7` | 6 | 11-23 01:29 | - | 725.7 / 288 / 20.8 | 1368.2 / 805 / 43.3 | 2259.8 / 3237 / 74.0 |
+| TokenSpeed after | `q36-kvb-rep4-g7` | 7 | 11-23 01:30 | - | 724.9 / 311 / 20.8 | 1367.8 / 884 / 43.0 | 2261.9 / 3162 / 74.3 |
+| TokenSpeed after | `q36-kvb-rep5-g7` | 7 | 11-23 01:52 | - | 724.4 / 313 / 20.8 | 1369.6 / 875 / 42.9 | 2262.6 / 3188 / 74.0 |
+| TokenSpeed after | `q36-kvb-rep6-g7` | 6 | 11-23 01:53 | - | 724.2 / 287 / 20.8 | 1369.7 / 899 / 42.7 | 2260.2 / 3190 / 73.5 |
+| TokenSpeed after | `q36-kvb-rep8-g7` | 7 | 11-23 02:28 | - | 725.0 / 289 / 20.8 | 1367.7 / 875 / 43.1 | 2267.8 / 3180 / 73.7 |
 
 ### 6.5 Qwen3.5-122B-A10B FP8 (TP2)
 | engine | session | GPU | finished (UTC) | C=1 | C=16 | C=64 | C=256 |
 |---|---|---|---|---|---|---|---|
 | vLLM 0.32.0 | `qwen3.5-122b-a10b-fp8` | 6,7 | 11-21 14:23 | 131.5 / 99 / 7.2 | 642.5 / 458 / 23.0 | 1186.6 / 1007 / 49.5 | 2070.8 / 2154 / 110.6 |
 | TokenSpeed before | `qwen3.5-122b-a10b-fp8` | 6,7 | 11-21 16:50 | 113.5 / 103 / 8.4 | 580.6 / 826 / 24.0 | 933.0 / 2281 / 59.2 | 1404.0 / 8620 / 102.4 |
-| TokenSpeed after | `q122-fp8-moetile` | 6,7 | 11-22 05:45 | 110.8 / 87 / 8.7 | 636.2 / 608 / 22.4 | 1140.8 / 1778 / 48.8 | 1664.1 / 7143 / 87.5 |
-| TokenSpeed after | `q122-fp8-moetile-b` | 6,7 | 11-22 05:55 | - | 643.9 / 607 / 22.4 | 1140.5 / 1865 / 48.5 | 1669.1 / 7020 / 87.6 |
-| TokenSpeed after | `q122-fp8-mt-rep` | 6,7 | 11-22 12:35 | 110.9 / 86 / 8.7 | 634.3 / 750 / 22.0 | 1143.4 / 1805 / 48.5 | 1665.8 / 7094 / 87.0 |
-| TokenSpeed after | `q122-fp8-mt-rep2` | 6,7 | 11-22 16:27 | 110.5 / 86 / 8.7 | 635.7 / 678 / 22.3 | 1144.3 / 1889 / 48.1 | 1667.4 / 7244 / 86.9 |
-| TokenSpeed after | `q122-fp8-actbase2` | 6,7 | 11-22 09:19 | - | 643.6 / 608 / 22.4 | 1143.8 / 2010 / 47.7 | 1663.4 / 7032 / 87.0 |
+| TokenSpeed after | `q122-fp8-rtap-a` | 6,7 | 11-23 04:38 | 168.1 / 82 / 5.6 | 665.9 / 581 / 21.5 | 1178.8 / 1854 / 46.7 | 1971.6 / 6152 / 102.5 |
+| TokenSpeed after | `q122-fp8-rtap-b` | 6,7 | 11-23 07:40 | 168.3 / 82 / 5.6 | 665.5 / 582 / 21.4 | 1178.1 / 1811 / 46.9 | 1972.2 / 6144 / 102.5 |
+| TokenSpeed after | `q122-fp8-rtap-c` | 6,7 | 11-23 08:02 | 168.2 / 82 / 5.6 | 666.7 / 581 / 21.4 | 1179.8 / 1873 / 46.5 | 1975.2 / 6217 / 102.1 |
 
 ### 6.6 Qwen3.5-122B-A10B NVFP4 (TP2)
 | engine | session | GPU | finished (UTC) | C=1 | C=16 | C=64 | C=256 |
@@ -539,6 +591,7 @@ Cells are `output tok/s / TTFT p50 ms / TPOT p50 ms`; `-` is a point that was no
 | TokenSpeed after | `q122-nvfp4-rep` | 6,7 | 11-22 11:36 | 134.7 / 72 / 7.1 | 814.8 / 511 / 17.3 | 1490.3 / 1613 / 36.3 | 2346.5 / 5194 / 86.6 |
 | TokenSpeed after | `q122-nvfp4-rep2` | 6,7 | 11-22 17:40 | 134.2 / 73 / 7.2 | 815.7 / 503 / 17.3 | 1492.8 / 1551 / 36.4 | 2350.6 / 5459 / 85.4 |
 | TokenSpeed after | `q122-nvfp4-rep5` | 6,7 | 11-22 18:50 | - | 823.6 / 502 / 17.4 | 1490.9 / 1706 / 35.9 | 2348.5 / 5295 / 86.3 |
+| TokenSpeed after | `q122-nvfp4-kv-b` | 6,7 | 11-23 00:57 | - | 824.6 / 502 / 17.3 | 1489.6 / 1724 / 36.0 | 2356.0 / 5433 / 85.6 |
 
 ### 6.7 DeepSeek-V4.1-Flash 128-of-384 experts (TP2, TokenSpeed only)
 | session | GPU | flags | finished (UTC) | C=1 | C=16 | C=64 | C=256 |
@@ -603,7 +656,7 @@ Whisper, 640 requests:
 The `change` column lists the flags and env of the session beyond the benchmark knobs; for gemma-4 and Qwen3.6 it ends with the graph settings that the script echoed in the first line of that session's server log (the script default changed during the work, section 3.5, 3.6). `code` names the overlay on `PYTHONPATH`; no overlay means the installed tree (for the Triton MoE kernel, the old file before about 06:50 UTC on 2026-11-22 and the `758ba1ac8` file after).
 Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token budget; `moesrc` new MoE tiles; `oldsrc` old MoE tiles; `actsrc2` FP8-activation leaf (flag off unless listed); `gdnsrc` FlashInfer GDN leaf; `src` snapshot of the branch scripts.
 
-**gemma-4-31B-it** (18 sessions; TP1 unless the change column says TP2)
+**gemma-4-31B-it** (22 sessions; TP1 unless the change column says TP2)
 | session | GPU | change | finished (UTC) | C=1 | C=16 | C=64 | C=256 | TTFT p50 ms, C=64 / C=256 |
 |---|---|---|---|---|---|---|---|---|
 | `g4-base-g7` | 6 | (default flags) [script then: prefill graphs engine default, decode ladder engine default] | 11-21 23:51 | - | - | 339.7 | 344.7 | 27756 / 160656 |
@@ -616,16 +669,20 @@ Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token bu
 | `g4-pg1024b-g7` | 7 | --prefill-graph-max-tokens 1024 [script then: prefill graphs engine default, decode ladder engine default] | 11-22 00:34 | - | - | 364.3 | 363.1 | 23143 / 151034 |
 | `g4-pg2048-cap128-g7` | 7 | --prefill-graph-max-tokens 2048 --max-cudagraph-capture-size 128 [script then: prefill graphs engine default, decode ladder engine default] | 11-21 23:58 | - | - | 374.0 | 374.7 | 21616 / 143675 |
 | `g4-pg2048-g7` | 7 | --prefill-graph-max-tokens 2048 [script then: prefill graphs engine default, decode ladder engine default] | 11-21 22:26 | - | - | 361.6 | 359.5 | 23665 / 152340 |
+| `g4-rep10a-tp1b` | 7 | (default flags) [script then: prefill graphs engine default, decode ladder engine default] | 11-23 02:05 | - | - | 382.7 | 376.6 | 21452 / 143009 |
+| `g4-rep11a-tp1b` | 6 | (default flags) [script then: prefill graphs engine default, decode ladder engine default] | 11-23 02:07 | - | - | 374.4 | 373.6 | 21636 / 143267 |
 | `g4-rep3-tp1` | 7 | (default flags) [script then: prefill graphs 1024, decode cap max_num_seqs] | 11-22 03:14 | 23.1 | 264.7 | 366.7 | 366.8 | 22966 / 149686 |
 | `g4-rep4b-tp1` | 6 | (default flags) [script then: prefill graphs 1024, decode cap max_num_seqs] | 11-22 05:23 | 23.1 | 264.7 | 366.8 | 365.7 | 23629 / 149900 |
 | `g4-rep5a-tp1` | 7 | (default flags) [script then: prefill graphs 1024, decode cap max_num_seqs] | 11-22 07:37 | - | - | 366.6 | - | 23287 / - |
 | `g4-rep6a-tp1` | 7 | (default flags) [script then: prefill graphs 1024, decode cap max_num_seqs] | 11-22 08:47 | - | - | 367.8 | 363.3 | 23667 / 150028 |
 | `g4-rep6b-tp1` | 6 | (default flags) [script then: prefill graphs 1024, decode cap max_num_seqs] | 11-22 08:54 | 23.1 | - | - | - | - / - |
 | `g4-rep7a-tp1` | 7 | (default flags) [script then: prefill graphs 1024, decode cap 128] | 11-22 15:55 | - | - | 376.2 | 376.5 | 21744 / 143437 |
+| `g4-rep8a-tp1b` | 6 | (default flags) [script then: prefill graphs engine default, decode ladder engine default] | 11-22 23:12 | - | - | 378.3 | 373.4 | 21545 / 142759 |
+| `g4-rep9a-tp1b` | 7 | (default flags) [script then: prefill graphs engine default, decode ladder engine default] | 11-22 23:13 | - | - | 377.7 | 381.1 | 21722 / 143548 |
 | `g4-tp2-cap128b` | 6,7 | TP2; MAX_CUDAGRAPH_CAPTURE_SIZE=128 [script then: prefill graphs 1024, decode cap 128] | 11-22 13:50 | - | - | 872.4 | 1001.2 | 655 / 31298 |
 | `g4-util92-g7` | 7 | GPU_MEMORY_UTILIZATION=0.92 [script then: prefill graphs engine default, decode ladder engine default] | 11-22 00:20 | - | - | 362.3 | 369.1 | 23510 / 148916 |
 
-**Qwen3.6-35B-A3B, BF16** (18 sessions)
+**Qwen3.6-35B-A3B, BF16** (36 sessions)
 | session | GPU | change | finished (UTC) | C=1 | C=16 | C=64 | C=256 | TTFT p50 ms, C=64 / C=256 |
 |---|---|---|---|---|---|---|---|---|
 | `q36-base-g7` | 7 | (default flags) [script then: prefill graphs engine default] | 11-21 22:51 | - | 727.0 | 1368.7 | 2129.2 | 755 / 3697 |
@@ -634,17 +691,35 @@ Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token bu
 | `q36-chunk2k-g7` | 6 | --chunked-prefill-size 2048 [script then: prefill graphs 1024] | 11-22 07:06 | - | 702.9 | 1301.2 | 2058.9 | 1076 / 4886 |
 | `q36-chunk4k-g7` | 7 | --chunked-prefill-size 4096 [script then: prefill graphs 1024] | 11-22 07:06 | - | 719.9 | 1352.6 | 1343.6 | 875 / 3820 |
 | `q36-coalesce5-g7` | 6 | --prefill-coalesce-ms 5 [script then: prefill graphs 1024] | 11-22 07:14 | - | 729.1 | 1369.8 | 2222.5 | 913 / 3620 |
+| `q36-final-g7` | 7 | (default flags) [script then: prefill graphs 1024] | 11-22 05:04 | 170.0 | 726.1 | 1371.4 | 2232.7 | 877 / 3551 |
 | `q36-gdnfi2-g7` | 6 | code: FlashInfer GDN prefill leaf on SM120 [script then: prefill graphs engine default] | 11-22 00:27 | - | 727.0 | 1386.8 | 1982.0 | 761 / 17941 |
 | `q36-gdnfi3-g7` | 6 | code: FlashInfer GDN prefill leaf on SM120 [script then: prefill graphs engine default] | 11-22 03:35 | - | 727.6 | 1383.8 | 1986.6 | 813 / 18003 |
+| `q36-kv-a-11687` | 6 | code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles [script then: prefill graphs engine default] | 11-23 00:04 | - | 725.9 | 1369.4 | 2234.9 | 856 / 3525 |
+| `q36-kv-a-3574` | 6 | code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles [script then: prefill graphs engine default] | 11-22 23:35 | - | 725.8 | 1369.5 | 2234.1 | 779 / 3489 |
 | `q36-mixed-g7` | 7 | --enable-mixed-batch [script then: prefill graphs engine default] | 11-21 22:39 | - | 688.6 | 1088.9 | 1219.7 | 481 / 21319 |
 | `q36-moefic-g7` | 7 | MOE_BACKEND=flashinfer_cutlass [script then: prefill graphs engine default] | 11-22 03:44 | - | 726.1 | 1368.7 | 2037.8 | 833 / 3857 |
 | `q36-moetriton-g7` | 6 | MOE_BACKEND=triton [script then: prefill graphs engine default] | 11-22 03:43 | - | 731.8 | 1350.0 | 2171.2 | 1052 / 4001 |
 | `q36-nokv-g7` | 6 | --disable-kvstore [script then: prefill graphs 1024] | 11-22 14:06 | - | 727.3 | 1373.1 | 2244.1 | 737 / 3350 |
 | `q36-pg1024-g7` | 6 | --prefill-graph-max-tokens 1024 [script then: prefill graphs engine default] | 11-22 02:53 | - | 726.5 | 1369.5 | 2236.2 | 929 / 3584 |
 | `q36-pg1024b-g7` | 6 | --prefill-graph-max-tokens 1024 [script then: prefill graphs engine default] | 11-22 03:51 | - | 725.5 | 1371.5 | 2233.1 | 847 / 3456 |
+| `q36-rep10-c-g7` | 7 | (default flags) [script then: prefill graphs 1024] | 11-22 16:35 | - | 726.0 | 1370.4 | 2233.8 | 949 / 3482 |
+| `q36-rep11-c-g7` | 6 | (default flags) [script then: prefill graphs 1024] | 11-22 16:37 | - | 725.4 | 1367.9 | 2230.3 | 779 / 3602 |
+| `q36-rep12-d-g7` | 7 | (default flags) [script then: prefill graphs 1024] | 11-22 17:48 | - | 725.5 | 1369.0 | 2232.6 | 949 / 3500 |
+| `q36-rep14-d-g7` | 7 | (default flags) [script then: prefill graphs 1024] | 11-22 18:01 | - | 724.9 | 1369.8 | 2232.7 | 837 / 3610 |
+| `q36-rep15-d-g7` | 6 | (default flags) [script then: prefill graphs engine default] | 11-22 22:59 | - | 725.0 | 1370.9 | 2230.6 | 902 / 3437 |
+| `q36-rep16-d-g7` | 7 | (default flags) [script then: prefill graphs engine default] | 11-22 22:59 | - | 728.3 | 1371.3 | 2233.9 | 834 / 3532 |
+| `q36-rep17-d-g7` | 7 | (default flags) [script then: prefill graphs engine default] | 11-23 00:11 | - | 725.4 | 1371.6 | 2233.2 | 813 / 3570 |
+| `q36-rep19-d-g7` | 6 | (default flags) [script then: prefill graphs engine default] | 11-23 00:14 | - | 725.5 | 1371.5 | 2238.8 | 836 / 3448 |
 | `q36-rep3-g7` | 6 | (default flags) [script then: prefill graphs engine default] | 11-22 02:42 | - | 726.5 | 1370.0 | 2149.6 | 877 / 3685 |
+| `q36-rep4-b-g7` | 6 | (default flags) [script then: prefill graphs 1024] | 11-22 13:11 | - | 724.8 | 1370.3 | 2233.1 | 812 / 3490 |
 | `q36-rep4-g7` | 6 | (default flags) [script then: prefill graphs engine default] | 11-22 03:02 | - | 726.1 | 1369.8 | 2124.6 | 874 / 3706 |
+| `q36-rep5-b-g7` | 6 | (default flags) [script then: prefill graphs 1024] | 11-22 13:19 | - | 725.9 | 1368.3 | 2234.6 | 950 / 3525 |
 | `q36-rep5-g7` | 6 | (default flags) [script then: prefill graphs engine default] | 11-22 04:34 | 170.2 | 727.5 | 1370.7 | 2128.6 | 822 / 3704 |
+| `q36-rep6-b-g7` | 7 | (default flags) [script then: prefill graphs 1024] | 11-22 14:56 | - | 725.6 | 1371.3 | 2232.4 | 840 / 3566 |
+| `q36-rep6-g7` | 6 | (default flags) [script then: prefill graphs 1024] | 11-22 07:23 | - | 724.7 | 1370.9 | 2234.0 | 884 / 3508 |
+| `q36-rep7-g7` | 7 | (default flags) [script then: prefill graphs 1024] | 11-22 12:55 | - | 725.5 | 1373.1 | 2221.0 | 826 / 3527 |
+| `q36-rep8-g7` | 6 | (default flags) [script then: prefill graphs 1024] | 11-22 15:49 | - | 728.1 | 1370.8 | 2230.9 | 841 / 3565 |
+| `q36-rep9-c-g7` | 7 | (default flags) [script then: prefill graphs 1024] | 11-22 16:03 | - | 726.3 | 1371.4 | 2239.3 | 866 / 3452 |
 | `q36-spf-g7` | 7 | --enable-short-prefill-first [script then: prefill graphs 1024] | 11-22 07:14 | - | 725.9 | 1370.5 | 2245.1 | 694 / 1668 |
 
 **Qwen3.6-35B-A3B, FP8 weights** (7 sessions)
@@ -658,15 +733,26 @@ Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token bu
 | `q36-fp8-moetile2-g7` | 7 | MOE_BACKEND=triton; QUANTIZATION=fp8 [script then: prefill graphs 1024] | 11-22 07:22 | - | 1097.4 | 2058.9 | 3493.9 | 828 / 2789 |
 | `q36-fp8-moetile3-g7` | 6 | MOE_BACKEND=triton; QUANTIZATION=fp8 [script then: prefill graphs 1024] | 11-22 07:30 | - | 1098.3 | 1983.4 | 3492.1 | 910 / 2762 |
 
-**Qwen3.5-122B-A10B FP8 / NVFP4** (22 sessions)
+**Qwen3.5-122B-A10B FP8 / NVFP4** (40 sessions)
 | session | GPU | change | finished (UTC) | C=1 | C=16 | C=64 | C=256 | TTFT p50 ms, C=64 / C=256 |
 |---|---|---|---|---|---|---|---|---|
 | `q122-fp8-act` | 6,7 | QUANTIZATION=fp8; code: FP8-activation MoE prototype | 11-22 08:11 | - | 649.3 | 1165.3 | 1707.4 | 1805 / 6568 |
 | `q122-fp8-act2` | 6,7 | --moe-block-fp8-fp8-activation; QUANTIZATION=fp8; code: branch snapshot (log fix, gemma/Qwen3 script knobs) + FP8-activation MoE leaf (flag off unless listed) | 11-22 09:09 | - | 650.2 | 1166.1 | 1717.9 | 1731 / 6619 |
 | `q122-fp8-act3` | 6,7 | --moe-block-fp8-fp8-activation; QUANTIZATION=fp8; code: branch snapshot (log fix, gemma/Qwen3 script knobs) + FP8-activation MoE leaf (flag off unless listed) | 11-22 11:02 | - | 649.3 | 1163.2 | 1715.9 | 1676 / 6581 |
+| `q122-fp8-actbase2` | 6,7 | QUANTIZATION=fp8; code: branch snapshot (log fix, gemma/Qwen3 script knobs) + FP8-activation MoE leaf (flag off unless listed) | 11-22 09:19 | - | 643.6 | 1143.8 | 1663.4 | 2010 / 7032 |
+| `q122-fp8-base-c1` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-23 03:51 | 110.4 | - | - | - | - / - |
 | `q122-fp8-base3` | 6,7 | QUANTIZATION=fp8 | 11-22 03:25 | - | 589.0 | 932.6 | 1406.2 | 2109 / 8587 |
 | `q122-fp8-chunk16k` | 6,7 | --chunked-prefill-size 16384 --max-prefill-tokens 16384; QUANTIZATION=fp8 | 11-22 04:53 | - | 591.7 | 935.7 | 1413.3 | 2533 / 8518 |
+| `q122-fp8-kv-a` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-22 23:56 | - | 642.4 | 1143.9 | 1667.7 | 1900 / 7106 |
+| `q122-fp8-kv-act-b` | 6,7 | --moe-block-fp8-fp8-activation; QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + FP8-activation MoE leaf (flag off unless listed) | 11-23 01:08 | - | 649.8 | 1164.2 | 1964.8 | 1697 / 5848 |
+| `q122-fp8-kv-b` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-22 23:23 | - | 642.3 | 1141.4 | 1899.1 | 1821 / 6111 |
+| `q122-fp8-kvb-c1` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-23 06:57 | 110.6 | - | - | - | - / - |
+| `q122-fp8-kvb-rep1` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-23 06:48 | - | 641.9 | 1141.1 | 1897.4 | 1993 / 6618 |
+| `q122-fp8-kvb-rep2` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-23 07:08 | - | 641.8 | 1141.9 | 1900.3 | 1711 / 6032 |
+| `q122-fp8-kvb-rep3` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-23 07:19 | - | 642.3 | 1142.5 | 1901.4 | 1971 / 6056 |
 | `q122-fp8-mamba16` | 6,7 | --mamba-ssm-dtype bfloat16; QUANTIZATION=fp8 | 11-22 01:47 | - | - | 976.8 | 1807.9 | 2475 / 7985 |
+| `q122-fp8-moetile-b` | 6,7 | QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 05:55 | - | 643.9 | 1140.5 | 1669.1 | 1865 / 7020 |
+| `q122-fp8-moetile` | 6,7 | QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 05:45 | 110.8 | 636.2 | 1140.8 | 1664.1 | 1778 / 7143 |
 | `q122-fp8-mt-ar4k` | 6,7 | --comm-fusion-max-num-tokens 4096; QUANTIZATION=fp8 | 11-22 08:33 | - | 644.0 | 1145.6 | 1664.9 | 1775 / 7213 |
 | `q122-fp8-mt-ar8k` | 6,7 | --comm-fusion-max-num-tokens 8192; QUANTIZATION=fp8 | 11-22 09:29 | - | 644.6 | 1146.2 | 1671.5 | 1896 / 7184 |
 | `q122-fp8-mt-chunk16k` | 6,7 | --chunked-prefill-size 16384 --max-prefill-tokens 16384; QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 15:06 | - | 643.8 | 1146.1 | 1669.3 | 2070 / 7137 |
@@ -677,12 +763,19 @@ Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token bu
 | `q122-fp8-mt-pdi2` | 6,7 | --prefill-decode-interval 2; QUANTIZATION=fp8 | 11-22 10:03 | - | 639.8 | 1131.1 | 1665.1 | 1129 / 7253 |
 | `q122-fp8-mt-pdimin1` | 6,7 | --prefill-decode-min-interval 1; QUANTIZATION=fp8 | 11-22 10:13 | - | 641.8 | 1131.0 | 1651.0 | 1563 / 6191 |
 | `q122-fp8-mt-pg1024` | 6,7 | --prefill-graph-max-tokens 1024; QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 15:41 | - | 644.3 | 1145.0 | 1673.3 | 1931 / 7165 |
+| `q122-fp8-mt-rep` | 6,7 | QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 12:35 | 110.9 | 634.3 | 1143.4 | 1665.8 | 1805 / 7094 |
+| `q122-fp8-mt-rep2` | 6,7 | QUANTIZATION=fp8 | 11-22 16:27 | 110.5 | 635.7 | 1144.3 | 1667.4 | 1889 / 7244 |
 | `q122-fp8-mt-seqs256` | 6,7 | MAX_NUM_SEQS=256; QUANTIZATION=fp8 | 11-22 10:52 | - | 643.0 | 1144.5 | 1671.2 | 1939 / 7248 |
 | `q122-fp8-mt-spf` | 6,7 | --enable-short-prefill-first; QUANTIZATION=fp8 | 11-22 09:53 | - | 644.2 | 1141.7 | 1668.1 | 1600 / 4307 |
 | `q122-fp8-mt-util94` | 6,7 | GPU_MEMORY_UTILIZATION=0.94; QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 06:11 | - | 643.6 | 1141.5 | 1729.7 | 1804 / 6688 |
 | `q122-fp8-nokv` | 6,7 | --disable-kvstore; QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 14:31 | - | 646.7 | 1147.2 | 1690.5 | 1712 / 6672 |
 | `q122-fp8-nokv2` | 6,7 | --disable-kvstore; QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-22 18:42 | - | - | 1145.2 | 1689.9 | 1884 / 6762 |
 | `q122-fp8-pg1024` | 6,7 | --prefill-graph-max-tokens 1024; QUANTIZATION=fp8 | 11-22 04:11 | - | 590.2 | 934.6 | 1394.5 | 2218 / 8713 |
+| `q122-fp8-rep11` | 6,7 | QUANTIZATION=fp8; code: new Triton block-FP8 MoE tiles | 11-23 06:33 | 110.7 | 634.7 | 1144.6 | 1666.1 | 1859 / 7086 |
+| `q122-fp8-rt-a` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + kernel package of the final branch (FA4 SM120 leaf, route-parallel MoE) | 11-23 04:24 | 146.3 | 634.2 | 1141.1 | 1902.1 | 1889 / 6549 |
+| `q122-fp8-rt-b` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + kernel package of the final branch (FA4 SM120 leaf, route-parallel MoE) | 11-23 05:45 | 146.4 | 636.3 | 1140.1 | 1898.7 | 1858 / 5888 |
+| `q122-fp8-rt-c` | 6,7 | QUANTIZATION=fp8; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + kernel package of the final branch (FA4 SM120 leaf, route-parallel MoE) | 11-23 06:11 | 146.4 | 636.0 | 1142.7 | 1900.5 | 1896 / 6485 |
+| `q122-nvfp4-kvb-mixed` | 6,7 | --enable-mixed-batch; code: runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) + new Triton block-FP8 MoE tiles | 11-23 07:49 | - | - | 1131.6 | 1069.0 | 527 / 24745 |
 
 **Qwen3-Embedding-8B** (the `emb_c64` point unless named: `embl40_600` = 40 clients with whole 12000-character documents, `embl8_160`, `embq_*` request formats, `embc128_800` 128 clients, 800 requests)
 | session | GPU | code | flags | finished (UTC) | requests/s | p50 s | input tok/s |
@@ -694,8 +787,32 @@ Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token bu
 | `emb-budget-c64d` | 6 | log fix + orjson + token budget | emb_c64;  | 11-22 18:07 | 57.235 | 0.873 | 22451.0 |
 | `emb-budget-long2` | 6 | log fix + orjson + token budget | embl40_600;  | 11-22 17:09 | 28.578 | 1.373 | 23175.9 |
 | `emb-c128-g7` | 7 | installed (old) | embc128_800; --no-enable-log-requests | 11-21 22:59 | 34.293 | 3.906 | 23248.5 |
+| `emb-fa4-a2` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 00:22 | 57.240 | 0.868 | 22453.0 |
+| `emb-fa4-a3` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 00:24 | 58.659 | 0.846 | 23009.5 |
+| `emb-fa4-b6` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 01:12 | 62.048 | 0.822 | 24338.9 |
+| `emb-fa4-dbg3` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:18 | 56.670 | 0.895 | 22229.1 |
+| `emb-fa4base-1` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:42 | 57.485 | 0.901 | 22548.8 |
+| `emb-fa4base-2` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:46 | 57.874 | 0.827 | 22701.6 |
+| `emb-fa4base-3` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:50 | 58.183 | 1.034 | 22822.9 |
+| `emb-fa4base-5` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 03:00 | 58.874 | 0.829 | 23093.8 |
+| `emb-fa4base-6` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 03:05 | 57.277 | 0.913 | 22467.6 |
+| `emb-fa4fix-1` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:39 | 61.022 | 0.816 | 23936.6 |
+| `emb-fa4fix-10` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 03:04 | 61.974 | 0.839 | 24310.0 |
+| `emb-fa4fix-2` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:42 | 62.008 | 0.820 | 24323.0 |
+| `emb-fa4fix-3` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:47 | 50.390 | 0.817 | 19765.8 |
+| `emb-fa4fix-5` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:53 | 61.433 | 0.821 | 24097.7 |
+| `emb-fa4fix-6` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:53 | 61.805 | 1.004 | 24243.5 |
+| `emb-fa4fix-7` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:57 | 62.018 | 0.966 | 24327.2 |
+| `emb-fa4fix-8` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 02:58 | 60.853 | 0.846 | 23870.2 |
+| `emb-fa4fix-9` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 03:01 | 60.864 | 0.798 | 23874.5 |
 | `emb-final-a` | 7 | branch snapshot (log fix, gemma/Qwen3 script knobs) | emb_c64;  | 11-22 03:33 | 57.267 | 0.975 | 22463.6 |
 | `emb-final-b` | 7 | branch snapshot (log fix, gemma/Qwen3 script knobs) | emb_c64;  | 11-22 03:36 | 56.935 | 0.933 | 22333.1 |
+| `emb-kern2-1` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 04:47 | 62.224 | 0.782 | 24408.0 |
+| `emb-kern2-2` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 04:50 | 61.442 | 0.834 | 24101.1 |
+| `emb-kern2-3` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 04:54 | 61.168 | 0.788 | 23993.8 |
+| `emb-kern2-4` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 06:14 | 62.120 | 0.803 | 24367.0 |
+| `emb-kern2-5` | 7 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 06:16 | 62.202 | 0.805 | 24399.4 |
+| `emb-kern2-6` | 6 | runtime of the KV-group split (`cs/a`: HEAD before it, `cs/b`: after it) | emb_c64;  | 11-23 06:18 | 62.047 | 0.818 | 24338.3 |
 | `emb-kvauto-g7` | 7 | installed (old) | emb_c64; KV_CACHE_DTYPE=auto | 11-21 22:05 | 52.144 | 1.055 | 20453.9 |
 | `emb-logfix-g7` | 7 | branch snapshot (log fix, gemma/Qwen3 script knobs) | emb_c64;  | 11-22 00:56 | 56.381 | 0.961 | 22116.0 |
 | `emb-long-repro` | 6 | log fix + orjson | embl40_600;  | 11-22 16:29 | 28.328 | 1.407 | 22972.9 |
@@ -716,6 +833,9 @@ Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token bu
 | `emb-rep-g7` | 7 | branch snapshot (log fix, gemma/Qwen3 script knobs) | emb_c64;  | 11-22 04:28 | 56.939 | 0.967 | 22335.0 |
 | `emb-rep2-g7` | 7 | branch snapshot (log fix, gemma/Qwen3 script knobs) | emb_c64;  | 11-22 07:40 | 54.572 | 1.034 | 21406.4 |
 | `emb-rep3-g7` | 6 | installed (old) | emb_c64;  | 11-22 12:57 | 52.862 | 0.998 | 20735.7 |
+| `emb-rep4-g7` | 7 | installed (old) | emb_c64;  | 11-22 23:27 | 52.756 | 1.063 | 20693.9 |
+| `emb-rep5-g7` | 6 | installed (old) | emb_c64;  | 11-22 23:27 | 53.366 | 0.966 | 20933.4 |
+| `emb-rep6-g7` | 7 | installed (old) | emb_c64;  | 11-23 02:15 | 52.162 | 1.116 | 20461.1 |
 
 ## 7. Reproduce
 - The result trees are `tmp/vs_vllm/results/` (vLLM), `tmp/vs_ts/results/` (BEFORE), `tmp/sm120_scripts/results*/` (task 91 script tests, V4.1), `tmp/perf92/results/` (tuning, AFTER sets), `tmp/vs_omni/results/` (MiniMax) on the benchmark host.
