@@ -3,6 +3,7 @@ Tasks 91, 92 and 95 of the SM120 spec. Served on 2026-11-21 to 2026-11-23 on the
 This is the detailed record. The short version is in [`deepgemm_report.md`](deepgemm_report.md) section 3, the status
 log row is in [`deepgemm-analysis.md`](deepgemm-analysis.md), and the earlier TokenSpeed-only image benchmarks are
 [`deepgemm_benchmark.md`](deepgemm_benchmark.md) and [`deepgemm_benchmark_1118.md`](deepgemm_benchmark_1118.md).
+Sections 1 to 7 compare against vLLM 0.32.0; section 8 repeats the comparison against vLLM 0.34.0.
 The question: how do the TokenSpeed serve scripts for SM120 (`scripts/*.sh`, defaults only) compare with vLLM 0.32.0 on
 the same GPUs, what limits them, and which changes fix what could be fixed? Six LLM configurations (five models), an embedding model and
 a transcription model go against `vllm/vllm-openai:latest`; DeepSeek-V4.1-Flash runs on TokenSpeed only; three MiniMax pipelines go against the vLLM-omni nightly.
@@ -843,3 +844,60 @@ Overlays: `embsrc_a` log fix; `embsrc_b` log fix + orjson; `embsrc_c` + token bu
 - `tmp/vs_ts/compare.py [model]` prints vLLM against TokenSpeed per point from those trees; this document's tables come from `tmp/vllm_bench_data.py`, `vllm_bench_tables.py` and `vllm_bench_build.py` (DeepGEMM scratch folder) over a copy of the JSON files.
 - Drivers: `tmp/vs_vllm/driver.sh`, `tmp/vs_ts/queue.sh`, `tmp/vs_omni/queue.sh`, and for the tuning runs `tmp/ts_sched/sched.sh submit <jobfile>` with `tmp/perf92/item.sh` (one session per job; the item names are the session names above).
 - The pre-commit hooks and the tests of each commit ran on a scratch clone of the branch: `test_token_budget`, `test_embedding_server` (13), `test_async_llm_log_metadata` 23 passed together; `test_triton_fp8_apply` and the MoE tests (58 passed, 29 skipped: the SM90-SM103-only channel tests); the FP8-activation kernel tests 15 and the runtime tests 14 (including `test_h3_placement`).
+## 8. Re-run against vLLM 0.34.0
+The image behind `vllm/vllm-openai:latest` changed after sections 1 to 7 were measured. This section repeats the comparison against it. Sections 1 to 7 stay as recorded against vLLM 0.32.0.
+
+### 8.1 Versions and flags
+| | TokenSpeed | vLLM |
+|---|---|---|
+| software | branch `arch-defaults` head `7640e530c` (copy-engine all-reduce `13493c0a0`, MIXED-round GDN decode split `724c44713`, SM12x defaults of task 91), serve scripts at defaults plus the same three sizing knobs as section 2.4; the Qwen3.5-122B runs use the rebuilt scheduler extension overlay of the earlier rounds | `vllm/vllm-openai:latest`, ID `sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1`, created 2026-11-16, vLLM 0.34.0, torch 2.14.0+cu130, `flashinfer-python` 0.7.3 (TokenSpeed: 0.7.4) |
+| flags | `--max-num-seqs` 512 (128 embedding, 64 whisper), `--gpu-memory-utilization` 0.9, `--max-model-len` as in section 2.3 | the same flags and the same model paths, GPUs and TP as section 2.3, one container `nctu6-vllm-b34v-*` per run, nothing else |
+
+One flag differs from section 2.3: **gemma-4-31B TP1 runs with `--gpu-memory-utilization 0.95` on vLLM 0.34.0.** At 0.9 and `--max-model-len 131072` the server stops at startup (`23.33 GiB KV cache is needed ... larger than the available KV cache memory (22.33 GiB)`, the estimated maximum length is 118016). vLLM 0.34 sizes the KV cache after warmup and graph capture ("extensible KV cache"), counts that against the 0.9 cap, and says in its log that the flag should be left unset (default 1.0). The same model on 0.32.0 started at 0.9. Both engines are therefore compared at 0.95 for this row (section 8.3).
+
+What the vLLM 0.34.0 start-up logs show on SM120 (no flag given):
+- Attention: `FLASH_ATTN` (FlashAttention 2) for gemma-3, Qwen3.5 FP8 and Qwen3.6, `TRITON_ATTN` for gemma-4, `FLASHINFER` for the NVFP4 checkpoint; vision tower `FLASH_ATTN`.
+- MoE: `FlashInfer CUTLASS Unquantized MoE` (Qwen3.6), `FLASHINFER_CUTLASS NvFp4 MoE` (Qwen3.5 NVFP4), the Triton FP8 MoE (Qwen3.5 FP8). GDN prefill: `FlashInfer GDN prefill kernel`.
+- FlashInfer autotuning of the fused-MoE tactics at start-up (token buckets 1 to 8192, `enable_flashinfer_autotune=True`); CUDA graphs `FULL_AND_PIECEWISE`, capture sizes up to `--max-num-seqs`.
+- Mamba cache mode `align` with prefix caching (attention block 2112 / 4224 tokens for FP8 / NVFP4), `max_num_batched_tokens` 8192.
+- All-reduce: custom all-reduce for small messages on two ranks, FlashInfer PCIe-IPC and symmetric memory not used, so large (prefill) messages go through NCCL like TokenSpeed before the copy-engine tier.
+- DeepSeek-V4.1-Flash with `--hf-overrides '{"n_routed_experts": 128, "num_checkpoint_experts": 384}'` still fails (`AssertionError: Attempted to load weight (torch.Size([384])) into parameter (torch.Size([128]))`), as in section 5.4: TokenSpeed only.
+
+### 8.2 Runs
+Every side ran twice (Qwen3.6: three times), interleaved vLLM, TokenSpeed, TokenSpeed, vLLM on the same GPUs through the job scheduler (TP1 jobs two at a time, one per GPU; TP2 jobs alone). RAG at C=1 (100 requests), C=16, 64, 256 (500 requests each) on one warm server per run, as in section 2.5.
+
+### 8.3 Table: output tok/s, mean of the runs (TokenSpeed over vLLM 0.34.0)
+| model | C=1 | C=16 | C=64 | C=256 |
+|---|---|---|---|---|
+| gemma-3-27b-it TP1 | 26.4 / 25.7 = 1.03x | 320.1 / 310.6 = 1.03x | 704.0 / 648.6 = 1.09x | 702.5 / 643.2 = 1.09x |
+| gemma-4-31B TP1, 0.95 on both | - | 264.8 / 254.0 = 1.04x | 416.5 / 413.3 = 1.01x | 414.4 / 412.2 = 1.01x |
+| gemma-4-31B TP1, TokenSpeed 0.9 (vLLM cannot start at 0.9) | 23.1 / 22.3 = 1.04x | 264.6 / 254.0 = 1.04x | 380.5 / 413.3 = 0.92x | 384.1 / 412.2 = 0.93x |
+| gemma-4-31B TP2 | 43.0 / 41.3 = 1.04x | 487.6 / 443.3 = 1.10x | 964.8 / 873.7 = 1.10x | 1151.1 / 992.9 = 1.16x |
+| Qwen3.6-35B-A3B TP1 | 169.3 / 161.6 = 1.05x | 716.0 / 714.2 = 1.00x | 1370.2 / 1388.5 = 0.99x | 2257.3 / 2256.0 = 1.00x |
+| Qwen3.5-122B FP8 TP2 | 167.0 / 130.8 = 1.28x | 673.2 / 637.1 = 1.06x | 1212.8 / 1185.3 = 1.02x | 2083.1 / 1891.7 = 1.10x |
+| Qwen3.5-122B NVFP4 TP2 | 134.0 / 117.1 = 1.15x | 819.2 / 778.5 = 1.05x | 1542.9 / 1502.0 = 1.03x | 2492.7 / 2454.2 = 1.02x |
+| DeepSeek-V4.1-Flash 128-of-384 TP2 | 109.0 / - | 675.8 / - | 1596.7 / - | 3438.0 / - |
+
+| model | point | TokenSpeed | vLLM 0.34.0 | ratio |
+|---|---|---|---|---|
+| Qwen3-Embedding-8B TP1 | C=64, requests/s | 61.6 (62.3, 60.9) | 62.3 (62.28, 62.27) | 0.99x |
+| whisper-large-v3 TP1 | C=16, requests/s | 55.4 (56.31, 54.42) | 35.9 (35.88, 35.87) | 1.54x |
+
+The two TokenSpeed embedding runs differ by 2.2 %: the first equals vLLM (62.30 against 62.28), the second is 60.91. vLLM's runs agree within 0.02 %. Both pairs ran at the same time on the two GPUs.
+
+### 8.4 What moved against section 6 (vLLM 0.32.0 to 0.34.0)
+| point | 0.32.0 | 0.34.0 | change |
+|---|---|---|---|
+| gemma-4 TP1 C=64 / 256 | 379.5 / 378.1 (0.9) | 413.3 / 412.2 (0.95) | +8.9 / +9.0 % (KV cache 28.6 GiB, 152,194 tokens; 22.33 GiB were left at 0.9) |
+| gemma-3 C=64 / 256 | 654.6 / 674.0 | 648.6 / 643.2 | -0.9 / -4.6 % |
+| Qwen3.5 FP8 C=16 / 64 / 256 | 642.5 / 1186.6 / 2070.8 | 637.1 / 1185.3 / 1891.7 | -0.8 / -0.1 / -8.7 % |
+| Qwen3.5 NVFP4 C=64 / 256 | 1484.4 / 2413.7 | 1502.0 / 2454.2 | +1.2 / +1.7 % |
+| Qwen3.6 C=64 / 256 | 1385.8 / 2205.3 | 1388.5 / 2256.0 | +0.2 / +2.3 % |
+| whisper C=16 req/s | 33.3 | 35.9 | +7.6 % |
+| embedding C=64 req/s | 61.3 | 62.3 | +1.6 % |
+
+### 8.5 The points at or below 1.00x
+- **gemma-4 TP1 at 0.9 (0.92x / 0.93x).** A memory-fraction effect, not an engine gap. At C=64 both engines hold about 30 requests in the batch because the KV pool is full (TokenSpeed log: 2371 pages, `#running-req` 26 to 31, `#queue-req` 31 to 226; vLLM: 152,194 tokens at 28.6 GiB), the decode step is the same (ITL p50 74.0 against 75.1 ms), and the throughput follows the pool. With TokenSpeed also at `GPU_MEMORY_UTILIZATION=0.95` (two runs) it gives 420.0 / 413.0 at C=64 and 412.1 / 416.6 at C=256 against vLLM 413.3 / 412.2, so 1.01x.
+- **Qwen3.6 TP1 C=64, 0.99x (1370.2 against 1388.5, spread 0.2 % and 0.05 %, three runs each).** Reproducible but small. The profile shows no host gap: the engine run under `nsys` is GPU-bound (kernel time 6.13 s in a 6 s window), 73.5 % in the two FlashInfer CUTLASS MoE kernels (`Fused_Moe_Kernel_sm80` 32x128x64 at 504 us and `MoeFCGemm` 32x128x64 at 238 us per layer call), 7.6 % in GDN decode; vLLM uses the same FlashInfer CUTLASS unquantized MoE backend. Re-tuning the FlashInfer tactics from an empty cache (two runs) gives the same 1369.2 / 1368.3 at C=64, so the tactic cache is not the cause. TTFT p50 is 872 ms against 494 ms while ITL p50 is 42.6 against 43.7 ms and requests/s are equal at 5.4. No change shipped.
+- **Embedding C=64, 0.99x:** one TokenSpeed run equal to vLLM, one 2.2 % lower (60.91); the cause of that spread was not isolated, the mean is 1.1 % below. Earlier TokenSpeed embedding runs scatter by the same amount (section 6.8). Not profiled again: the profile of section 3.12 (80.5 % dense BF16 GEMM) has not changed.
+- **TTFT p50 at C=256 for Qwen3.5 (FP8 5.7 s against 2.4 s, NVFP4 4.7 s against 1.6 s):** unchanged wave alignment of the closed-loop client (section 5.3); the throughput at C=256 is higher on TokenSpeed.
